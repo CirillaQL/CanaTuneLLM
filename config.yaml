@@ -1,0 +1,138 @@
+project:
+  name: canatune-exp
+  mode: disaggregated_inference
+  work_dir_root: /path/to/vllm_job_work
+  broker_root: /path/to/job_broker
+
+slurm:
+  partition: long
+  time_limit: "16:00:00"
+  nodes: 2
+  cpus_per_gpu: 8
+  exclusive: true
+
+runtime:
+  python: /path/to/python
+  vllm_version: "0.15.1"
+  offline: true
+  environment:
+    HF_HUB_OFFLINE: "1"
+    TRANSFORMERS_OFFLINE: "1"
+    NCCL_IB_DISABLE: "1"
+    NCCL_SOCKET_IFNAME: "^lo"
+    NCCL_DEBUG: INFO
+
+model:
+  name: mistralai/Mistral-7B-v0.1
+  snapshot_root: /path/to/model/snapshots
+  path_override_env: MODEL_OVERRIDE
+  max_model_len: 4096
+
+topology:
+  ip_resolution:
+    method: slurm_hostname_I_first_address
+    hardcode_ip: false
+
+  prefill_nodegroup:
+    node: prefill-node
+    gpu_type: NVIDIA L40S
+    endpoint_prefix: P
+    gpu_ids: [0, 1, 2, 3]
+    http_port_base: 8100
+    kv_port_base: 14579
+    high_frequency_mhz: 2520
+    memory_frequency_mhz: 9001
+
+  decode_nodegroup:
+    node: decode-node
+    gpu_type: NVIDIA L4
+    endpoint_prefix: D
+    gpu_ids: [0, 1, 2, 3]
+    http_port_base: 8200
+    kv_port_base: 14579
+    high_frequency_mhz: 1500
+    memory_frequency_mhz: 6251
+    gpu_memory_utilization: 0.82
+
+  endpoints:
+    P0: {role: prefill, gpu_id: 0, http_port: 8100, kv_port: 14579}
+    P1: {role: prefill, gpu_id: 1, http_port: 8101, kv_port: 14580}
+    P2: {role: prefill, gpu_id: 2, http_port: 8102, kv_port: 14581}
+    P3: {role: prefill, gpu_id: 3, http_port: 8103, kv_port: 14582}
+    D0: {role: decode, gpu_id: 0, http_port: 8200, kv_port: 14579}
+    D1: {role: decode, gpu_id: 1, http_port: 8201, kv_port: 14580}
+    D2: {role: decode, gpu_id: 2, http_port: 8202, kv_port: 14581}
+    D3: {role: decode, gpu_id: 3, http_port: 8203, kv_port: 14582}
+
+kv_transfer:
+  connector: P2pNcclConnector
+  prefill_role: kv_producer
+  decode_role: kv_consumer
+  prefill_send_type: PUT
+  disable_prefix_cache: true
+  disable_chunked_prefill: true
+
+proxy:
+  enabled: true
+  host: 127.0.0.1
+  port: 8000
+  endpoint: /v1/completions
+  diagnostics_log: "${raw_root}/launcher/proxy_diagnostics.jsonl"
+
+routing:
+  canary_pair: [P0, D0]
+  production_pairs:
+    - [P1, D1]
+    - [P2, D2]
+    - [P3, D3]
+  allow_production_cross_pairs: true
+  production_initial_frequency: high
+
+  tiers:
+    high: {pair: [P1, D1], prefill_mhz: 2520, decode_mhz: 1500}
+    middle: {pair: [P2, D2], prefill_mhz: 1710, decode_mhz: 975}
+    low: {pair: [P3, D3], prefill_mhz: 900, decode_mhz: 450}
+
+cache:
+  root: "${work_dir}"
+  hf_home: "${work_dir}/huggingface"
+  hf_hub_cache: "${work_dir}/huggingface/hub"
+  torch_home: "${work_dir}/torch-cache"
+  triton_cache: "${work_dir}/triton-cache"
+  cuda_cache: "${work_dir}/cuda-cache"
+  vllm_cache: "${work_dir}/vllm-cache"
+  flashinfer_workspace: "${work_dir}/flashinfer"
+  tmp_dir: "${work_dir}/tmp"
+
+artifacts:
+  raw_root: "${work_dir}/raw"
+  result_root: "${broker_job_dir}/results/${slurm_job_id}"
+  server_logs: "${raw_root}/launcher"
+  frequency_table: "${raw_root}/frequency_table.json"
+  route_control: "${raw_root}/production_route_control.json"
+
+experiment:
+  smoke_gate:
+    enabled: true
+    endpoint_pair: [P0, D0]
+    required_before_formal_measurement: true
+
+  slo:
+    ttft_ms: 500
+    tpot_ms: 200
+
+  workload:
+    request_timeout_s: 900
+    max_concurrency: 1
+    request_interval_s: 5
+
+container:
+  enabled: false
+  runtime: apptainer
+  image: /path/to/vllm.sif
+  use_nvidia_runtime: true
+  host_network: true
+  mounts:
+    - "${work_dir}:${work_dir}"
+    - "${model_path}:${model_path}:ro"
+    - "${source_root}:/workspace"
