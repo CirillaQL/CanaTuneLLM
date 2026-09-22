@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Run on the allocated Decode host. Starts four TP=1 vLLM consumers,
+# one per GPU. Supply site-specific values through the variables below.
+set -euo pipefail
+
+: "${PYTHON_BIN:?Set PYTHON_BIN to the vLLM environment's Python executable}"
+: "${MODEL_PATH:?Set MODEL_PATH to a local model snapshot directory}"
+: "${PD_WORK_DIR:?Set PD_WORK_DIR to this job's writable work directory}"
+: "${DECODE_GPU_IDS:?Set DECODE_GPU_IDS, for example 0,1,2,3}"
+: "${DECODE_HTTP_PORT_BASE:?Set DECODE_HTTP_PORT_BASE, for example 8200}"
+: "${DECODE_KV_PORT_BASE:?Set DECODE_KV_PORT_BASE, for example 14579}"
+: "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
+
+[[ -x "$PYTHON_BIN" ]] || { echo "Python is not executable: $PYTHON_BIN" >&2; exit 2; }
+[[ -d "$MODEL_PATH" ]] || { echo "Model directory does not exist: $MODEL_PATH" >&2; exit 2; }
+command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
+
+IFS=, read -r -a gpu_ids <<< "$DECODE_GPU_IDS"
+[[ ${#gpu_ids[@]} -eq 4 ]] || { echo "Exactly four Decode GPU IDs are required" >&2; exit 2; }
+for gpu_id in "${gpu_ids[@]}"; do
+  [[ "$gpu_id" =~ ^[0-9]+$ ]] || { echo "Invalid GPU ID: $gpu_id" >&2; exit 2; }
+done
+[[ ${#gpu_ids[@]} -eq $(printf '%s\n' "${gpu_ids[@]}" | sort -u | wc -l | tr -d ' ') ]] || {
+  echo "Decode GPU IDs must be unique" >&2; exit 2;
+}
+
+ROLE_WORK_DIR="${PD_WORK_DIR}/decode"
+export HOME="${ROLE_WORK_DIR}/home"
+export HF_HOME="${ROLE_WORK_DIR}/huggingface"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export XDG_CACHE_HOME="${ROLE_WORK_DIR}/xdg-cache"
+export XDG_CONFIG_HOME="${ROLE_WORK_DIR}/xdg-config"
+export XDG_DATA_HOME="${ROLE_WORK_DIR}/xdg-data"
+export XDG_STATE_HOME="${ROLE_WORK_DIR}/xdg-state"
+export XDG_RUNTIME_DIR="${ROLE_WORK_DIR}/xdg-runtime"
+export VLLM_CACHE_ROOT="${ROLE_WORK_DIR}/vllm-cache"
+export VLLM_CONFIG_ROOT="${ROLE_WORK_DIR}/vllm-config"
+export TORCH_HOME="${ROLE_WORK_DIR}/torch-cache"
+export TRITON_CACHE_DIR="${ROLE_WORK_DIR}/triton-cache"
+export CUDA_CACHE_PATH="${ROLE_WORK_DIR}/cuda-cache"
+export TMPDIR="${ROLE_WORK_DIR}/tmp"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+export NCCL_IB_DISABLE=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+mkdir -p "$HOME" "$HF_HUB_CACHE" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+  "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$VLLM_CACHE_ROOT" \
+  "$VLLM_CONFIG_ROOT" "$TORCH_HOME" "$TRITON_CACHE_DIR" "$CUDA_CACHE_PATH" \
+  "$TMPDIR" "${ROLE_WORK_DIR}/logs"
+chmod 700 "$XDG_RUNTIME_DIR" "$TMPDIR"
+
+pids=()
+cleanup() {
+  trap - EXIT INT TERM
+  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for index in 0 1 2 3; do
+  gpu_id=${gpu_ids[$index]}
+  http_port=$((DECODE_HTTP_PORT_BASE + index))
+  kv_port=$((DECODE_KV_PORT_BASE + index))
+  kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_consumer","kv_port":%d}' "$kv_port")
+  log_file="${ROLE_WORK_DIR}/logs/decode_${index}.log"
+
+  CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
+    --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
+    --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
+    --gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION:-0.82}" \
+    --kv-transfer-config "$kv_config" \
+    --no-enable-prefix-caching --no-enable-chunked-prefill \
+    >"$log_file" 2>&1 &
+  pids+=("$!")
+
+  ready=0
+  for ((attempt=0; attempt<${STARTUP_TIMEOUT_S:-1500}; attempt+=5)); do
+    if ! kill -0 "${pids[-1]}" 2>/dev/null; then break; fi
+    if curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:${http_port}/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 5
+  done
+  [[ "$ready" -eq 1 ]] || { echo "D${index} failed to start; see $log_file" >&2; exit 1; }
+  echo "D${index} ready: GPU=${gpu_id} HTTP=${http_port} KV=${kv_port}"
+done
+
+echo "All four Decode instances are ready"
+wait -n "${pids[@]}" || exit $?
+echo "A Decode instance exited unexpectedly" >&2
+exit 1
