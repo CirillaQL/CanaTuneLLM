@@ -10,6 +10,10 @@ set -euo pipefail
 : "${PREFILL_HTTP_PORT_BASE:?Set PREFILL_HTTP_PORT_BASE, for example 8100}"
 : "${PREFILL_KV_PORT_BASE:?Set PREFILL_KV_PORT_BASE, for example 14579}"
 : "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
+PREFILL_KV_SEND_TYPE="${PREFILL_KV_SEND_TYPE:-PUT_ASYNC}"
+[[ "$PREFILL_KV_SEND_TYPE" == PUT || "$PREFILL_KV_SEND_TYPE" == PUT_ASYNC ]] || {
+  echo "PREFILL_KV_SEND_TYPE must be PUT or PUT_ASYNC" >&2; exit 2;
+}
 
 [[ -x "$PYTHON_BIN" ]] || { echo "Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 [[ -d "$MODEL_PATH" ]] || { echo "Model directory does not exist: $MODEL_PATH" >&2; exit 2; }
@@ -51,7 +55,22 @@ chmod 700 "$XDG_RUNTIME_DIR" "$TMPDIR"
 pids=()
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  local pid alive deadline
+  local grace="${NODE_SHUTDOWN_GRACE_S:-20}"
+  [[ "$grace" =~ ^[1-9][0-9]*$ ]] || grace=20
+  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  deadline=$((SECONDS + grace))
+  while ((SECONDS < deadline)); do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
+    done
+    ((alive == 0)) && break
+    sleep 0.2
+  done
+  for pid in "${pids[@]}"; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
@@ -62,7 +81,7 @@ for index in 0 1 2 3; do
   gpu_id=${gpu_ids[$index]}
   http_port=$((PREFILL_HTTP_PORT_BASE + index))
   kv_port=$((PREFILL_KV_PORT_BASE + index))
-  kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"PUT"}}' "$kv_port")
+  kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"%s"}}' "$kv_port" "$PREFILL_KV_SEND_TYPE")
   log_file="${ROLE_WORK_DIR}/logs/prefill_${index}.log"
 
   CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \

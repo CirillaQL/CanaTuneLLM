@@ -68,7 +68,7 @@ kv_transfer:
   connector: P2pNcclConnector
   prefill_role: kv_producer
   decode_role: kv_consumer
-  prefill_send_type: PUT
+  prefill_send_type: PUT_ASYNC  # K1b: TTFT 25-38 % lower than PUT
   disable_prefix_cache: true
   disable_chunked_prefill: true
 
@@ -80,18 +80,100 @@ proxy:
   diagnostics_log: "${raw_root}/launcher/proxy_diagnostics.jsonl"
 
 routing:
-  canary_pair: [P0, D0]
-  production_pairs:
+  # round_robin: baseline (production pairs in turn, no admission, no clock control).
+  # cantune: risk-based admission + tier Controller + telemetry + Canary API.
+  policy: round_robin
+  canary_pair: [P0, D0]       # group G0
+  production_pairs:           # groups G1..G3; P_i/D_i are fixed pairs in v1
     - [P1, D1]
     - [P2, D2]
     - [P3, D3]
-  allow_production_cross_pairs: true
-  production_initial_frequency: high
+  allow_production_cross_pairs: false
 
-  tiers:
-    high: {pair: [P1, D1], prefill_mhz: 2520, decode_mhz: 1500}
-    middle: {pair: [P2, D2], prefill_mhz: 1710, decode_mhz: 975}
-    low: {pair: [P3, D3], prefill_mhz: 900, decode_mhz: 450}
+# Per-request admission (design v2 section 5.2).
+router:
+  theta: 0.10                 # admit only when the cell's violation risk <= theta
+  max_wait_ms: 100            # bounded wait inside the TTFT budget before rejecting
+  retry_period_ms: 20
+  snapshot_max_age_s: 1.0     # older /metrics snapshots count as unknown (unsafe)
+  d_busy_min_running: 1       # D counts as busy with >= this many running sequences
+  chars_per_token: 4          # estimate for text prompts; such samples skip the table
+
+telemetry:
+  enabled: true
+  period_s: 0.25              # /metrics scrape period for all endpoints
+
+# Group control (design v2 section 5.1). No clocks or thresholds are configured:
+# the Canary publishes tiers (park, H, optional L), C_H, alpha and the D wall.
+# Loads are equivalent prompt tokens/s = sum(prompt tokens + alpha) / window.
+controller:
+  period_s: 1.0
+  load_window_s: 10.0
+  t_down_s: 30                # sustained low load before parking / L down-shift
+  wake_load_fraction: 0.85    # wake a parked group above 0.85 C_H mean active load
+  park_load_fraction: 0.7     # park one when the rest carry the total at <= 0.7 C_H
+  min_active_groups: 1
+  stagger_s: 2.0              # groups move to a new tier one at a time
+  energy_log_period_s: 5
+
+# Online risk table R(clock point, N_await, L_in, D busy) (design v2 section 4.1).
+# Starts empty on a new cluster; production runs at MAX and admits everything
+# until the Canary has published tiers and filled the H cells.
+risk:
+  n_await_edges: [0, 1, 2, 3, 5]           # buckets 0,1,2,3,4-5 and >5
+  prompt_token_edges: [128, 512, 1024, 2048]  # buckets <=128 ... <=2048 and >2048
+  min_samples: 20
+  path: null                  # or set CANATUNE_RISK_TABLE
+  seed: {}                    # optional {"1815/1050": 6x5 matrix}; not used by default
+
+clock_control:
+  enabled: false              # true: lock clocks through the per-node GPU agents
+  agent_port: 9300
+  agents:                     # or CANATUNE_PREFILL_AGENT / CANATUNE_DECODE_AGENT
+    prefill: null
+    decode: null
+  min_mhz:                    # agents refuse lower clocks; the Canary never probes below
+    prefill: 600
+    decode: 300
+
+# Canary (design v2 section 6): experiment scheduling, tier locator, probes.
+canary:
+  tier_table_path: null       # or set CANATUNE_TIER_TABLE; keyed by config identity
+  default_lengths:            # (prompt, output) pairs until 50 real requests finished
+    - [128, 64]
+    - [512, 64]
+    - [1024, 64]
+    - [2048, 64]
+  length_min_samples: 50
+  # scheduler
+  period_s: 1.0
+  quiet_s: 60                 # no Router rejection for this long before switching out
+  others_load_max: 0.7        # rest of the pool must carry production at <= 0.7 C_H
+  min_interval_s: 600
+  max_duty: 0.10              # at most 10 % of the time experimenting
+  periodic_s: 1800            # neighbour check of H
+  length_shift: 0.30          # median/p90 change that triggers a P relocation
+  drift_min_samples: 200
+  drain_timeout_s: 30
+  locator:
+    eps: 0.02                 # energy band: within 2 % of the minimum
+    ttft_target_fraction: 0.8 # capacity: TTFT p95 <= 0.8 SLO
+    target_load_fraction: 0.8 # search at 0.8 C0 (consolidated operating point)
+    low_load_fraction: 0.3    # second load for the one-or-two-tiers check
+    fill_load_fractions: [0.3, 0.5, 0.8, 1.0]
+    window_s: 20
+    idle_window_s: 5
+    coarse_points: 5
+    refine_steps: 3
+    limited_fraction_max: 0.3 # skip clocks power/thermal-limited > 30 % of busy time
+    decode_probe_concurrency: 16
+    decode_start_concurrency: 8
+    decode_kv_limit: 0.90
+  probe:
+    settle_s: 2.0
+    sample_period_s: 0.25
+    prefill_min_mhz: 600
+    decode_min_mhz: 300
 
 cache:
   root: "${work_dir}"

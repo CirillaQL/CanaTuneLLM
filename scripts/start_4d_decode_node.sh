@@ -52,7 +52,22 @@ chmod 700 "$XDG_RUNTIME_DIR" "$TMPDIR"
 pids=()
 cleanup() {
   trap - EXIT INT TERM
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  local pid alive deadline
+  local grace="${NODE_SHUTDOWN_GRACE_S:-20}"
+  [[ "$grace" =~ ^[1-9][0-9]*$ ]] || grace=20
+  for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+  deadline=$((SECONDS + grace))
+  while ((SECONDS < deadline)); do
+    alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=1; break; fi
+    done
+    ((alive == 0)) && break
+    sleep 0.2
+  done
+  for pid in "${pids[@]}"; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
   for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 }
 trap cleanup EXIT
