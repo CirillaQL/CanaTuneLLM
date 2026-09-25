@@ -133,6 +133,28 @@ def test_closed_window_idle_power_service_times_and_hardware() -> None:
     p_w, d_w = asyncio.run(probe.idle_power(ClockPoint(900, 450), 0.05))
     assert p_w > 0 and d_w > 0
     samples = asyncio.run(probe.service_times(ClockPoint(2520, 1500), [128, 1024]))
-    assert [t for t, _ in samples] == [128, 1024]
+    assert [t for t, _, _ in samples] == [128, 1024]
+    assert all(ttft is not None and prefill is not None for _, prefill, ttft in samples)
+    assert probe.set_prompt_limit(100) == 64  # only the (64, 3) pair remains
+    assert probe.set_prompt_limit(None) == 160
     hw = asyncio.run(probe.hardware())
     assert hw.prefill_clocks[-1] == 2520 and hw.decode_clocks[-1] == 1500
+
+
+def test_same_load_replays_the_same_trace_at_every_clock() -> None:
+    requests: list = []
+    probe, _ = make_probe(requests, FakeAgent())
+    asyncio.run(probe.open_window(ClockPoint(2520, 1500), 3000.0, 0.0, 0.3, 1.0))
+    first = [len(body["prompt"]) for port, body, _ in requests if port == 8100]
+    requests.clear()
+    asyncio.run(probe.open_window(ClockPoint(1305, 1500), 3000.0, 0.0, 0.3, 1.0))
+    second = [len(body["prompt"]) for port, body, _ in requests if port == 8100]
+    assert first and first == second  # identical arrivals and lengths
+
+
+def test_closed_windows_use_long_outputs() -> None:
+    requests: list = []
+    probe, _ = make_probe(requests, FakeAgent())
+    asyncio.run(probe.closed_window(ClockPoint(1815, 1050), 2, 0.1))
+    decode_bodies = [body for port, body, _ in requests if port == 8200]
+    assert decode_bodies and all(b["max_tokens"] == 256 for b in decode_bodies)

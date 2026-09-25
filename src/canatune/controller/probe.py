@@ -63,6 +63,7 @@ class ProbeSettings:
     vocab_low: int = 1000
     vocab_high: int = 31000
     seed: int = 20260925
+    decode_output_tokens: int = 256  # closed (decode) windows: long outputs load D
     prefill_min_mhz: int = 0  # never probe below these clocks
     decode_min_mhz: int = 0
 
@@ -108,6 +109,7 @@ class CanaryProbe:
         self.log = log or JsonlLog(None)
         self.rng = random.Random(settings.seed)
         self._model: str | None = None
+        self.prompt_limit: int | None = None  # set by the locator (idle TTFT check)
         self._n_await = 0
         self._decoding = 0
 
@@ -241,16 +243,20 @@ class CanaryProbe:
             self.table.record(cell, violated)
         return violated
 
+    def set_prompt_limit(self, max_prompt: int | None) -> float:
+        self.prompt_limit = max_prompt
+        return self.lengths.mean_prompt(max_prompt)
+
     async def service_times(
         self, clock: ClockPoint, prompts: Sequence[int]
-    ) -> list[tuple[int, float]]:
+    ) -> list[tuple[int, float, float | None]]:
         await self.lock(clock)
         out = []
         async with self.client_factory() as client:
             for tokens in prompts:
-                outcome = await self.request(client, tokens, 1)
+                outcome = await self.request(client, tokens, 2)
                 if outcome.status == "ok" and outcome.prefill_ms is not None:
-                    out.append((tokens, outcome.prefill_ms))
+                    out.append((tokens, outcome.prefill_ms, outcome.ttft_ms))
         return out
 
     # ---- windows -------------------------------------------------------------------------------
@@ -316,6 +322,7 @@ class CanaryProbe:
             decode_preemptions=preempt,
             decode_waiting_max=max((s.waiting or 0.0 for s in decode_snaps), default=0.0),
             decode_kv_max=max((s.kv_usage or 0.0 for s in decode_snaps), default=None),
+            decode_running_max=max((s.running or 0.0 for s in decode_snaps), default=None),
             aborted=aborted,
         )
 
@@ -323,7 +330,12 @@ class CanaryProbe:
         self, clock: ClockPoint, eq_tps: float, alpha: float, seconds: float, abort_above: float
     ) -> WindowResult:
         await self.lock(clock)
-        pairs = self.lengths.sample(self.rng, max(1, int(eq_tps * seconds / 64) + 64))
+        # Same load -> same trace: every clock replays identical arrival times and
+        # lengths, so per-request energy is compared on identical work.
+        trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
+        pairs = self.lengths.sample(
+            trace, max(1, int(eq_tps * seconds / 64) + 64), self.prompt_limit
+        )
         mean_eq = sum(p for p, _ in pairs) / len(pairs) + alpha
         rate = eq_tps / mean_eq  # requests/s
         outcomes: list[ProbeOutcome] = []
@@ -359,7 +371,7 @@ class CanaryProbe:
                 task = asyncio.create_task(one(prompt_tokens, output_tokens))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
-                next_at += self.rng.expovariate(rate)
+                next_at += trace.expovariate(rate)
             if tasks:
                 await asyncio.wait(tasks, timeout=self.s.drain_timeout_s)
             for task in tasks:
@@ -385,7 +397,8 @@ class CanaryProbe:
             async def worker() -> None:
                 nonlocal violations
                 while time.monotonic() < deadline:
-                    prompt_tokens, output_tokens = self.lengths.sample(self.rng, 1)[0]
+                    prompt_tokens = self.lengths.sample(self.rng, 1, self.prompt_limit)[0][0]
+                    output_tokens = self.s.decode_output_tokens
                     outcome = await self.request(client, prompt_tokens, output_tokens)
                     outcomes.append(outcome)
                     if self._record(clock, outcome):

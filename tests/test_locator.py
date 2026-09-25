@@ -52,6 +52,8 @@ class SurrogateBackend:
         self.fail_after = fail_after
         self.windows = 0
         self.f_cap = 2040
+        self.long_penalty = 0.0  # extra idle TTFT per token above 1500 (ms)
+        self.limit = None
 
     async def hardware(self):
         return Hardware(tuple(range(600, 2521, 15)), tuple(range(300, 1501, 15)))
@@ -95,7 +97,15 @@ class SurrogateBackend:
     async def service_times(self, clock, prompts):
         self._tick()
         scale = self.s_ms(clock.prefill_mhz) / self.s_ms(2040)
-        return [(p, (28.1 + 0.0615 * p) * scale * (1 + self.rng.gauss(0, 0.01))) for p in prompts]
+        out = []
+        for p in prompts:
+            prefill = (28.1 + 0.0615 * p) * scale * (1 + self.rng.gauss(0, 0.01))
+            out.append((p, prefill, 180 + prefill + self.long_penalty * max(0, p - 1500)))
+        return out
+
+    def set_prompt_limit(self, max_prompt):
+        self.limit = max_prompt
+        return PROMPT
 
     async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
         self._tick()
@@ -186,6 +196,15 @@ def test_aborted_run_resumes_from_cached_windows() -> None:
     asyncio.run(fresh.locate(PROMPT, [128, 512, 1024, 2048]))
     assert backend.windows - before < fresh.run.windows
     assert table.h.prefill_mhz >= 1590
+
+
+def test_prompts_too_long_even_when_idle_are_excluded_from_probes() -> None:
+    backend = SurrogateBackend(seed=7)
+    backend.long_penalty = 0.3  # 2048 tokens: idle TTFT ~ 500 ms > 400 ms target
+    locator = TierLocator(backend, settings())
+    table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024, 2048]))
+    assert table.evidence["prompt_limit"] == 1024 and backend.limit == 1024
+    assert table.evidence["idle_ttft_ms"][2048] > 400 >= table.evidence["idle_ttft_ms"][1024]
 
 
 def test_two_tiers_when_low_load_band_excludes_h() -> None:

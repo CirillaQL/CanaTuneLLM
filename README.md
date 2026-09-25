@@ -326,6 +326,16 @@ is wired into this job yet. With the example `proxy.host: 127.0.0.1`, clients
 must reach the batch node locally or through a tunnel; use an appropriate bind
 address in the site configuration for remote clients.
 
+**Smoke test (Canary cold-start calibration).** `scripts/make_job_config.py`
+writes a job config from `config.yaml` with the allocated nodes, GPU indices and
+UUIDs (pair 0 = Canary; at least 2 pairs). `scripts/smoke_calibrate.py` starts
+the process controller, waits until the Canary publishes a tier table, saves
+`/canatune/state`, `/tiers` and `/risk`, then stops everything (agents reset the
+clocks). The node scripts start one vLLM per listed GPU (1–8) and check
+`PREFILL_GPU_UUIDS` / `DECODE_GPU_UUIDS` before each launch; the agents check
+`gpu_uuids` from the config. Set `CANATUNE_STEP_GPUS=1` to request the GPUs for
+the node steps (`--gpus-per-node=N --gpu-bind=none`).
+
 Run the project checks with:
 
 ```bash

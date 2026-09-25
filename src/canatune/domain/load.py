@@ -79,9 +79,26 @@ class LengthStats:
         with self._lock:
             return len(self._pairs) < self.min_samples
 
-    def sample(self, rng: random.Random, n: int) -> list[tuple[int, int]]:
+    def pairs_upto(self, max_prompt: int | None) -> list[tuple[int, int]]:
+        """Pairs with prompt <= max_prompt (all when None); never empty."""
         pairs = self.pairs()
+        if max_prompt is None:
+            return pairs
+        kept = [(p, o) for p, o in pairs if p <= max_prompt]
+        if kept:
+            return kept
+        outputs = sorted(o for _, o in pairs)
+        return [(max_prompt, outputs[len(outputs) // 2])]
+
+    def sample(
+        self, rng: random.Random, n: int, max_prompt: int | None = None
+    ) -> list[tuple[int, int]]:
+        pairs = self.pairs_upto(max_prompt)
         return [pairs[rng.randrange(len(pairs))] for _ in range(n)]
+
+    def mean_prompt(self, max_prompt: int | None = None) -> float:
+        pairs = self.pairs_upto(max_prompt)
+        return sum(p for p, _ in pairs) / len(pairs)
 
     def summary(self) -> LengthSummary:
         pairs = self.pairs()

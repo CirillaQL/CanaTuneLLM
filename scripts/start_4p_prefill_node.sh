@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Run on the allocated Prefill host. Starts four TP=1 vLLM producers,
-# one per GPU. Supply site-specific values through the variables below.
+# Run on the allocated Prefill host. Starts one TP=1 vLLM producers,
+# per GPU in PREFILL_GPU_IDS (1-8 GPUs; endpoint i uses port base + i). Optional
+# PREFILL_GPU_UUIDS (same order) is checked before each launch: GPUs are not
+# cgroup-constrained on the cluster, so a wrong index would hit another job's GPU.
+# Supply site-specific values through the variables below.
 set -euo pipefail
 
 : "${PYTHON_BIN:?Set PYTHON_BIN to the vLLM environment's Python executable}"
@@ -20,7 +23,12 @@ PREFILL_KV_SEND_TYPE="${PREFILL_KV_SEND_TYPE:-PUT_ASYNC}"
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
 
 IFS=, read -r -a gpu_ids <<< "$PREFILL_GPU_IDS"
-[[ ${#gpu_ids[@]} -eq 4 ]] || { echo "Exactly four Prefill GPU IDs are required" >&2; exit 2; }
+(( ${#gpu_ids[@]} >= 1 && ${#gpu_ids[@]} <= 8 )) || { echo "1-8 Prefill GPU IDs are required" >&2; exit 2; }
+gpu_uuids=()
+if [[ -n "${PREFILL_GPU_UUIDS:-}" ]]; then
+  IFS=, read -r -a gpu_uuids <<< "$PREFILL_GPU_UUIDS"
+  [[ ${#gpu_uuids[@]} -eq ${#gpu_ids[@]} ]] || { echo "PREFILL_GPU_UUIDS must match PREFILL_GPU_IDS" >&2; exit 2; }
+fi
 for gpu_id in "${gpu_ids[@]}"; do
   [[ "$gpu_id" =~ ^[0-9]+$ ]] || { echo "Invalid GPU ID: $gpu_id" >&2; exit 2; }
 done
@@ -77,8 +85,14 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for index in 0 1 2 3; do
+for index in "${!gpu_ids[@]}"; do
   gpu_id=${gpu_ids[$index]}
+  if [[ ${#gpu_uuids[@]} -gt 0 ]]; then
+    actual=$(nvidia-smi -i "$gpu_id" --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
+    [[ "$actual" == "${gpu_uuids[$index]}" ]] || {
+      echo "GPU $gpu_id is $actual, expected ${gpu_uuids[$index]}; refusing to start" >&2; exit 97;
+    }
+  fi
   http_port=$((PREFILL_HTTP_PORT_BASE + index))
   kv_port=$((PREFILL_KV_PORT_BASE + index))
   kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"%s"}}' "$kv_port" "$PREFILL_KV_SEND_TYPE")
@@ -94,7 +108,7 @@ for index in 0 1 2 3; do
 
   ready=0
   for ((attempt=0; attempt<${STARTUP_TIMEOUT_S:-1500}; attempt+=5)); do
-    if ! kill -0 "${pids[-1]}" 2>/dev/null; then break; fi
+    if ! kill -0 "${pids[${#pids[@]}-1]}" 2>/dev/null; then break; fi
     if curl -fsS --connect-timeout 2 --max-time 3 "http://127.0.0.1:${http_port}/health" >/dev/null 2>&1; then
       ready=1
       break
@@ -105,7 +119,15 @@ for index in 0 1 2 3; do
   echo "P${index} ready: GPU=${gpu_id} HTTP=${http_port} KV=${kv_port}"
 done
 
-echo "All four Prefill instances are ready"
-wait -n "${pids[@]}" || exit $?
-echo "A Prefill instance exited unexpectedly" >&2
-exit 1
+echo "All ${#gpu_ids[@]} Prefill instances are ready"
+# Stay up while every instance runs (portable: no `wait -n`, which needs bash 4.3).
+while true; do
+  for pid in "${pids[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"; rc=$?
+      echo "A Prefill instance exited unexpectedly (status $rc)" >&2
+      exit 1
+    fi
+  done
+  sleep 2
+done

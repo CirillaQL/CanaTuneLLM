@@ -11,6 +11,8 @@ Canary discovers tiers, so the clock set is not configured in advance.
 Environment:
   CANATUNE_AGENT_GPUS         comma-separated physical GPU indices (required)
   CANATUNE_AGENT_MIN_MHZ      lowest SM clock that may be locked (default 0)
+  CANATUNE_AGENT_GPU_UUIDS    UUIDs in the same order as the GPUs; the agent refuses
+                              to start on a mismatch (GPUs are not cgroup-isolated)
   CANATUNE_AGENT_MEMORY_MHZ   memory clock locked once before the first SM lock (optional)
   CANATUNE_AGENT_HOST/PORT    bind address (default 0.0.0.0:9300)
   CANATUNE_AGENT_DRY_RUN=1    fake GPUs (tests, laptops)
@@ -32,12 +34,25 @@ from pydantic import BaseModel
 class GpuBackend:
     """NVML reads plus `sudo -n nvidia-smi` locks for a fixed set of GPUs."""
 
-    def __init__(self, indices: Iterable[int], *, memory_mhz: int | None = None) -> None:
+    def __init__(
+        self,
+        indices: Iterable[int],
+        *,
+        memory_mhz: int | None = None,
+        expected_uuids: Iterable[str] | None = None,
+    ) -> None:
         import pynvml  # nvidia-ml-py; only needed where GPUs exist
 
         pynvml.nvmlInit()
         self.nv = pynvml
+        indices = list(indices)
         self.handles = {i: pynvml.nvmlDeviceGetHandleByIndex(i) for i in indices}
+        if expected_uuids is not None:
+            for index, expected in zip(indices, expected_uuids, strict=True):
+                actual = pynvml.nvmlDeviceGetUUID(self.handles[index])
+                actual = actual.decode() if isinstance(actual, bytes) else actual
+                if actual != expected:
+                    raise RuntimeError(f"GPU {index} is {actual}, expected {expected}")
         self.memory_mhz = memory_mhz
         self.memory_locked: set[int] = set()
 
@@ -263,7 +278,11 @@ def service_from_env() -> ClockService:
     allowed = _int_list(raw_allowed, "CANATUNE_AGENT_ALLOWED_MHZ") if raw_allowed else None
     memory = os.environ.get("CANATUNE_AGENT_MEMORY_MHZ")
     backend_type = DryRunBackend if os.environ.get("CANATUNE_AGENT_DRY_RUN") == "1" else GpuBackend
-    backend = backend_type(gpus, memory_mhz=int(memory) if memory else None)
+    raw_uuids = os.environ.get("CANATUNE_AGENT_GPU_UUIDS")
+    uuids = [u.strip() for u in raw_uuids.split(",")] if raw_uuids else None
+    if uuids is not None and len(uuids) != len(gpus):
+        raise ValueError("CANATUNE_AGENT_GPU_UUIDS must list one UUID per GPU")
+    backend = backend_type(gpus, memory_mhz=int(memory) if memory else None, expected_uuids=uuids)
     min_mhz = int(os.environ.get("CANATUNE_AGENT_MIN_MHZ", "0"))
     return ClockService(backend, gpus, allowed, min_mhz=min_mhz)
 

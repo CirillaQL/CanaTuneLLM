@@ -3,7 +3,10 @@
 Procedure (design v2 §6.2; validated offline by replaying K2/K3b/K4a data):
 
 1. park     idle power at a few clocks, lowest power wins (noise -> lowest clock)
-2. alpha    per-request fixed prefill cost in tokens: fit prefill time = a + b*L
+2. alpha    per-request fixed prefill cost in tokens: fit prefill time = a + b*L;
+            prompt lengths whose TTFT misses the target even on an idle system are
+            excluded from later probes (the Router rejects them; they would only
+            make every load look infeasible)
 3. ramp     at the highest clock, double the load (equivalent tokens/s) until TTFT
             p95 reaches the target, bisect twice -> C0; the clock actually reached
             under load is the search ceiling f_eff (power cap)
@@ -64,6 +67,7 @@ class WindowResult:
     decode_preemptions: float = 0.0
     decode_waiting_max: float = 0.0
     decode_kv_max: float | None = None
+    decode_running_max: float | None = None  # sequences D actually ran (telemetry)
     aborted: bool = False
 
     def summary(self) -> dict[str, Any]:
@@ -93,8 +97,12 @@ class ProbeBackend(Protocol):
 
     async def service_times(
         self, clock: ClockPoint, prompts: Sequence[int]
-    ) -> list[tuple[int, float]]:
-        """(prompt tokens, prefill ms) of sequential single requests."""
+    ) -> list[tuple[int, float, float | None]]:
+        """(prompt tokens, prefill ms, TTFT ms) of sequential single requests."""
+        ...
+
+    def set_prompt_limit(self, max_prompt: int | None) -> float:
+        """Probe only prompts <= max_prompt from now on; -> mean probe prompt length."""
         ...
 
     async def open_window(
@@ -337,17 +345,31 @@ class TierLocator:
         self.run.evidence["idle_power_w"] = {"prefill": p_power, "decode": d_power}
         return ClockPoint(lowest(p_power), lowest(d_power))
 
-    async def alpha(self, top: ClockPoint, prompts: Sequence[int]) -> float:
+    async def alpha(self, top: ClockPoint, prompts: Sequence[int]) -> tuple[float, int | None]:
+        """-> (alpha tokens, largest prompt that meets the TTFT target when idle;
+        None when every tested length does)."""
         self._phase("alpha")
         lengths = sorted(set(prompts))
         samples = await self._cached(
             ("service", top, tuple(lengths)),
             lambda: self.backend.service_times(top, lengths * self.s.service_repeats),
         )
-        alpha = fit_alpha(samples)
+        alpha = fit_alpha([(t, ms) for t, ms, _ in samples])
+        target = self.s.ttft_target_fraction * self.s.ttft_slo_ms
+        idle_ttft: dict[int, float] = {}
+        for tokens in lengths:
+            values = sorted(ttft for t, _, ttft in samples if t == tokens and ttft is not None)
+            if values:
+                idle_ttft[tokens] = values[len(values) // 2]
+        ok = [t for t in lengths if idle_ttft.get(t, float("inf")) <= target]
+        if not ok:
+            raise LocatorError("no prompt length meets the TTFT target even on an idle system")
+        limit = None if len(ok) == len(lengths) else max(ok)
         assert self.run is not None
-        self.run.evidence["alpha_tokens"] = alpha
-        return alpha
+        self.run.evidence.update(
+            {"alpha_tokens": alpha, "idle_ttft_ms": idle_ttft, "prompt_limit": limit}
+        )
+        return alpha, limit
 
     async def ramp(
         self, hw: Hardware, top: ClockPoint, alpha: float, mean_prompt: float
@@ -491,12 +513,15 @@ class TierLocator:
         emin = min(ok.values())
         f_d = max(f for f, e in ok.items() if e <= (1 + self.s.eps) * emin)
 
-        async def b_star(f: int) -> int:
+        async def b_star(f: int) -> tuple[int, WindowResult | None]:
+            """Largest clean client concurrency and its window."""
             point = ClockPoint(prefill_mhz, f)
             c, good, bad = self.s.decode_start_concurrency, 0, None
+            good_w: WindowResult | None = None
             while c <= self.s.decode_max_concurrency:
-                if self.decode_clean(await self.closed(point, c)):
-                    good, c = c, c * 2
+                w = await self.closed(point, c)
+                if self.decode_clean(w):
+                    good, good_w, c = c, w, c * 2
                 else:
                     bad = c
                     break
@@ -506,15 +531,16 @@ class TierLocator:
                     mid = (lo + hi) // 2
                     if mid in (lo, hi):
                         break
-                    if self.decode_clean(await self.closed(point, mid)):
-                        lo = mid
+                    w = await self.closed(point, mid)
+                    if self.decode_clean(w):
+                        lo, good_w = mid, w
                     else:
                         hi = mid
                 good = lo
-            return good
+            return good, good_w
 
         self._phase("decode_wall")
-        b_low = await b_star(f_d)
+        b_low, b_window = await b_star(f_d)
         if b_low <= 0:
             raise LocatorError("decode is not clean even at the start concurrency")
         # Wall check with one window: is the highest D clock clean clearly beyond B*?
@@ -525,12 +551,17 @@ class TierLocator:
         else:
             clean = self.decode_clean(await self.closed(ClockPoint(prefill_mhz, top_d), beyond))
             wall, b_high = not clean, (beyond if clean else b_low)
+        # Admission compares D running+waiting sequences, so publish what D actually
+        # ran in the clean B* window (client concurrency also waits at P).
+        running = None if b_window is None else b_window.decode_running_max
+        b_published = int(running) if running else b_low
         evidence = {
             "decode_j_per_token": ok,
-            "b_star": {str(f_d): b_low, f"{top_d}_at_least": b_high},
+            "b_star_concurrency": {str(f_d): b_low, f"{top_d}_at_least": b_high},
+            "b_star_running": b_published,
             "kv_wall": wall,
         }
-        return f_d, b_low, wall, evidence
+        return f_d, b_published, wall, evidence
 
     async def fill(self, point: ClockPoint, c0: float, alpha: float) -> float:
         """Windows at H over several loads (risk-table samples); -> C_H."""
@@ -556,7 +587,9 @@ class TierLocator:
         hw = await self.backend.hardware()
         top = ClockPoint(hw.prefill_clocks[-1], hw.decode_clocks[-1])
         park = previous.park if previous is not None else await self.park(hw)
-        alpha = await self.alpha(top, prompts)
+        self.backend.set_prompt_limit(None)
+        alpha, limit = await self.alpha(top, prompts)
+        mean_prompt = self.mean_prompt = self.backend.set_prompt_limit(limit)
         c0, f_eff = await self.ramp(hw, top, alpha, mean_prompt)
         f_h, meas_hi = await self.search_prefill(
             hw, f_eff, top.decode_mhz, self.s.target_load_fraction * c0, alpha, "target"

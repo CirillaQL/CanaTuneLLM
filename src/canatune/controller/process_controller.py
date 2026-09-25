@@ -217,11 +217,23 @@ def main() -> int:
     decode_port = int(os.environ["DECODE_HTTP_PORT_BASE"])
     proxy = config["proxy"]
     proxy_host = "127.0.0.1" if proxy["host"] == "0.0.0.0" else proxy["host"]
+    roles = [e["role"] for e in config["topology"]["endpoints"].values()]
+    counts = {role: roles.count(role) for role in ("prefill", "decode")}
     endpoint_urls = [
         f"http://{host}:{base + index}/health"
-        for host, base in ((prefill_host, prefill_port), (decode_host, decode_port))
-        for index in range(4)
+        for role, host, base in (
+            ("prefill", prefill_host, prefill_port),
+            ("decode", decode_host, decode_port),
+        )
+        for index in range(counts[role])
     ]
+    # Node steps: optionally request the role's GPUs for the step without binding
+    # (each vLLM process selects its own GPU via CUDA_VISIBLE_DEVICES).
+    step_gpus = os.environ.get("CANATUNE_STEP_GPUS") == "1"
+
+    def gpu_args(role: str) -> list[str]:
+        return [f"--gpus-per-node={counts[role]}", "--gpu-bind=none"] if step_gpus else []
+
     endpoint_timeout_s = _positive_seconds(
         os.environ.get("ENDPOINT_TIMEOUT_S", "6030"), "ENDPOINT_TIMEOUT_S"
     )
@@ -233,14 +245,17 @@ def main() -> int:
     agent_health_urls: list[str] = []
     clock_control = config.get("clock_control", {})
     if clock_control.get("enabled"):
-        port = int(clock_control.get("agent_port", 9300))
+        raw_port = clock_control.get("agent_port", 9300)
         topology = config["topology"]
         for role, node, host in (
             ("prefill", prefill_node, prefill_host),
             ("decode", decode_node, decode_host),
         ):
+            # One port for both nodes, or {prefill: ..., decode: ...}.
+            port = int(raw_port[role] if isinstance(raw_port, dict) else raw_port)
             group = topology[f"{role}_nodegroup"]
             min_mhz = int((clock_control.get("min_mhz") or {}).get(role, 0))
+            memory = group.get("memory_frequency_mhz")
             agent_commands[role] = [
                 "srun",
                 "--overlap",
@@ -250,8 +265,13 @@ def main() -> int:
                 "env",
                 f"CANATUNE_AGENT_GPUS={','.join(map(str, group['gpu_ids']))}",
                 f"CANATUNE_AGENT_MIN_MHZ={min_mhz}",
-                f"CANATUNE_AGENT_MEMORY_MHZ={group['memory_frequency_mhz']}",
                 f"CANATUNE_AGENT_PORT={port}",
+                *([f"CANATUNE_AGENT_MEMORY_MHZ={memory}"] if memory else []),
+                *(
+                    [f"CANATUNE_AGENT_GPU_UUIDS={','.join(group['gpu_uuids'])}"]
+                    if group.get("gpu_uuids")
+                    else []
+                ),
                 sys.executable,
                 "-m",
                 "canatune.infrastructure.gpu_agent",
@@ -277,6 +297,7 @@ def main() -> int:
                 "--nodes=1",
                 "--ntasks=1",
                 f"--nodelist={prefill_node}",
+                *gpu_args("prefill"),
                 "bash",
                 str(root / "scripts/start_4p_prefill_node.sh"),
             ),
@@ -286,6 +307,7 @@ def main() -> int:
                 "--nodes=1",
                 "--ntasks=1",
                 f"--nodelist={decode_node}",
+                *gpu_args("decode"),
                 "bash",
                 str(root / "scripts/start_4d_decode_node.sh"),
             ),
