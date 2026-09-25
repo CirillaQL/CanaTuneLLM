@@ -269,7 +269,7 @@ class CanaryScheduler:
                 self.controller.log.write({"event": "canary_error", "error": repr(error)})
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.s.period_s)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
         if self.running:
             assert self.task is not None

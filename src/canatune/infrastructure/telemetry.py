@@ -110,7 +110,7 @@ class Telemetry:
                 await self.scrape_once(client)
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=self.period_s)
-                except TimeoutError:
+                except asyncio.TimeoutError:
                     pass
 
     def fresh(self, endpoint: str, max_age_s: float) -> EndpointSnapshot | None:

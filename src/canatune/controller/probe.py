@@ -270,7 +270,7 @@ class CanaryProbe:
                 self.log.write({"event": "probe_sample_error", "error": repr(error)})
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.s.sample_period_s)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
 
     def _result(

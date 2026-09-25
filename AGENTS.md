@@ -26,7 +26,7 @@ empirical Canary measurements instead of a learned runtime performance model.
 
 ## 4. Development
 
-- Python 3.11 or newer is required.
+- Python 3.10 or newer is required (the cluster vLLM env is 3.10).
 - Install dependencies with `uv sync --extra dev`.
 - Run tests with `uv run pytest`.
 - Run static checks with `uv run ruff check .`.

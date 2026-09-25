@@ -301,7 +301,7 @@ class TierController:
                 self.log.write({"event": "controller_error", "error": repr(error)})
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.settings.period_s)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
 
     def state(self) -> dict[str, Any]:

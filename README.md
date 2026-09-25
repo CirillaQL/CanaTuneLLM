@@ -251,7 +251,7 @@ src/canatune/
 
 ## Development
 
-Python 3.11 or newer is required.
+Python 3.10 or newer is required (the cluster's vLLM env is 3.10).
 
 ```bash
 uv sync --extra dev

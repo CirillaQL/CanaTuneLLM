@@ -13,9 +13,16 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from enum import StrEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any
+
+
+class StrEnum(str, Enum):
+    """`enum.StrEnum` for Python 3.10 (the cluster's vLLM env): members are strings."""
+
+    def __str__(self) -> str:
+        return self.value
 
 
 class Tier(StrEnum):
