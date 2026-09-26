@@ -20,8 +20,13 @@ Procedure (design v2 §6.2; validated offline by replaying K2/K3b/K4a data):
             H there (a second tier must pay for its clock switches)
 8. decode   J/token over D clocks at a fixed concurrency; B* (clean concurrency)
             at the chosen and the highest D clock: equal -> KV wall
-9. fill     windows at H over several loads so the risk table has samples before
-            production switches to it; C_H = highest load meeting the target
+9. joint    P at H together with D at the chosen clock at 0.8*C0 (and L at
+            0.3*C0): raise D a step until it holds; P and D are each measured with
+            the other at its ceiling, and a slow D also delays the first token
+            (smoke r3: D 735 alone was clean, with P at H TTFT doubled)
+10. fill    windows at H over several loads so the risk table has samples before
+            production switches to it; C_H = highest load meeting the target,
+            bisected between the last feasible and the first infeasible load
 
 Every window result is cached, so an aborted run resumes where it stopped.
 The locator never touches production: the backend drives only the Canary pair.
@@ -130,6 +135,7 @@ class LocatorSettings:
     low_load_fraction: float = 0.3
     l_tier_min_gain: float = 0.04  # add L only when it saves clearly more than noise (2 eps)
     fill_load_fractions: tuple[float, ...] = (0.3, 0.5, 0.8, 1.0)
+    fill_bisect_steps: int = 2  # C_H between the fill loads (smoke r3: 0.5 vs 0.8 C0)
     window_s: float = 20.0
     min_window_requests: int = 60  # 0 violations -> bound ~3 %: tells 5 % from 10 %
     max_window_s: float = 120.0
@@ -588,17 +594,49 @@ class TierLocator:
         }
         return f_d, b_published, wall, evidence
 
+    async def joint(
+        self, hw: Hardware, prefill_mhz: int, decode_mhz: int, load: float, alpha: float
+    ) -> tuple[int, dict[str, Any]]:
+        """-> (lowest D clock from `decode_mhz` up that holds with P at `prefill_mhz`
+        under `load`, evidence). The top D clock is where P was searched, so its
+        window is usually cached."""
+        top_d = hw.decode_clocks[-1]
+        ladder = sorted(set(spread(hw.decode_clocks, decode_mhz, top_d, self.s.coarse_points - 1)))
+        tried: dict[str, Any] = {}
+        for f in ladder:
+            w = await self.open(ClockPoint(prefill_mhz, f), load, alpha)
+            tried[str(f)] = {
+                "requests": w.requests,
+                "violations": w.violations,
+                "ttft_p95_ms": w.ttft_p95_ms,
+            }
+            if self.meets_target(w):
+                return f, tried
+        raise LocatorError(
+            f"P {prefill_mhz} MHz misses the SLO at load {load:.0f} with every D clock"
+        )
+
     async def fill(self, point: ClockPoint, c0: float, alpha: float) -> float:
         """Windows at H over several loads (risk-table samples); -> C_H."""
         self._phase("fill")
-        capacity = 0.0
+        good: list[float] = []
+        bad: list[float] = []
         for fraction in self.s.fill_load_fractions:
             w = await self.open(point, fraction * c0, alpha)
-            if self.meets_target(w):
-                capacity = max(capacity, w.load)
-        if capacity <= 0:
+            (good if self.meets_target(w) else bad).append(w.load)
+        if not good:
             raise LocatorError("no fill load is feasible at H: table not published")
-        return capacity
+        lo = max(good)
+        above = [load for load in bad if load > lo]
+        if above:
+            hi = min(above)
+            for _ in range(self.s.fill_bisect_steps):
+                w = await self.open(point, (lo + hi) / 2, alpha)
+                if self.meets_target(w):
+                    lo = w.load
+                else:
+                    hi = w.load
+        return lo
 
     # ---- full and partial runs ---------------------------------------------------------
 
@@ -645,6 +683,17 @@ class TierLocator:
             d_evidence = {"reused_from_previous": True}
         else:
             f_d, b_star, wall, d_evidence = await self.decode(hw, f_eff)
+
+        self._phase("joint")
+        target_load = self.s.target_load_fraction * c0
+        f_d_alone = f_d
+        f_d, joint_h = await self.joint(hw, f_h, f_d, target_load, alpha)
+        joint_evidence: dict[str, Any] = {"h": joint_h, "decode_alone": f_d_alone}
+        if f_l is not None:
+            w = await self.open(ClockPoint(f_l, f_d), low_load, alpha)
+            joint_evidence["l"] = {"violations": w.violations, "requests": w.requests}
+            if not self.feasible(w):
+                f_l = None  # L was only checked with D at its ceiling
         h = ClockPoint(f_h, f_d)
         capacity = await self.fill(h, c0, alpha)
 
@@ -653,13 +702,15 @@ class TierLocator:
             {
                 "f_h": f_h,
                 "f_l": f_l,
-                "target_load": self.s.target_load_fraction * c0,
+                "target_load": target_load,
                 "low_load": low_load,
                 "prefill_energy_target": {
                     str(f): w.prefill_j_per_request for f, w in sorted(meas_hi.items())
                 },
                 "prefill_energy_low": {str(f): e for f, e in sorted(low_e.items())},
                 "decode": d_evidence,
+                "joint": joint_evidence,
+                "capacity_h_fraction": capacity / c0,
                 "windows": self.run.windows,
                 "reused_windows": self.run.reused,
                 "duration_s": self._clock() - self.run.started_at,

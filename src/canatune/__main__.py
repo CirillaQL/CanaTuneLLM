@@ -16,6 +16,7 @@ def main() -> None:
         factory=True,
         host=str(proxy["host"]),
         port=int(proxy["port"]),
+        access_log=False,  # per-request lines flooded the job console (smoke r3)
     )
 
 

@@ -244,6 +244,36 @@ def test_pressure_with_nothing_parked_aborts_canary() -> None:
     assert reasons == ["load_above_wake"]
 
 
+def test_pressure_without_experiment_boosts_to_max_then_returns_to_h() -> None:
+    clock, _, groups, _, _, controller, _ = setup(table=published(capacity_h=100.0))
+    activate(groups)
+    controller.on_pressure = lambda reason: False  # no experiment to abort
+    for g in groups:
+        for _ in range(10):
+            g.record_admission(clock.now, 512, 10)
+    asyncio.run(controller.tick())
+    assert [g.tier for g in groups].count(Tier.MAX) == 1  # one group per tick
+    for _ in groups:
+        asyncio.run(controller.tick())
+    assert all(g.tier is Tier.MAX and g.effective == MAX for g in groups)
+    clock.now += 60  # load gone
+    for _ in range(2 * len(groups) + 2):
+        asyncio.run(controller.tick())
+        clock.now += 31
+    assert all(g.tier is Tier.H for g in groups if g.state is GroupState.ACTIVE)
+
+
+def test_pressure_aborting_the_canary_does_not_boost() -> None:
+    clock, _, groups, _, _, controller, _ = setup(table=published(capacity_h=100.0))
+    activate(groups)
+    controller.on_pressure = lambda reason: True  # the Canary comes back instead
+    for g in groups:
+        for _ in range(10):
+            g.record_admission(clock.now, 512, 10)
+    asyncio.run(controller.tick())
+    assert all(g.tier is Tier.H for g in groups)
+
+
 def test_l_h_switching_with_hysteresis() -> None:
     clock, risk, groups, _, _, controller, _ = setup(
         table=published(l=L, tau_up=2000.0, tau_down=1000.0)

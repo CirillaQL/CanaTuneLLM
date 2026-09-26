@@ -348,7 +348,11 @@ def test_no_feasible_fill_load_publishes_nothing() -> None:
             w.violations = w.requests
         return w
 
+    async def joint_as_measured(hw, prefill_mhz, decode_mhz, load, alpha):
+        return decode_mhz, {}  # keep D where decode chose it: fill windows are new
+
     backend.open_window = fill_fails
+    locator.joint = joint_as_measured
     with pytest.raises(LocatorError, match="not published"):
         asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
 
@@ -357,3 +361,38 @@ def test_alpha_lengths_include_the_longest_prompt() -> None:
     _, _, _, _, scheduler = build(SurrogateBackend(seed=12))
     scheduler.lengths = LengthStats([(128, 8)] * 50 + [(4000, 8)], min_samples=1)
     assert 4000 in scheduler._prompts()
+
+
+def test_joint_check_raises_d_when_slow_d_breaks_ttft_at_h() -> None:
+    backend = SurrogateBackend(seed=13)
+    original = backend.open_window
+
+    async def slow_d_delays_first_token(clock, eq_tps, alpha, seconds, abort_above):
+        w = await original(clock, eq_tps, alpha, seconds, abort_above)
+        if clock.decode_mhz < 1000 and eq_tps > 0.6 * 4000:  # smoke r3: D 735 at 0.8 C0
+            w.violations = w.requests // 4
+        return w
+
+    backend.open_window = slow_d_delays_first_token
+    table = asyncio.run(TierLocator(backend, settings()).locate(PROMPT, [128, 512, 1024]))
+    joint = table.evidence["joint"]
+    assert joint["decode_alone"] < 1000 <= table.h.decode_mhz
+    assert table.capacity_h >= table.evidence["target_load"]
+
+
+def test_fill_bisects_capacity_between_fill_loads() -> None:
+    backend = SurrogateBackend(seed=14)
+    locator = TierLocator(backend, settings())
+    original = backend.open_window
+
+    async def wall_at_090(clock, eq_tps, alpha, seconds, abort_above):
+        w = await original(clock, eq_tps, alpha, seconds, abort_above)
+        c0 = (locator.run.evidence if locator.run else {}).get("capacity_c0")
+        if locator.run is not None and locator.run.phase == "fill" and eq_tps > 0.9 * c0:
+            w.violations = w.requests
+        return w
+
+    backend.open_window = wall_at_090
+    table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
+    c0 = table.evidence["capacity_c0"]
+    assert 0.8 * c0 < table.capacity_h <= 0.9 * c0

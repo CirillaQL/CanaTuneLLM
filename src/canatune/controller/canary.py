@@ -15,7 +15,8 @@ The Canary then drains (no new requests; in-flight ones finish) and explores.
 
 Stop: the locator finishes (the new table is published), or the Controller
 reports pressure it cannot relieve by waking a parked group (abort: the
-Canary locks back to H and serves). Window results are cached in the locator,
+Canary locks back to H and serves; only without an experiment to abort does
+the Controller raise groups to MAX). Window results are cached in the locator,
 so an aborted run resumes where it stopped next time.
 """
 
@@ -150,19 +151,24 @@ class CanaryScheduler:
 
     # ---- control --------------------------------------------------------------------------
 
-    def abort(self, reason: str) -> None:
-        """Called by the Controller under pressure it cannot relieve otherwise."""
+    def abort(self, reason: str) -> bool:
+        """Called by the Controller under pressure it cannot relieve otherwise;
+        -> whether an experiment (running or about to start) was stopped."""
         if self.controller.tiers.table is None:
-            return  # cold start: production is at MAX and admits everything
+            return False  # cold start: production is at MAX and admits everything
+        stopped = False
         if self.running:
             assert self.task is not None
             self.task.cancel()
             self.controller.log.write({"event": "canary_abort", "reason": reason})
+            stopped = True
         if self._pending is not None:
             self._pending = None
+            stopped = True
             canary = self.canary
             if canary is not None and canary.state is GroupState.DRAINING:
                 canary.state = GroupState.ACTIVE
+        return stopped
 
     def request(self, kind: str, reason: str) -> tuple[bool, str]:
         """Manual start through the control API (start conditions still apply)."""

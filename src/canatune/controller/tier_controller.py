@@ -6,7 +6,11 @@ Once the Canary publishes a table, production groups move to H one at a time,
 and from then on the Controller
 * wakes a parked group when the Router rejected requests or the mean active
   load exceeds `wake_load_fraction * C_H`; if nothing is parked it asks the
-  Canary to abort its experiment (pressure order: wake -> abort Canary -> reject),
+  Canary to abort its experiment; if the Canary is not experimenting either, it
+  raises the most loaded working group to MAX (pressure order: wake -> abort
+  Canary -> MAX -> reject), so C_H never caps what MAX could serve; groups go
+  back to H once the mean load stays below `park_load_fraction * C_H` for
+  `t_down_s`,
 * switches L/H per group when the Canary published an L tier,
 * drains and parks the least-loaded group when the rest could carry the total
   at `park_load_fraction * C_H` for `t_down_s`.
@@ -93,9 +97,11 @@ class TierController:
         self._clock = clock
         self._low_since: dict[str, float] = {}
         self._consolidate_since: float | None = None
+        self._calm_since: float | None = None
         self._rejections_seen = 0
         self._last_energy_log = float("-inf")
-        self.on_pressure: Callable[[str], None] | None = None  # set by the Canary scheduler
+        # Set by the Canary scheduler: abort an experiment; -> whether one was aborted.
+        self.on_pressure: Callable[[str], bool] | None = None
 
     # ---- actuation ---------------------------------------------------------------
 
@@ -202,22 +208,54 @@ class TierController:
         capacity = table.capacity_h
         mean_load = sum(loads[g.name] for g in active) / len(active) if active else float("inf")
 
-        # Pressure: wake a parked group; with none left, the Canary must come back.
+        # Pressure: wake a parked group; with none left, the Canary must come back;
+        # with the Canary serving too, raise a group to MAX before the Router rejects.
         if new_rejections > 0 or mean_load > s.wake_load_fraction * capacity:
+            self._calm_since = None
             reason = "rejections" if new_rejections else "load_above_wake"
             woken = await self.wake(reason)
             if woken is not None:
                 active.append(woken)
-            elif self.on_pressure is not None:
-                self.on_pressure(reason)
+            elif not (self.on_pressure is not None and self.on_pressure(reason)):
+                await self._boost(active, loads, reason)
+        else:
+            await self._unboost(active, loads, mean_load <= s.park_load_fraction * capacity, now)
 
         await self._switch_l_h(table, active, loads, now)
         await self._consolidate(table, active, loads, now)
         await self._finish_draining()
 
+    async def _boost(
+        self, active: Sequence[Group], loads: Mapping[str, float], reason: str
+    ) -> None:
+        """Raise the most loaded H group to MAX (one per tick); L groups go to H
+        first through the tau_up switch."""
+        working = [g for g in active if g.tier is Tier.H]
+        if working:
+            group = max(working, key=lambda g: (loads[g.name], g.n_inflight))
+            await self.set_tier(group, Tier.MAX, f"boost:{reason}")
+
+    async def _unboost(
+        self, active: Sequence[Group], loads: Mapping[str, float], calm: bool, now: float
+    ) -> None:
+        """Return one MAX group to H after the load stayed low for t_down_s."""
+        boosted = [g for g in active if g.tier is Tier.MAX]
+        if not boosted or not calm:
+            self._calm_since = None
+            return
+        if self._calm_since is None:
+            self._calm_since = now
+            return
+        if now - self._calm_since < self.settings.t_down_s:
+            return
+        self._calm_since = now  # the next group waits another t_down_s
+        group = min(boosted, key=lambda g: (loads[g.name], g.n_inflight))
+        await self.set_tier(group, Tier.H, "unboost")
+
     async def _switch_l_h(
         self, table: TierTable, active: Sequence[Group], loads: Mapping[str, float], now: float
     ) -> None:
+        active = [g for g in active if g.tier is not Tier.MAX]  # boosted: see _unboost
         if table.l is None or table.tau_up is None or table.tau_down is None:
             for group in active:
                 if group.tier is not Tier.H:

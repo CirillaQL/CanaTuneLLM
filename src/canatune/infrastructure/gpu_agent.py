@@ -296,6 +296,7 @@ def main() -> None:
             create_agent_app(service),
             host=os.environ.get("CANATUNE_AGENT_HOST", "0.0.0.0"),
             port=int(os.environ.get("CANATUNE_AGENT_PORT", "9300")),
+            access_log=False,  # the controller polls /gpus every second
         )
     finally:
         # Never leave clocks locked after the job: reset every managed GPU.

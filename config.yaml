@@ -160,6 +160,7 @@ canary:
     target_load_fraction: 0.8 # search at 0.8 C0 (consolidated operating point)
     low_load_fraction: 0.3    # second load for the one-or-two-tiers check
     fill_load_fractions: [0.3, 0.5, 0.8, 1.0]
+    fill_bisect_steps: 2      # C_H between the fill loads (bisection)
     window_s: 20
     min_window_requests: 60   # violation bound with 0/60 is ~3 %
     max_window_s: 120
