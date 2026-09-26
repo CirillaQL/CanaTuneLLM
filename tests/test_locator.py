@@ -201,11 +201,11 @@ def test_aborted_run_resumes_from_cached_windows() -> None:
 
 def test_prompts_too_long_even_when_idle_are_excluded_from_probes() -> None:
     backend = SurrogateBackend(seed=7)
-    backend.long_penalty = 0.3  # 2048 tokens: idle TTFT ~ 500 ms > 400 ms target
+    backend.long_penalty = 1.0  # 2048 tokens: idle TTFT ~ 880 ms > 500 ms SLO
     locator = TierLocator(backend, settings())
     table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024, 2048]))
     assert table.evidence["prompt_limit"] == 1024 and backend.limit == 1024
-    assert table.evidence["idle_ttft_ms"][2048] > 400 >= table.evidence["idle_ttft_ms"][1024]
+    assert table.evidence["idle_ttft_ms"][2048] > 500 >= table.evidence["idle_ttft_ms"][1024]
 
 
 def test_two_tiers_when_low_load_band_excludes_h() -> None:
@@ -309,3 +309,51 @@ def test_failed_alpha_is_measured_again_on_retry() -> None:
         asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
     table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
     assert len(calls) == 2 and table.alpha_tokens > 0
+
+
+def test_decode_runs_with_p_at_the_ceiling_and_needs_25pct_for_a_step() -> None:
+    class StepBackend(SurrogateBackend):
+        def __init__(self, seed, top_wall):
+            super().__init__(seed=seed)
+            self.top_wall = top_wall
+            self.closed_clocks = []
+
+        async def closed_window(self, clock, concurrency, seconds):
+            self.closed_clocks.append(clock)
+            w = await super().closed_window(clock, concurrency, seconds)
+            wall = self.top_wall if clock.decode_mhz == 1500 else 44
+            if concurrency > wall:
+                w.tpot_p95_ms, w.decode_preemptions, w.decode_waiting_max = 400.0, 5.0, 3.0
+            else:
+                w.tpot_p95_ms, w.decode_preemptions, w.decode_waiting_max = 90.0, 0.0, 0.0
+            return w
+
+    small = StepBackend(9, top_wall=48)  # +9 %: still a KV wall
+    table = asyncio.run(TierLocator(small, settings()).locate(PROMPT, [128, 512, 1024]))
+    assert table.decode_wall
+    assert all(c.prefill_mhz == table.evidence["f_eff"] for c in small.closed_clocks)
+    big = StepBackend(10, top_wall=96)  # D clock really buys capacity
+    table = asyncio.run(TierLocator(big, settings()).locate(PROMPT, [128, 512, 1024]))
+    assert not table.decode_wall
+
+
+def test_no_feasible_fill_load_publishes_nothing() -> None:
+    backend = SurrogateBackend(seed=11)
+    locator = TierLocator(backend, settings())
+    original = backend.open_window
+
+    async def fill_fails(clock, eq_tps, alpha, seconds, abort_above):
+        w = await original(clock, eq_tps, alpha, seconds, abort_above)
+        if locator.run is not None and locator.run.phase == "fill":
+            w.violations = w.requests
+        return w
+
+    backend.open_window = fill_fails
+    with pytest.raises(LocatorError, match="not published"):
+        asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
+
+
+def test_alpha_lengths_include_the_longest_prompt() -> None:
+    _, _, _, _, scheduler = build(SurrogateBackend(seed=12))
+    scheduler.lengths = LengthStats([(128, 8)] * 50 + [(4000, 8)], min_samples=1)
+    assert 4000 in scheduler._prompts()

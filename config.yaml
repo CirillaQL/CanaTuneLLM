@@ -93,7 +93,7 @@ routing:
 # Per-request admission (design v2 section 5.2).
 router:
   theta: 0.10                 # admit only when the cell's violation risk <= theta
-  max_wait_ms: 100            # bounded wait inside the TTFT budget before rejecting
+  max_wait_ms: 300            # bounded wait inside the TTFT budget (covers waking a parked group)
   retry_period_ms: 20
   snapshot_max_age_s: 1.0     # older /metrics snapshots count as unknown (unsafe)
   d_busy_min_running: 1       # D counts as busy with >= this many running sequences
@@ -157,17 +157,20 @@ canary:
   drain_timeout_s: 30
   locator:
     eps: 0.02                 # energy band: within 2 % of the minimum
-    ttft_target_fraction: 0.8 # capacity: TTFT p95 <= 0.8 SLO
     target_load_fraction: 0.8 # search at 0.8 C0 (consolidated operating point)
     low_load_fraction: 0.3    # second load for the one-or-two-tiers check
     fill_load_fractions: [0.3, 0.5, 0.8, 1.0]
     window_s: 20
+    min_window_requests: 60   # violation bound with 0/60 is ~3 %
+    max_window_s: 120
     idle_window_s: 5
     coarse_points: 5
     refine_steps: 3
     limited_fraction_max: 0.3 # skip clocks power/thermal-limited > 30 % of busy time
     decode_probe_concurrency: 16
     decode_start_concurrency: 8
+    decode_load_fraction: 0.7 # choose the D clock at 0.7 B*
+    decode_wall_tolerance: 0.25
     decode_kv_limit: 0.90
   probe:
     settle_s: 2.0
@@ -200,7 +203,9 @@ experiment:
     required_before_formal_measurement: true
 
   slo:
-    ttft_ms: 500
+    # 1000 ms: >= the idle p95 of the longest prompt in this P/D setup (K4a: 733 ms);
+    # 500 ms is missed even with nothing queued (0930 report, section 6).
+    ttft_ms: 1000
     tpot_ms: 200
 
   workload:

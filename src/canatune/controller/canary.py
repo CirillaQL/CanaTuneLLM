@@ -215,7 +215,10 @@ class CanaryScheduler:
     def _prompts(self) -> list[int]:
         pairs = self.lengths.pairs()
         prompts = sorted(p for p, _ in pairs)
+        # Include the longest prompt: lengths that miss the SLO even when idle must be
+        # found here, or they poison every later window (smoke r2 never tested 2048).
         picks = {prompts[int(q * (len(prompts) - 1))] for q in (0.1, 0.3, 0.5, 0.7, 0.9)}
+        picks.add(prompts[-1])
         if len(picks) < 2:
             only = next(iter(picks))
             picks = {max(1, only // 2), only, only * 2}

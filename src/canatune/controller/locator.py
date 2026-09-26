@@ -126,14 +126,13 @@ class LocatorSettings:
     eps: float = 0.02
     ttft_slo_ms: float = 500.0
     tpot_slo_ms: float = 200.0
-    ttft_target_fraction: float = 0.8  # capacity: TTFT p95 <= 0.8 SLO
     target_load_fraction: float = 0.8  # search load = 0.8 C0
     low_load_fraction: float = 0.3
     l_tier_min_gain: float = 0.04  # add L only when it saves clearly more than noise (2 eps)
     fill_load_fractions: tuple[float, ...] = (0.3, 0.5, 0.8, 1.0)
     window_s: float = 20.0
-    min_window_requests: int = 30  # below ~15 the violation bound cannot reach 10 %
-    max_window_s: float = 60.0
+    min_window_requests: int = 60  # 0 violations -> bound ~3 %: tells 5 % from 10 %
+    max_window_s: float = 120.0
     idle_window_s: float = 5.0
     park_candidates: int = 5
     coarse_points: int = 5
@@ -142,12 +141,13 @@ class LocatorSettings:
     cap_gap: float = 0.05  # median busy clock this far below the lock -> power cap
     ucb_z: float = 1.28  # one-sided 90 %
     idle_noise_w: float = 0.5
-    ramp_start_rps: float = 0.5
+    ramp_start_rps: float = 1.0
     ramp_max_steps: int = 10
     decode_probe_concurrency: int = 16
     decode_start_concurrency: int = 8
     decode_max_concurrency: int = 512
-    decode_wall_tolerance: float = 0.10
+    decode_wall_tolerance: float = 0.25  # frequency step only if B* grows >= 25 %
+    decode_load_fraction: float = 0.7  # choose the D clock at 0.7 B* (near full load)
     decode_kv_limit: float = 0.90
     service_repeats: int = 3
     cache_ttl_s: float = 3600.0
@@ -301,13 +301,9 @@ class TierLocator:
         return w.requests > 0 and wilson_ucb(w.violations, w.requests, self.s.ucb_z) <= self.s.theta
 
     def meets_target(self, w: WindowResult) -> bool:
-        target = self.s.ttft_target_fraction * self.s.ttft_slo_ms
-        return (
-            self.feasible(w)
-            and not w.aborted
-            and w.ttft_p95_ms is not None
-            and w.ttft_p95_ms <= target
-        )
+        """Capacity uses the admission criterion itself (violation bound <= theta);
+        TTFT p95 is recorded but not a separate, stricter target (smoke r2)."""
+        return self.feasible(w) and not w.aborted
 
     def decode_clean(self, w: WindowResult) -> bool:
         return (
@@ -365,7 +361,7 @@ class TierLocator:
         except LocatorError:
             self._cache.pop(("service", top, tuple(lengths)), None)  # re-measure next time
             raise
-        target = self.s.ttft_target_fraction * self.s.ttft_slo_ms
+        target = self.s.ttft_slo_ms
         idle_ttft: dict[int, float] = {}
         for tokens in lengths:
             values = sorted(ttft for t, _, ttft in samples if t == tokens and ttft is not None)
@@ -399,7 +395,7 @@ class TierLocator:
                     break
                 load /= 2  # even the start load is too much: go down
         if good is None:
-            raise LocatorError("no load meets the TTFT target even at the highest clock")
+            raise LocatorError("no load meets the SLO even at the highest clock")
         if bad is not None:
             lo, hi = good.load, bad.load
             for _ in range(2):
@@ -500,35 +496,29 @@ class TierLocator:
         return max(steady or band)
 
     async def decode(self, hw: Hardware, prefill_mhz: int) -> tuple[int, int, bool, dict]:
-        """-> (decode clock, B*, KV wall?, evidence)."""
-        self._phase("decode_clock")
-        target = self.s.ttft_target_fraction * self.s.tpot_slo_ms
-        per_clock: dict[int, WindowResult] = {}
-        for f in spread(
-            hw.decode_clocks, hw.decode_clocks[0], hw.decode_clocks[-1], self.s.coarse_points
-        ):
-            w = await self.closed(ClockPoint(prefill_mhz, f), self.s.decode_probe_concurrency)
-            per_clock[f] = w
-            if w.tpot_p95_ms is None or w.tpot_p95_ms > target:
-                break
-        ok = {
-            f: w.decode_j_per_token
-            for f, w in per_clock.items()
-            if w.decode_j_per_token is not None
-            and w.tpot_p95_ms is not None
-            and w.tpot_p95_ms <= target
-        }
-        if not ok:
-            raise LocatorError("no decode clock meets the TPOT target")
-        emin = min(ok.values())
-        f_d = max(f for f, e in ok.items() if e <= (1 + self.s.eps) * emin)
+        """-> (decode clock, B*, KV wall?, evidence).
 
-        async def b_star(f: int) -> tuple[int, WindowResult | None]:
-            """Largest clean client concurrency and its window."""
+        P runs at its ceiling so it does not limit D concurrency. B* is searched at
+        the highest D clock first (the most D can take), the D clock is chosen by
+        J/token at 0.7 B* (near full load, where it matters), and B* is re-checked
+        at the chosen clock: a >= 25 % larger B* at the top clock means a frequency
+        step, otherwise a KV wall.
+        """
+        top_d = hw.decode_clocks[-1]
+
+        async def b_star(f: int, hint: int | None = None) -> tuple[int, WindowResult | None]:
+            """Largest clean client concurrency at D clock f and its window."""
             point = ClockPoint(prefill_mhz, f)
-            c, good, bad = self.s.decode_start_concurrency, 0, None
-            good_w: WindowResult | None = None
-            while c <= self.s.decode_max_concurrency:
+            good, good_w, bad = 0, None, None
+            if hint is not None:  # usually B*(f) <= B*(top): test the hint first
+                w = await self.closed(point, hint)
+                if self.decode_clean(w):
+                    return hint, w
+                bad = hint
+                c = max(self.s.decode_start_concurrency, hint // 2)
+            else:
+                c = self.s.decode_start_concurrency
+            while c <= self.s.decode_max_concurrency and (bad is None or c < bad):
                 w = await self.closed(point, c)
                 if self.decode_clean(w):
                     good, good_w, c = c, w, c * 2
@@ -550,24 +540,49 @@ class TierLocator:
             return good, good_w
 
         self._phase("decode_wall")
-        b_low, b_window = await b_star(f_d)
-        if b_low <= 0:
+        b_top, _ = await b_star(top_d)
+        if b_top <= 0:
             raise LocatorError("decode is not clean even at the start concurrency")
-        # Wall check with one window: is the highest D clock clean clearly beyond B*?
-        top_d = hw.decode_clocks[-1]
-        beyond = math.ceil(b_low * (1 + self.s.decode_wall_tolerance)) + 1
+
+        self._phase("decode_clock")
+        load = max(1, round(self.s.decode_load_fraction * b_top))
+        per_clock: dict[int, WindowResult] = {}
+        for f in spread(hw.decode_clocks, hw.decode_clocks[0], top_d, self.s.coarse_points):
+            w = await self.closed(ClockPoint(prefill_mhz, f), load)
+            per_clock[f] = w
+            if not self.decode_clean(w):
+                break  # lower D clocks only get slower
+        ok = {
+            f: w.decode_j_per_token
+            for f, w in per_clock.items()
+            if w.decode_j_per_token is not None and self.decode_clean(w)
+        }
+        if not ok:
+            raise LocatorError("no decode clock is clean at 0.7 B*")
+        emin = min(ok.values())
+        f_d = max(f for f, e in ok.items() if e <= (1 + self.s.eps) * emin)
+
+        self._phase("decode_verify")
         if f_d == top_d:
-            wall, b_high = True, b_low
+            b_low, b_window = await b_star(top_d)  # cached
         else:
-            clean = self.decode_clean(await self.closed(ClockPoint(prefill_mhz, top_d), beyond))
-            wall, b_high = not clean, (beyond if clean else b_low)
+            b_low, b_window = await b_star(f_d, hint=b_top)
+        if b_low <= 0:
+            raise LocatorError("decode is not clean at the chosen clock")
+        if f_d == top_d:
+            # Only the top clock may be clean at 0.7 B*: lower clocks lose capacity,
+            # i.e. a frequency step; with every tested clock clean it is a KV wall.
+            wall = all(self.decode_clean(w) for w in per_clock.values())
+        else:
+            wall = b_top < b_low * (1 + self.s.decode_wall_tolerance)
         # Admission compares D running+waiting sequences, so publish what D actually
         # ran in the clean B* window (client concurrency also waits at P).
         running = None if b_window is None else b_window.decode_running_max
         b_published = int(running) if running else b_low
         evidence = {
+            "decode_load_concurrency": load,
             "decode_j_per_token": ok,
-            "b_star_concurrency": {str(f_d): b_low, f"{top_d}_at_least": b_high},
+            "b_star_concurrency": {str(f_d): b_low, str(top_d): b_top},
             "b_star_running": b_published,
             "kv_wall": wall,
         }
@@ -582,7 +597,7 @@ class TierLocator:
             if self.meets_target(w):
                 capacity = max(capacity, w.load)
         if capacity <= 0:
-            capacity = min(self.s.fill_load_fractions) * c0 * 0.5
+            raise LocatorError("no fill load is feasible at H: table not published")
         return capacity
 
     # ---- full and partial runs ---------------------------------------------------------
@@ -629,7 +644,7 @@ class TierLocator:
             )
             d_evidence = {"reused_from_previous": True}
         else:
-            f_d, b_star, wall, d_evidence = await self.decode(hw, f_h)
+            f_d, b_star, wall, d_evidence = await self.decode(hw, f_eff)
         h = ClockPoint(f_h, f_d)
         capacity = await self.fill(h, c0, alpha)
 
