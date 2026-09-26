@@ -253,6 +253,12 @@ src/canatune/
 
 Python 3.10 or newer is required (the cluster's vLLM env is 3.10).
 
+GitHub Actions runs `ruff check .` and the full pytest suite on Ubuntu with
+Python 3.10 and 3.12 for pushes and pull requests. Dependencies are installed
+from `uv.lock` with `uv sync --locked --extra dev`. The tests use simulated
+backends and do not require GPUs, Slurm, or running vLLM servers; cluster smoke
+tests remain separate. The CI workflow can also be started manually.
+
 ```bash
 uv sync --extra dev
 uv run python -m canatune
