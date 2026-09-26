@@ -197,17 +197,22 @@ def spread(grid: Sequence[int], low: int, high: int, n: int) -> list[int]:
 
 
 def fit_alpha(samples: Sequence[tuple[int, float]]) -> float:
-    """Least squares prefill_ms = a + b * tokens; alpha = a / b tokens (>= 0)."""
-    if len({t for t, _ in samples}) < 2:
+    """prefill_ms = a + b * tokens on the per-length medians (one slow request,
+    e.g. the first KV-connector handshake, cannot flip the slope); alpha = a / b."""
+    by_length: dict[int, list[float]] = {}
+    for tokens, ms in samples:
+        by_length.setdefault(tokens, []).append(ms)
+    if len(by_length) < 2:
         raise LocatorError("service-time fit needs at least two prompt lengths")
-    n = len(samples)
-    mx = sum(t for t, _ in samples) / n
-    my = sum(ms for _, ms in samples) / n
-    sxx = sum((t - mx) ** 2 for t, _ in samples)
-    b = sum((t - mx) * (ms - my) for t, ms in samples) / sxx
+    points = [(t, sorted(v)[len(v) // 2]) for t, v in by_length.items()]
+    n = len(points)
+    mx = sum(t for t, _ in points) / n
+    my = sum(ms for _, ms in points) / n
+    sxx = sum((t - mx) ** 2 for t, _ in points)
+    b = sum((t - mx) * (ms - my) for t, ms in points) / sxx
     a = my - b * mx
     if b <= 0:
-        raise LocatorError("prefill time does not grow with prompt length")
+        raise LocatorError(f"prefill time does not grow with prompt length: {sorted(points)}")
     return max(0.0, a / b)
 
 
@@ -354,7 +359,12 @@ class TierLocator:
             ("service", top, tuple(lengths)),
             lambda: self.backend.service_times(top, lengths * self.s.service_repeats),
         )
-        alpha = fit_alpha([(t, ms) for t, ms, _ in samples])
+        self.log.write({"event": "locator_service", "clock": top.key(), "samples": samples})
+        try:
+            alpha = fit_alpha([(t, ms) for t, ms, _ in samples])
+        except LocatorError:
+            self._cache.pop(("service", top, tuple(lengths)), None)  # re-measure next time
+            raise
         target = self.s.ttft_target_fraction * self.s.ttft_slo_ms
         idle_ttft: dict[int, float] = {}
         for tokens in lengths:

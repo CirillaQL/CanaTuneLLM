@@ -17,6 +17,7 @@ from canatune.config import load_config
 from canatune.controller.canary import CanaryScheduler, SchedulerSettings
 from canatune.controller.locator import (
     Hardware,
+    LocatorError,
     LocatorSettings,
     TierLocator,
     WindowResult,
@@ -282,3 +283,29 @@ def test_pressure_aborts_experiment_and_canary_serves_again() -> None:
     assert scheduler.history[-1]["outcome"] == "aborted"
     assert groups[0].state is GroupState.ACTIVE and groups[0].tier is Tier.H
     assert tiers.table is first  # nothing published
+
+
+def test_alpha_fit_ignores_one_slow_first_request() -> None:
+    # K2 shape, plus a 3 s first request at 128 tokens (connector handshake).
+    samples = [(128, 3036.0), (512, 60.0), (1024, 91.0), (128, 36.0), (512, 59.0)]
+    samples += [(1024, 92.0), (128, 37.0), (512, 60.5), (1024, 90.0)]
+    assert fit_alpha(samples) == pytest.approx(455, rel=0.15)
+
+
+def test_failed_alpha_is_measured_again_on_retry() -> None:
+    backend = SurrogateBackend(seed=8)
+    calls = []
+    original = backend.service_times
+
+    async def flat_then_real(clock, prompts):
+        calls.append(1)
+        if len(calls) == 1:
+            return [(p, 50.0, 300.0) for p in prompts]  # slope 0: fit fails
+        return await original(clock, prompts)
+
+    backend.service_times = flat_then_real
+    locator = TierLocator(backend, settings())
+    with pytest.raises(LocatorError):
+        asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
+    table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
+    assert len(calls) == 2 and table.alpha_tokens > 0

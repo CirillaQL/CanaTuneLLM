@@ -226,6 +226,7 @@ class CanaryScheduler:
         controller = self.controller
         table = controller.tiers.table
         outcome = "failed"
+        error_text = None
         try:
             summary = self.lengths.summary()
             if kind == "recheck" and table is not None:
@@ -245,14 +246,24 @@ class CanaryScheduler:
         except asyncio.CancelledError:
             outcome = "aborted"
         except LocatorError as error:
-            controller.log.write({"event": "locator_error", "error": str(error)})
+            error_text = str(error)
+            controller.log.write({"event": "locator_error", "error": error_text})
         except Exception as error:  # probes hit real services: never kill the control loop
-            controller.log.write({"event": "locator_error", "error": repr(error)})
+            error_text = repr(error)
+            controller.log.write({"event": "locator_error", "error": error_text})
         finally:
             now = self._clock()
             self.explore_s += now - (self._started_at or now)
             self.last_end = now
-            self.history.append({"kind": kind, "reason": reason, "outcome": outcome, "end": now})
+            self.history.append(
+                {
+                    "kind": kind,
+                    "reason": reason,
+                    "outcome": outcome,
+                    "end": now,
+                    "error": error_text,
+                }
+            )
             canary = self.canary
             if canary is not None:
                 canary.state = GroupState.ACTIVE

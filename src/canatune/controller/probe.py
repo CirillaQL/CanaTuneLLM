@@ -64,6 +64,7 @@ class ProbeSettings:
     vocab_high: int = 31000
     seed: int = 20260925
     decode_output_tokens: int = 256  # closed (decode) windows: long outputs load D
+    warmup_requests: int = 3  # discarded before service times (KV-connector handshake)
     prefill_min_mhz: int = 0  # never probe below these clocks
     decode_min_mhz: int = 0
 
@@ -253,6 +254,8 @@ class CanaryProbe:
         await self.lock(clock)
         out = []
         async with self.client_factory() as client:
+            for _ in range(self.s.warmup_requests):
+                await self.request(client, min(prompts), 2)
             for tokens in prompts:
                 outcome = await self.request(client, tokens, 2)
                 if outcome.status == "ok" and outcome.prefill_ms is not None:
