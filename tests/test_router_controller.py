@@ -231,6 +231,24 @@ def test_consolidation_parks_at_park_clocks_and_pressure_wakes() -> None:
     assert len([g for g in groups if g.state is GroupState.ACTIVE]) == 2
 
 
+def test_no_parking_right_after_rejections() -> None:
+    clock, _, groups, _, router, controller, _ = setup(table=published())
+    activate(groups)
+    controller.on_pressure = lambda reason: True
+    router.rejections += 5  # every request rejected: the admitted load reads 0
+    asyncio.run(controller.tick())
+    for _ in range(3):
+        clock.now += 10
+        asyncio.run(controller.tick())
+    assert all(g.state is GroupState.ACTIVE for g in groups)
+    clock.now += 31  # calm for t_down: consolidation may start its own t_down window
+    asyncio.run(controller.tick())
+    clock.now += 31
+    asyncio.run(controller.tick())
+    asyncio.run(controller.tick())
+    assert sum(g.state is GroupState.PARK for g in groups) == 1
+
+
 def test_pressure_with_nothing_parked_aborts_canary() -> None:
     clock, _, groups, _, _, controller, _ = setup(table=published(capacity_h=100.0))
     activate(groups[1:])

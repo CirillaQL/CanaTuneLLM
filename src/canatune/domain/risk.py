@@ -197,29 +197,57 @@ class RiskTable:
             return self._estimate(cell)
 
     def _estimate(self, cell: Cell) -> RiskEstimate:
+        """Own observation, bounded by monotonicity: a cell is at least as risky as
+        any lighter one and, when sparse, at most as risky as the least risky
+        heavier one. Heavier = more queued requests, a longer prompt, or D busy
+        instead of idle (smoke 2: the Canary's windows keep D busy, so idle-D cells
+        stay empty and would otherwise block the first request on an idle group)."""
         own = self._own(cell)
         n_rows, n_cols = self.buckets.shape
+        lighter_d = (False, True) if cell.d_busy else (False,)
+        heavier_d = (True,) if cell.d_busy else (False, True)
         lower = 0.0
-        for i in range(cell.n_await + 1):
-            for j in range(cell.prompt + 1):
-                if (i, j) == (cell.n_await, cell.prompt):
-                    continue
-                other = self._own(Cell(cell.clock, i, j, cell.d_busy))
-                if other is not None:
-                    lower = max(lower, other.risk)
+        for d in lighter_d:
+            for i in range(cell.n_await + 1):
+                for j in range(cell.prompt + 1):
+                    if (i, j, d) == (cell.n_await, cell.prompt, cell.d_busy):
+                        continue
+                    other = self._own(Cell(cell.clock, i, j, d))
+                    if other is not None:
+                        lower = max(lower, other.risk)
         if own is not None:
             return RiskEstimate(max(own.risk, lower), own.source, own.samples)
         upper = None
-        for i in range(cell.n_await, n_rows):
-            for j in range(cell.prompt, n_cols):
-                if (i, j) == (cell.n_await, cell.prompt):
-                    continue
-                other = self._own(Cell(cell.clock, i, j, cell.d_busy))
-                if other is not None:
-                    upper = other.risk if upper is None else min(upper, other.risk)
+        for d in heavier_d:
+            for i in range(cell.n_await, n_rows):
+                for j in range(cell.prompt, n_cols):
+                    if (i, j, d) == (cell.n_await, cell.prompt, cell.d_busy):
+                        continue
+                    other = self._own(Cell(cell.clock, i, j, d))
+                    if other is not None:
+                        upper = other.risk if upper is None else min(upper, other.risk)
+        source = "heavier_bound"
+        # Pooled bound: one row (same queue, prompt at least as long) or one column
+        # (same prompt bucket, queue at least as long) of cells no lighter than this
+        # one, sparse ones included. Their pooled rate is still an upper bound, and it
+        # uses the fill windows' samples that are spread too thin for single cells.
+        rows = [(cell.n_await, j) for j in range(cell.prompt, n_cols)]
+        cols = [(i, cell.prompt) for i in range(cell.n_await, n_rows)]
+        for region in (rows, cols):
+            admitted = violated = 0
+            for d in heavier_d:
+                for i, j in region:
+                    stats = self._cells.get(Cell(cell.clock, i, j, d))
+                    if stats is not None:
+                        admitted += stats.admitted
+                        violated += stats.violated
+            if admitted >= self.min_samples:
+                pooled = violated / admitted
+                if upper is None or pooled < upper:
+                    upper, source = pooled, "pooled_bound"
         if upper is None:
             return RiskEstimate(UNSAFE, "unknown", 0)
-        return RiskEstimate(max(upper, lower), "heavier_bound", 0)
+        return RiskEstimate(max(upper, lower), source, 0)
 
     def lookup(
         self, clock: ClockPoint, n_await: int, prompt_tokens: int, d_busy: bool

@@ -13,7 +13,8 @@ and from then on the Controller
   `t_down_s`,
 * switches L/H per group when the Canary published an L tier,
 * drains and parks the least-loaded group when the rest could carry the total
-  at `park_load_fraction * C_H` for `t_down_s`.
+  at `park_load_fraction * C_H` for `t_down_s` and there was no pressure (a
+  rejection or load above the wake level) within the last `t_down_s`.
 
 Loads are equivalent prompt tokens/s. A clock change takes ~0.2-0.5 s, so the
 Controller acts on windowed trends; while a group's clock changes the Router
@@ -98,6 +99,7 @@ class TierController:
         self._low_since: dict[str, float] = {}
         self._consolidate_since: float | None = None
         self._calm_since: float | None = None
+        self._pressure_at = float("-inf")
         self._rejections_seen = 0
         self._last_energy_log = float("-inf")
         # Set by the Canary scheduler: abort an experiment; -> whether one was aborted.
@@ -212,6 +214,7 @@ class TierController:
         # with the Canary serving too, raise a group to MAX before the Router rejects.
         if new_rejections > 0 or mean_load > s.wake_load_fraction * capacity:
             self._calm_since = None
+            self._pressure_at = now
             reason = "rejections" if new_rejections else "load_above_wake"
             woken = await self.wake(reason)
             if woken is not None:
@@ -279,7 +282,9 @@ class TierController:
         self, table: TierTable, active: Sequence[Group], loads: Mapping[str, float], now: float
     ) -> None:
         s = self.settings
-        if len(active) <= s.min_active_groups:
+        # Rejected requests never enter the admitted load, so right after pressure the
+        # load looks low; parking then would feed the rejections (smoke 2 sim).
+        if len(active) <= s.min_active_groups or now - self._pressure_at < s.t_down_s:
             self._consolidate_since = None
             return
         total = sum(loads[g.name] for g in active)

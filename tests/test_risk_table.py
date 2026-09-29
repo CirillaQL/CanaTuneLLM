@@ -54,6 +54,35 @@ def test_sparse_cell_uses_heavier_bound_and_lighter_floor() -> None:
     assert t.estimate(t.cell(H, 1, 512, False)).source == "unknown"
 
 
+def test_idle_decode_is_bounded_by_busy_decode() -> None:
+    t = table()
+    busy = t.cell(L, 1, 512, True)
+    for _ in range(3):
+        t.record(busy, False)
+    idle = t.estimate(t.cell(L, 0, 128, False))
+    assert (idle.source, idle.risk) == ("heavier_bound", 0.0)
+    # D busy is never bounded by idle-D samples, but idle-D violations raise it.
+    assert t.estimate(t.cell(L, 2, 512, True)).source == "unknown"
+    bad = t.cell(L, 0, 128, False)
+    for _ in range(3):
+        t.record(bad, True)
+    assert t.estimate(busy).risk == 1.0
+
+
+def test_pooled_bound_uses_sparse_heavier_cells() -> None:
+    t = RiskTable(Buckets((0, 1, 2, 3, 5), (128, 512, 1024, 2048)), min_samples=20)
+    for prompt, n in ((128, 9), (512, 14), (1024, 16)):  # queue 2, D busy: 1 violation
+        for k in range(n):
+            t.record(t.cell(H, 2, prompt, True), prompt == 1024 and k == 0)
+    row = t.estimate(t.cell(H, 2, 128, True))
+    assert row.source == "pooled_bound"
+    assert row.risk == pytest.approx(1 / 39)
+    # Too few samples in the heavier part of the row: still unknown.
+    assert t.estimate(t.cell(H, 2, 2048, True)).source == "unknown"
+    # Lighter cells never enter the pool.
+    assert t.estimate(t.cell(H, 3, 128, True)).source == "unknown"
+
+
 def test_sparse_observations_can_raise_but_not_lower_a_seed() -> None:
     t = table()
     t.load_seed(H, [[0.2] * 5 for _ in range(6)])

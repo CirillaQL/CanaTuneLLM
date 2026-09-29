@@ -342,6 +342,18 @@ clocks). The node scripts start one vLLM per listed GPU (1–8) and check
 `gpu_uuids` from the config. Set `CANATUNE_STEP_GPUS=1` to request the GPUs for
 the node steps (`--gpus-per-node=N --gpu-bind=none`).
 
+**Smoke test (2): production path.** `scripts/smoke_production.py` with
+`SMOKE_MODE=cantune` runs the cold-start calibration, waits until the production
+groups are at H, then plays a load profile through the Router with
+`canatune.loadgen`. The profile is `name:seconds:load[:action]` phases, with load
+in units of one group's C_H. The default one exercises drain + park, wake,
+boost to MAX and back, and a Canary recheck aborted under pressure. The trace is
+saved as `trace.json`. `SMOKE_MODE=baseline` replays that trace with the
+`round_robin` policy over all pairs, with driver-managed clocks. Both runs read
+every GPU's NVML energy counter through the node agents. The results are
+`load/requests.jsonl`, `energy.jsonl`, `timeline.jsonl` and `load_summary.json`,
+which gives per-phase outcomes, J per request and which Controller paths fired.
+
 Run the project checks with:
 
 ```bash
