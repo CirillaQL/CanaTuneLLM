@@ -8,7 +8,10 @@ their outcomes are recorded in the risk table under the Canary's clock point.
 
 Energy comes from the NVML cumulative counter read through the node agents;
 the same polling gives the median busy SM clock and the share of samples in
-which power or thermal limits held the clock down.
+which power or thermal limits held the clock down. vLLM counters bracket the
+same windows: P's own prefill time (alpha without proxy, KV transfer and D's
+first step) and D's generated tokens (the J/token denominator; SSE events can
+carry several tokens, so counting events undercounts).
 """
 
 import asyncio
@@ -28,7 +31,14 @@ from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable, is_violation
 from canatune.infrastructure.clocks import ClockActuator, GpuRef
 from canatune.infrastructure.records import JsonlLog
-from canatune.infrastructure.telemetry import Telemetry
+from canatune.infrastructure.telemetry import (
+    GENERATION_TOKENS,
+    PREFILL_TIME_COUNT,
+    PREFILL_TIME_SUM,
+    Telemetry,
+    kv_capacity_tokens,
+    prom_value,
+)
 from canatune.proxy.proxy import Endpoint, StreamTimer, pd_transport_id
 
 # NVML clocks-event reasons that mean "held below the requested clock".
@@ -64,6 +74,7 @@ class ProbeSettings:
     vocab_high: int = 31000
     seed: int = 20260925
     decode_output_tokens: int = 256  # closed (decode) windows: long outputs load D
+    decode_stagger_s: float = 15.0  # closed windows: spread worker starts (steady state)
     warmup_requests: int = 3  # discarded before service times (KV-connector handshake)
     prefill_min_mhz: int = 0  # never probe below these clocks
     decode_min_mhz: int = 0
@@ -113,6 +124,7 @@ class CanaryProbe:
         self.prompt_limit: int | None = None  # set by the locator (idle TTFT check)
         self._n_await = 0
         self._decoding = 0
+        self.service_source = "http"  # how service_times measured prefill ("metrics" or "http")
 
     # ---- clocks and readings -------------------------------------------------------------
 
@@ -136,6 +148,28 @@ class CanaryProbe:
         return await asyncio.gather(
             self._reading(self.canary.prefill), self._reading(self.canary.decode)
         )
+
+    async def _metrics(self, client: httpx.AsyncClient, endpoint: Endpoint) -> str | None:
+        try:
+            response = await client.get(
+                f"http://{endpoint.http_host}:{endpoint.http_port}/metrics", timeout=5
+            )
+            response.raise_for_status()
+            return response.text
+        except Exception:  # counters are an improvement, never a requirement
+            return None
+
+    async def _counter(
+        self, client: httpx.AsyncClient, endpoint: Endpoint, names: tuple[str, ...]
+    ) -> float | None:
+        text = await self._metrics(client, endpoint)
+        return None if text is None else prom_value(text, names)
+
+    async def kv_capacity(self) -> int | None:
+        """D's KV cache size in tokens (vllm:cache_config_info), if exposed."""
+        async with self.client_factory() as client:
+            text = await self._metrics(client, self.decode)
+        return None if text is None else kv_capacity_tokens(text)
 
     async def hardware(self) -> Hardware:
         p = await self.actuator.supported_clocks(self.refs[self.canary.prefill])
@@ -251,15 +285,30 @@ class CanaryProbe:
     async def service_times(
         self, clock: ClockPoint, prompts: Sequence[int]
     ) -> list[tuple[int, float, float | None]]:
+        """Sequential single requests. Prefill time is P's own
+        vllm:request_prefill_time_seconds (difference around each request); without
+        it, the HTTP round trip of the prefill call."""
         await self.lock(clock)
         out = []
+        sources = set()
         async with self.client_factory() as client:
             for _ in range(self.s.warmup_requests):
                 await self.request(client, min(prompts), 2)
             for tokens in prompts:
+                before = await self._metrics(client, self.prefill)
                 outcome = await self.request(client, tokens, 2)
-                if outcome.status == "ok" and outcome.prefill_ms is not None:
-                    out.append((tokens, outcome.prefill_ms, outcome.ttft_ms))
+                after = await self._metrics(client, self.prefill)
+                if outcome.status != "ok" or outcome.prefill_ms is None:
+                    continue
+                prefill_ms, source = outcome.prefill_ms, "http"
+                if before is not None and after is not None:
+                    d_sum = _delta(before, after, PREFILL_TIME_SUM)
+                    d_count = _delta(before, after, PREFILL_TIME_COUNT)
+                    if d_sum is not None and d_count == 1:
+                        prefill_ms, source = d_sum * 1000.0, "metrics"
+                sources.add(source)
+                out.append((tokens, prefill_ms, outcome.ttft_ms))
+        self.service_source = "metrics" if sources == {"metrics"} else "http"
         return out
 
     # ---- windows -------------------------------------------------------------------------------
@@ -291,6 +340,7 @@ class CanaryProbe:
         samples: list,
         violations: int,
         aborted: bool,
+        decode_tokens: float | None = None,
     ) -> WindowResult:
         ok = [o for o in outcomes if o.status == "ok"]
         first, last = samples[0], samples[-1]  # explicit readings around the probes
@@ -309,6 +359,8 @@ class CanaryProbe:
                 0.0, (decode_snaps[-1].preemptions_total or 0.0) - decode_snaps[0].preemptions_total
             )
         tokens = sum(o.output_tokens for o in ok)
+        if decode_tokens is not None and decode_tokens > 0:
+            tokens = decode_tokens  # D's own count (includes tokens of cut-off requests)
         return WindowResult(
             clock=clock,
             kind=kind,
@@ -335,12 +387,14 @@ class CanaryProbe:
         await self.lock(clock)
         # Same load -> same trace: every clock replays identical arrival times and
         # lengths, so per-request energy is compared on identical work.
+        # Exactly round(rate x seconds) arrivals at uniform order statistics: a Poisson
+        # process conditioned on its count, so the realised load equals the nominal
+        # one (unconditioned traces deviated by up to +20 %, smoke r4).
         trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
-        pairs = self.lengths.sample(
-            trace, max(1, int(eq_tps * seconds / 64) + 64), self.prompt_limit
-        )
-        mean_eq = sum(p for p, _ in pairs) / len(pairs) + alpha
-        rate = eq_tps / mean_eq  # requests/s
+        rate = eq_tps / (self.lengths.mean_prompt(self.prompt_limit) + alpha)  # requests/s
+        count = max(1, round(rate * seconds))
+        pairs = self.lengths.sample(trace, count, self.prompt_limit)
+        arrivals = sorted(trace.uniform(0.0, seconds) for _ in range(count))
         outcomes: list[ProbeOutcome] = []
         tasks: set[asyncio.Task] = set()
         stop_sampling = asyncio.Event()
@@ -348,10 +402,10 @@ class CanaryProbe:
         violations = 0
         aborted = False
         async with self.client_factory() as client:
+            tokens_before = await self._counter(client, self.decode, GENERATION_TOKENS)
             await self._append_sample(samples)
             sampler = asyncio.create_task(self._sample(stop_sampling, samples))
             start = time.monotonic()
-            next_at, i = start, 0
 
             async def one(prompt_tokens: int, output_tokens: int) -> None:
                 nonlocal violations
@@ -360,21 +414,21 @@ class CanaryProbe:
                 if self._record(clock, outcome):
                     violations += 1
 
-            while time.monotonic() - start < seconds:
-                done = len(outcomes)
-                if done >= self.s.abort_min_requests and violations / done > abort_above:
-                    aborted = True
-                    break
-                delay = next_at - time.monotonic()
-                if delay > 0:
+            for at, (prompt_tokens, output_tokens) in zip(arrivals, pairs):
+                while True:
+                    done = len(outcomes)
+                    if done >= self.s.abort_min_requests and violations / done > abort_above:
+                        aborted = True
+                        break
+                    delay = start + at - time.monotonic()
+                    if delay <= 0:
+                        break
                     await asyncio.sleep(min(delay, 0.05))
-                    continue
-                prompt_tokens, output_tokens = pairs[i % len(pairs)]
-                i += 1
+                if aborted:
+                    break
                 task = asyncio.create_task(one(prompt_tokens, output_tokens))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
-                next_at += trace.expovariate(rate)
             if tasks:
                 await asyncio.wait(tasks, timeout=self.s.drain_timeout_s)
             for task in tasks:
@@ -382,36 +436,71 @@ class CanaryProbe:
             stop_sampling.set()
             await sampler
             await self._append_sample(samples)
-        return self._result(clock, "open", eq_tps, outcomes, samples, violations, aborted)
+            tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
+        generated = _diff(tokens_before, tokens_after)
+        return self._result(
+            clock, "open", eq_tps, outcomes, samples, violations, aborted, generated
+        )
 
     async def closed_window(
-        self, clock: ClockPoint, concurrency: int, seconds: float
+        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0
     ) -> WindowResult:
+        """`concurrency` workers loop over requests until `seconds` pass. Starts are
+        spread over decode_stagger_s so D reaches a steady mix rather than one wave;
+        prompt lengths come from a trace fixed by (concurrency, rep), so every clock
+        decodes the same work."""
         await self.lock(clock)
         outcomes: list[ProbeOutcome] = []
         stop_sampling = asyncio.Event()
         samples: list = []
         violations = 0
+        trace = random.Random(self.s.seed * 7_919 + concurrency * 101 + rep)
+        stagger = min(self.s.decode_stagger_s, seconds / 3)
         async with self.client_factory() as client:
+            tokens_before = await self._counter(client, self.decode, GENERATION_TOKENS)
             await self._append_sample(samples)
             sampler = asyncio.create_task(self._sample(stop_sampling, samples))
             deadline = time.monotonic() + seconds
 
-            async def worker() -> None:
+            async def worker(index: int, prompts: list[int]) -> None:
                 nonlocal violations
-                while time.monotonic() < deadline:
-                    prompt_tokens = self.lengths.sample(self.rng, 1, self.prompt_limit)[0][0]
+                await asyncio.sleep(stagger * index / max(concurrency, 1))
+                for prompt_tokens in prompts:
+                    if time.monotonic() >= deadline:
+                        break
                     output_tokens = self.s.decode_output_tokens
                     outcome = await self.request(client, prompt_tokens, output_tokens)
                     outcomes.append(outcome)
                     if self._record(clock, outcome):
                         violations += 1
 
-            workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+            per_worker = 64  # more than a worker can finish within any window
+            lengths = [
+                p
+                for p, _ in self.lengths.sample(trace, concurrency * per_worker, self.prompt_limit)
+            ]
+            workers = [
+                asyncio.create_task(worker(i, lengths[i * per_worker : (i + 1) * per_worker]))
+                for i in range(concurrency)
+            ]
             done, pending = await asyncio.wait(workers, timeout=seconds + self.s.drain_timeout_s)
             for task in pending:
                 task.cancel()
             stop_sampling.set()
             await sampler
             await self._append_sample(samples)
-        return self._result(clock, "closed", concurrency, outcomes, samples, violations, False)
+            tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
+        generated = _diff(tokens_before, tokens_after)
+        return self._result(
+            clock, "closed", concurrency, outcomes, samples, violations, False, generated
+        )
+
+
+def _diff(before: float | None, after: float | None) -> float | None:
+    if before is None or after is None:
+        return None
+    return max(0.0, after - before)
+
+
+def _delta(before: str, after: str, names: tuple[str, ...]) -> float | None:
+    return _diff(prom_value(before, names), prom_value(after, names))

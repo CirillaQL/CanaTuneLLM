@@ -11,6 +11,11 @@ RUNNING = ("vllm:num_requests_running",)
 WAITING = ("vllm:num_requests_waiting",)
 KV_USAGE = ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc")
 PREEMPTIONS = ("vllm:num_preemptions_total",)
+# Counters the Canary brackets around a measurement (differences, never absolutes).
+PREFILL_TIME_SUM = ("vllm:request_prefill_time_seconds_sum",)
+PREFILL_TIME_COUNT = ("vllm:request_prefill_time_seconds_count",)
+GENERATION_TOKENS = ("vllm:generation_tokens_total",)
+CACHE_CONFIG = "vllm:cache_config_info"
 
 
 def prom_value(text: str, names: tuple[str, ...]) -> float | None:
@@ -30,6 +35,30 @@ def prom_value(text: str, names: tuple[str, ...]) -> float | None:
         if seen:
             return total
     return None
+
+
+def prom_labels(text: str, name: str) -> dict[str, str] | None:
+    """Labels of the first sample of an info-style metric, e.g. vllm:cache_config_info."""
+    for line in text.splitlines():
+        if not line.startswith(name + "{"):
+            continue
+        body = line[len(name) + 1 : line.rfind("}")]
+        labels = {}
+        for part in body.split('",'):
+            key, sep, value = part.partition('="')
+            if sep:
+                labels[key.strip()] = value.rstrip('"')
+        return labels
+    return None
+
+
+def kv_capacity_tokens(text: str) -> int | None:
+    """KV cache size in tokens: num_gpu_blocks x block_size from cache_config_info."""
+    labels = prom_labels(text, CACHE_CONFIG) or {}
+    try:
+        return int(labels["num_gpu_blocks"]) * int(labels["block_size"])
+    except (KeyError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

@@ -130,7 +130,7 @@ class SurrogateBackend:
             aborted=aborted,
         )
 
-    async def closed_window(self, clock, concurrency, seconds):
+    async def closed_window(self, clock, concurrency, seconds, rep=0):
         self._tick()
         f = clock.decode_mhz
         tpot = (55 + 1.4 * concurrency) * (1050 / f) ** 0.15
@@ -181,7 +181,7 @@ def test_locate_on_surrogate_matches_manual_experiments() -> None:
     # park: lowest idle power -> lowest clocks
     assert table.park == ClockPoint(600, 300)
     assert table.capacity_h > 0.5 * ev["capacity_c0"]
-    assert locator.run.windows <= 42
+    assert locator.run.windows <= 48  # D clock choice measures each clock twice
 
 
 def test_aborted_run_resumes_from_cached_windows() -> None:
@@ -318,9 +318,9 @@ def test_decode_runs_with_p_at_the_ceiling_and_needs_25pct_for_a_step() -> None:
             self.top_wall = top_wall
             self.closed_clocks = []
 
-        async def closed_window(self, clock, concurrency, seconds):
+        async def closed_window(self, clock, concurrency, seconds, rep=0):
             self.closed_clocks.append(clock)
-            w = await super().closed_window(clock, concurrency, seconds)
+            w = await super().closed_window(clock, concurrency, seconds, rep)
             wall = self.top_wall if clock.decode_mhz == 1500 else 44
             if concurrency > wall:
                 w.tpot_p95_ms, w.decode_preemptions, w.decode_waiting_max = 400.0, 5.0, 3.0
@@ -396,3 +396,31 @@ def test_fill_bisects_capacity_between_fill_loads() -> None:
     table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
     c0 = table.evidence["capacity_c0"]
     assert 0.8 * c0 < table.capacity_h <= 0.9 * c0
+
+
+def test_d_clock_choice_uses_the_median_of_repeated_windows() -> None:
+    class NoisyBackend(SurrogateBackend):
+        async def closed_window(self, clock, concurrency, seconds, rep=0):
+            w = await super().closed_window(clock, concurrency, seconds, rep)
+            if clock.decode_mhz == 300 and rep == 0 and concurrency < 44:
+                w.decode_j_per_token = 0.001  # one absurd window must not decide
+            return w
+
+    table = asyncio.run(
+        TierLocator(NoisyBackend(seed=15), settings()).locate(PROMPT, [128, 512, 1024])
+    )
+    ev = table.evidence["decode"]
+    assert ev["decode_clock_repeats"] == 2
+    assert table.h.decode_mhz != 300 or ev["decode_j_per_token"][300] > 0.001
+
+
+def test_alpha_fit_reports_curvature() -> None:
+    from canatune.controller.locator import curvature
+
+    linear = [(t, 28 + 0.06 * t) for t in (128, 512, 1024, 2048)]
+    bent = [(t, 28 + 0.06 * t + 2e-5 * t * t) for t in (128, 512, 1024, 2048)]
+    assert abs(curvature(linear)["quad_share"]) < 1e-6
+    assert curvature(bent)["quad_share"] == pytest.approx(
+        2e-5 * 2048**2 / (28 + 0.06 * 2048 + 2e-5 * 2048**2), rel=1e-3
+    )
+    assert curvature(linear[:2]) is None

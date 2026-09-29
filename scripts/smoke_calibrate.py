@@ -10,6 +10,8 @@ Environment: everything `canatune.controller.process_controller` needs, plus
   SMOKE_DEADLINE_S   seconds to wait for the publish after start (default 2400)
   SMOKE_MAX_FAILURES stop after this many failed calibration attempts (default 3)
 
+Besides state/tiers/risk it saves every endpoint's raw /metrics (metrics_<name>.txt).
+
 Exit status: 0 published, 2 not published before the deadline, 3 the service
 stopped early, 4 the service never became ready, 5 calibration kept failing.
 """
@@ -25,6 +27,7 @@ from pathlib import Path
 import httpx
 
 from canatune.config import load_config
+from canatune.proxy.proxy import parse_endpoints
 
 
 def fetch(client: httpx.Client, base: str, path: str) -> object | None:
@@ -90,6 +93,16 @@ def main() -> int:
                         time.sleep(5)  # let the staggered move to H finish
                         break
                 time.sleep(5)
+            # Raw vLLM counters of every endpoint (names differ between vLLM versions).
+            for name, endpoint in parse_endpoints(config).items():
+                try:
+                    response = client.get(
+                        f"http://{endpoint.http_host}:{endpoint.http_port}/metrics", timeout=10
+                    )
+                    response.raise_for_status()
+                    (out / f"metrics_{name}.txt").write_text(response.text)
+                except httpx.HTTPError as error:
+                    print(f"smoke: /metrics of {name} failed: {error!r}", flush=True)
             for name, path in (
                 ("state.json", "/canatune/state"),
                 ("tiers.json", "/canatune/tiers"),

@@ -48,15 +48,52 @@ class FakeAgent:
         return list(range(210, 2521, 15)) if ref.gpu == 0 else list(range(210, 1501, 15))
 
 
-def vllm_handler(requests):
+class FakeMetrics:
+    """vLLM counters: P prefill time grows 0.05 ms/token + 20 ms; D counts every
+    generated token although the stream packs two tokens per SSE event."""
+
+    def __init__(self) -> None:
+        self.prefill_sum = 0.0
+        self.prefill_count = 0
+        self.generated = 0
+
+    def text(self, port: int) -> str:
+        if port == 8100:
+            return (
+                f'vllm:request_prefill_time_seconds_sum{{model_name="m"}} {self.prefill_sum}\n'
+                f'vllm:request_prefill_time_seconds_count{{model_name="m"}} {self.prefill_count}\n'
+            )
+        return (
+            f'vllm:generation_tokens_total{{model_name="m"}} {self.generated}\n'
+            'vllm:cache_config_info{block_size="16",cache_dtype="auto",'
+            'num_gpu_blocks="2103",gpu_memory_utilization="0.82"} 1.0\n'
+        )
+
+
+def vllm_handler(requests, metrics=None):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/models":
             return httpx.Response(200, json={"data": [{"id": "/models/mistral"}]})
+        if request.url.path == "/metrics":
+            if metrics is None:
+                return httpx.Response(404)
+            return httpx.Response(200, text=metrics.text(request.url.port))
         body = json.loads(request.content)
         requests.append((request.url.port, body, request.headers["X-Request-Id"]))
         if request.url.port == 8100:  # prefill
+            if metrics is not None:
+                metrics.prefill_sum += (20 + 0.05 * len(body["prompt"])) / 1000
+                metrics.prefill_count += 1
             return httpx.Response(200, json={"choices": [{"text": "x"}]})
         n = body["max_tokens"]
+        if metrics is not None:
+            metrics.generated += n
+            sse = b"".join(b'data: {"choices":[{"text":"tt"}]}\n\n' for _ in range((n + 1) // 2))
+            return httpx.Response(
+                200,
+                content=sse + b"data: [DONE]\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
         sse = b"".join(b'data: {"choices":[{"text":"t"}]}\n\n' for _ in range(n))
         return httpx.Response(
             200, content=sse + b"data: [DONE]\n\n", headers={"content-type": "text/event-stream"}
@@ -65,13 +102,13 @@ def vllm_handler(requests):
     return handler
 
 
-def make_probe(requests, agent):
+def make_probe(requests, agent, metrics=None):
     config = load_config()
     config["topology"]["prefill_nodegroup"]["node"] = "127.0.0.1"
     config["topology"]["decode_nodegroup"]["node"] = "127.0.0.2"
     canary = build_groups(config)[0]
     table = RiskTable.from_config(config["risk"], identity(config))
-    transport = httpx.MockTransport(vllm_handler(requests))
+    transport = httpx.MockTransport(vllm_handler(requests, metrics))
     probe = CanaryProbe(
         canary,
         parse_endpoints(config),
@@ -158,3 +195,41 @@ def test_closed_windows_use_long_outputs() -> None:
     asyncio.run(probe.closed_window(ClockPoint(1815, 1050), 2, 0.1))
     decode_bodies = [body for port, body, _ in requests if port == 8200]
     assert decode_bodies and all(b["max_tokens"] == 256 for b in decode_bodies)
+
+
+def test_open_window_sends_exactly_rate_times_seconds_requests() -> None:
+    requests: list = []
+    probe, _ = make_probe(requests, FakeAgent())
+    # lengths (64, 3) and (256, 5): mean prompt 160; alpha 40 -> 200 eq tokens/request
+    asyncio.run(probe.open_window(ClockPoint(2520, 1500), 4000.0, 40.0, 0.5, 1.0))
+    assert len([1 for port, _, _ in requests if port == 8100]) == 10  # 20 req/s x 0.5 s
+
+
+def test_counters_give_prefill_time_decode_tokens_and_kv_capacity() -> None:
+    requests: list = []
+    metrics = FakeMetrics()
+    probe, _ = make_probe(requests, FakeAgent(), metrics)
+    samples = asyncio.run(probe.service_times(ClockPoint(2520, 1500), [128, 1024]))
+    assert probe.service_source == "metrics"
+    assert [round(ms, 3) for _, ms, _ in samples] == [26.4, 71.2]  # 20 ms + 0.05 ms/token
+    closed = asyncio.run(probe.closed_window(ClockPoint(1815, 1050), 2, 0.1))
+    decoded = sum(
+        body["max_tokens"]
+        for port, body, _ in requests
+        if port == 8200 and body["max_tokens"] == 256
+    )
+    # D counted every token although only half as many SSE events arrived
+    energy = closed.decode_j_per_token * decoded
+    assert energy == pytest.approx(30.0 * closed.duration_s, rel=0.35)
+    assert asyncio.run(probe.kv_capacity()) == 2103 * 16
+
+
+def test_closed_window_trace_is_fixed_by_concurrency_and_rep() -> None:
+    def prompts(rep):
+        requests: list = []
+        probe, _ = make_probe(requests, FakeAgent())
+        probe.s = ProbeSettings(settle_s=0.0, sample_period_s=0.01, decode_stagger_s=0.0)
+        asyncio.run(probe.closed_window(ClockPoint(1815, 1050), 2, 0.05, rep=rep))
+        return sorted(len(b["prompt"]) for port, b, _ in requests if port == 8200)[:2]
+
+    assert prompts(0) == prompts(0)

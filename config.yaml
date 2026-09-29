@@ -173,9 +173,12 @@ canary:
     decode_load_fraction: 0.7 # choose the D clock at 0.7 B*
     decode_wall_tolerance: 0.25
     decode_kv_limit: 0.90
+    decode_window_s: 60       # closed windows: several requests per worker (r4 used 20 s)
+    decode_clock_repeats: 2   # D clock choice: median J/token of 2 windows
   probe:
     settle_s: 2.0
     sample_period_s: 0.25
+    decode_stagger_s: 15      # closed windows: spread worker starts over 15 s
     prefill_min_mhz: 600
     decode_min_mhz: 300
 

@@ -33,9 +33,10 @@ The locator never touches production: the backend drives only the Canary pair.
 """
 
 import math
+import statistics
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from canatune.domain.groups import ClockPoint, TierTable
@@ -89,6 +90,10 @@ class WindowResult:
             "prefill_mhz": self.prefill_mhz_median,
             "limited": round(self.prefill_limited_fraction, 3),
             "preempt": self.decode_preemptions,
+            "waiting_max": self.decode_waiting_max,
+            "kv_max": self.decode_kv_max,
+            "running_max": self.decode_running_max,
+            "duration_s": round(self.duration_s, 2),
             "aborted": self.aborted,
         }
 
@@ -118,8 +123,10 @@ class ProbeBackend(Protocol):
         ...
 
     async def closed_window(
-        self, clock: ClockPoint, concurrency: int, seconds: float
-    ) -> WindowResult: ...
+        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0
+    ) -> WindowResult:
+        """Fixed concurrency; `rep` selects another fixed prompt trace."""
+        ...
 
 
 # ---- settings and helpers -----------------------------------------------------------
@@ -155,6 +162,8 @@ class LocatorSettings:
     decode_wall_tolerance: float = 0.25  # frequency step only if B* grows >= 25 %
     decode_load_fraction: float = 0.7  # choose the D clock at 0.7 B* (near full load)
     decode_kv_limit: float = 0.90
+    decode_window_s: float = 60.0  # closed windows: several requests per worker (r4: 20 s)
+    decode_clock_repeats: int = 2  # D clock choice: median J/token of this many windows
     service_repeats: int = 3
     cache_ttl_s: float = 3600.0
 
@@ -202,15 +211,57 @@ def spread(grid: Sequence[int], low: int, high: int, n: int) -> list[int]:
     return sorted(points, reverse=True)
 
 
-def fit_alpha(samples: Sequence[tuple[int, float]]) -> float:
-    """prefill_ms = a + b * tokens on the per-length medians (one slow request,
-    e.g. the first KV-connector handshake, cannot flip the slope); alpha = a / b."""
+def _medians(samples: Sequence[tuple[int, float]]) -> list[tuple[int, float]]:
     by_length: dict[int, list[float]] = {}
     for tokens, ms in samples:
         by_length.setdefault(tokens, []).append(ms)
-    if len(by_length) < 2:
+    return sorted((t, sorted(v)[len(v) // 2]) for t, v in by_length.items())
+
+
+def curvature(samples: Sequence[tuple[int, float]]) -> dict[str, float] | None:
+    """Least-squares a + b*L + c*L^2 on the per-length medians; `quad_share` is the
+    c*L^2 part of the prefill time at the longest length (how far from linear)."""
+    points = _medians(samples)
+    if len(points) < 3:
+        return None
+    # normal equations for [a, b, c]
+    s = [sum(t**k for t, _ in points) for k in range(5)]
+    r = [sum(ms * t**k for t, ms in points) for k in range(3)]
+    m = [[s[0], s[1], s[2]], [s[1], s[2], s[3]], [s[2], s[3], s[4]]]
+
+    def det(x):
+        return (
+            x[0][0] * (x[1][1] * x[2][2] - x[1][2] * x[2][1])
+            - x[0][1] * (x[1][0] * x[2][2] - x[1][2] * x[2][0])
+            + x[0][2] * (x[1][0] * x[2][1] - x[1][1] * x[2][0])
+        )
+
+    d = det(m)
+    if d == 0:
+        return None
+    coef = []
+    for i in range(3):
+        mi = [row[:] for row in m]
+        for j in range(3):
+            mi[j][i] = r[j]
+        coef.append(det(mi) / d)
+    a, b, c = coef
+    top = points[-1][0]
+    total = a + b * top + c * top * top
+    return {
+        "a_ms": a,
+        "b_ms": b,
+        "c_ms": c,
+        "quad_share": (c * top * top / total) if total > 0 else 0.0,
+    }
+
+
+def fit_alpha(samples: Sequence[tuple[int, float]]) -> float:
+    """prefill_ms = a + b * tokens on the per-length medians (one slow request,
+    e.g. the first KV-connector handshake, cannot flip the slope); alpha = a / b."""
+    points = _medians(samples)
+    if len(points) < 2:
         raise LocatorError("service-time fit needs at least two prompt lengths")
-    points = [(t, sorted(v)[len(v) // 2]) for t, v in by_length.items()]
     n = len(points)
     mx = sum(t for t, _ in points) / n
     my = sum(ms for _, ms in points) / n
@@ -297,10 +348,34 @@ class TierLocator:
             lambda: self.backend.open_window(clock, eq_tps, alpha, seconds, 2 * self.s.theta),
         )
 
-    async def closed(self, clock: ClockPoint, concurrency: int) -> WindowResult:
-        key = ("closed", clock, concurrency)
+    async def closed(self, clock: ClockPoint, concurrency: int, rep: int = 0) -> WindowResult:
+        key = ("closed", clock, concurrency, rep)
         return await self._cached(
-            key, lambda: self.backend.closed_window(clock, concurrency, self.s.window_s)
+            key,
+            lambda: self.backend.closed_window(clock, concurrency, self.s.decode_window_s, rep=rep),
+        )
+
+    async def closed_median(self, clock: ClockPoint, concurrency: int) -> WindowResult:
+        """decode_clock_repeats windows with different fixed traces: clean only if every
+        one is clean, J/token their median (one window is too noisy: r3 1170, r4 1605)."""
+        ws = [
+            await self.closed(clock, concurrency, rep) for rep in range(self.s.decode_clock_repeats)
+        ]
+        energies = sorted(w.decode_j_per_token for w in ws if w.decode_j_per_token is not None)
+        return replace(
+            ws[0],
+            requests=sum(w.requests for w in ws),
+            violations=sum(w.violations for w in ws),
+            tpot_p95_ms=max((w.tpot_p95_ms for w in ws if w.tpot_p95_ms is not None), default=None),
+            decode_j_per_token=statistics.median(energies) if energies else None,
+            decode_preemptions=sum(w.decode_preemptions for w in ws),
+            decode_waiting_max=max(w.decode_waiting_max for w in ws),
+            decode_kv_max=max(
+                (w.decode_kv_max for w in ws if w.decode_kv_max is not None), default=None
+            ),
+            decode_running_max=max(
+                (w.decode_running_max for w in ws if w.decode_running_max is not None), default=None
+            ),
         )
 
     def feasible(self, w: WindowResult) -> bool:
@@ -379,7 +454,16 @@ class TierLocator:
         limit = None if len(ok) == len(lengths) else max(ok)
         assert self.run is not None
         self.run.evidence.update(
-            {"alpha_tokens": alpha, "idle_ttft_ms": idle_ttft, "prompt_limit": limit}
+            {
+                "alpha_tokens": alpha,
+                "alpha_source": getattr(self.backend, "service_source", "unknown"),
+                "alpha_fit": {
+                    "prefill_ms_by_length": dict(_medians([(t, ms) for t, ms, _ in samples])),
+                    "quadratic": curvature([(t, ms) for t, ms, _ in samples]),
+                },
+                "idle_ttft_ms": idle_ttft,
+                "prompt_limit": limit,
+            }
         )
         return alpha, limit
 
@@ -554,7 +638,7 @@ class TierLocator:
         load = max(1, round(self.s.decode_load_fraction * b_top))
         per_clock: dict[int, WindowResult] = {}
         for f in spread(hw.decode_clocks, hw.decode_clocks[0], top_d, self.s.coarse_points):
-            w = await self.closed(ClockPoint(prefill_mhz, f), load)
+            w = await self.closed_median(ClockPoint(prefill_mhz, f), load)
             per_clock[f] = w
             if not self.decode_clean(w):
                 break  # lower D clocks only get slower
@@ -585,12 +669,22 @@ class TierLocator:
         # ran in the clean B* window (client concurrency also waits at P).
         running = None if b_window is None else b_window.decode_running_max
         b_published = int(running) if running else b_low
+        # K* candidate (KV tokens D held in the clean B* window); recorded, not used yet.
+        capacity = None
+        if hasattr(self.backend, "kv_capacity"):
+            capacity = await self.backend.kv_capacity()
+        kv_peak = None if b_window is None else b_window.decode_kv_max
         evidence = {
             "decode_load_concurrency": load,
             "decode_j_per_token": ok,
             "b_star_concurrency": {str(f_d): b_low, str(top_d): b_top},
             "b_star_running": b_published,
             "kv_wall": wall,
+            "kv_capacity_tokens": capacity,
+            "kv_peak_clean": kv_peak,
+            "k_star_tokens": None if capacity is None or kv_peak is None else kv_peak * capacity,
+            "decode_window_s": self.s.decode_window_s,
+            "decode_clock_repeats": self.s.decode_clock_repeats,
         }
         return f_d, b_published, wall, evidence
 
