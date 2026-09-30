@@ -334,3 +334,15 @@ def test_group_load_in_equivalent_tokens() -> None:
     # 5 requests in the last 5 s, each 100 prompt tokens + alpha 460.
     assert g.load(109.5, 5, 460.0) == pytest.approx(5 * 560 / 5)
     assert g.load(109.5, 5, 0.0) == pytest.approx(100.0)
+
+
+def test_length_shift_ignores_median_flips_of_a_discrete_mix() -> None:
+    reference = LengthStats([(128, 64), (512, 64), (1024, 64), (2048, 64)], min_samples=1)
+    live = LengthStats([(1, 1)], min_samples=1)
+    for prompt in [128, 512, 512, 1024, 2048] * 40:  # median 512 instead of 1024
+        live.record(prompt, 64)
+    assert live.summary().prompt_p50 != reference.summary().prompt_p50
+    assert not live.summary().shifted(reference.summary(), 0.30)
+    for _ in range(400):
+        live.record(2048, 256)
+    assert live.summary().shifted(reference.summary(), 0.30)

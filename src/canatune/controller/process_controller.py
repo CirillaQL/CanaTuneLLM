@@ -52,6 +52,9 @@ class ProcessController:
         self._stop_signal: int | None = None
         self._stop_event = threading.Event()
         self._stopped = False
+        # Called while the agents still run: reset their clocks over HTTP (the agents'
+        # own reset on exit did not happen after srun's SIGTERM in smoke 2).
+        self.before_agents_stop: Callable[[], None] | None = None
 
     def _handle_signal(self, signum: int, _frame: object) -> None:
         self._stop_signal = signum
@@ -136,6 +139,11 @@ class ProcessController:
         self._stopped = True
         self._wait_then_kill(("proxy",))
         self._wait_then_kill(("prefill", "decode"))
+        if self.before_agents_stop is not None:
+            try:
+                self.before_agents_stop()
+            except Exception as error:
+                print(f"CanaTune controller: clock reset failed: {error!r}", file=sys.stderr)
         self._wait_then_kill(tuple(name for name in self._processes if name.endswith("_agent")))
 
     def run(
@@ -193,6 +201,19 @@ class ProcessController:
             self.stop()
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
+
+
+def reset_agent_clocks(client: httpx.Client, agent_urls: Sequence[str]) -> None:
+    """Reset every GPU of every agent and print the clocks read back."""
+    for url in agent_urls:
+        for gpu in client.get(f"{url}/gpus", timeout=10).json():
+            index = gpu["index"]
+            try:
+                client.post(f"{url}/gpus/{index}/reset", timeout=30).raise_for_status()
+                status = "ok"
+            except httpx.HTTPError as error:
+                status = f"failed: {error!r}"
+            print(f"CanaTune controller: reset {url} GPU {index}: {status}", flush=True)
 
 
 def _positive_seconds(value: str, name: str) -> float:
@@ -289,6 +310,8 @@ def main() -> int:
                 return False
 
         controller = ProcessController(health_check=health_check, shutdown_grace_s=shutdown_grace_s)
+        agent_urls = [url.removesuffix("/health") for url in agent_health_urls]
+        controller.before_agents_stop = lambda: reset_agent_clocks(client, agent_urls)
         return controller.run(
             cwd=root,
             prefill_command=(

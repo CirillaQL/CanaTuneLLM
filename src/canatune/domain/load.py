@@ -3,7 +3,7 @@
 The Router records (prompt tokens, generated tokens) of every finished
 production request. The Canary draws probe lengths from these pairs (joint, so
 the prompt/output correlation is kept) instead of copying requests, and a
-change of the median or p90 against the distribution used for the last
+change of the mean or p90 against the distribution used for the last
 calibration triggers a new one.
 """
 
@@ -22,13 +22,16 @@ class LengthSummary:
     output_p50: float
     output_p90: float
     prompt_mean: float
+    output_mean: float = 0.0
 
     def shifted(self, other: "LengthSummary", threshold: float) -> bool:
-        """Relative change of any median or p90 above `threshold`."""
+        """Relative change of any mean or p90 above `threshold`. Not the median: on a
+        few discrete lengths it jumps between neighbours (smoke 2: 1024 -> 512 on the
+        same uniform mix of four lengths triggered a relocation)."""
         pairs = (
-            (self.prompt_p50, other.prompt_p50),
+            (self.prompt_mean, other.prompt_mean),
             (self.prompt_p90, other.prompt_p90),
-            (self.output_p50, other.output_p50),
+            (self.output_mean, other.output_mean),
             (self.output_p90, other.output_p90),
         )
         return any(abs(a - b) / max(b, 1.0) > threshold for a, b in pairs)
@@ -111,4 +114,5 @@ class LengthStats:
             output_p50=_quantile(outputs, 0.5),
             output_p90=_quantile(outputs, 0.9),
             prompt_mean=sum(prompts) / len(prompts),
+            output_mean=sum(outputs) / len(outputs),
         )

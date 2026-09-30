@@ -76,6 +76,19 @@ def agents_and_names(config: dict) -> tuple[list[str], dict[str, str]]:
     return sorted(set(urls.values())), names
 
 
+def reset_clocks(client: httpx.Client, agents: list[str]) -> list[dict]:
+    """Reset every agent GPU to driver control; -> readings after the reset."""
+    readings = []
+    for agent in agents:
+        for gpu in client.get(f"{agent}/gpus", timeout=10).json():
+            client.post(f"{agent}/gpus/{gpu['index']}/reset", timeout=30).raise_for_status()
+        time.sleep(3)
+        for gpu in client.get(f"{agent}/gpus", timeout=10).json():
+            readings.append({"agent": agent, "index": gpu["index"], "sm_mhz": gpu.get("sm_mhz")})
+    log(f"clocks reset: {readings}")
+    return readings
+
+
 def model_name(client: httpx.Client, endpoints: dict) -> str:
     prefill = next(e for e in endpoints.values() if e.role == "prefill")
     response = client.get(f"http://{prefill.http_host}:{prefill.http_port}/v1/models", timeout=10)
@@ -288,6 +301,8 @@ def main() -> int:
                 loadgen.save_trace(out / "trace.json", meta, arrivals)
             else:
                 meta, arrivals = loadgen.load_trace(os.environ["SMOKE_TRACE"])
+                # Driver-managed clocks: never inherit locks from an earlier run.
+                summary["clocks_at_start"] = reset_clocks(client, agents)
             log(
                 f"trace: {meta['requests']} requests over {meta['duration_s']:.0f} s, "
                 + ", ".join(f"{p['name']}={p['rate_rps']:.2f}rps" for p in meta["phases"])

@@ -115,3 +115,17 @@ def test_stop_request_returns_signal_status(tmp_path: Path) -> None:
 
     assert status == 128 + signal.SIGTERM
     assert all(process.poll() is not None for process in controller._processes.values())
+
+
+def test_clocks_are_reset_before_agents_stop(tmp_path: Path) -> None:
+    events = tmp_path / "events"
+    controller = ProcessController(health_check=lambda _: True, shutdown_grace_s=0.5)
+    controller.before_agents_stop = lambda: events.open("a").write("reset\n")
+    try:
+        for name in ("prefill", "prefill_agent"):
+            ready = tmp_path / f"{name}.ready"
+            controller.start(name, _service_command(name, events, ready), cwd=tmp_path)
+            _wait_for(ready)
+    finally:
+        controller.stop()
+    assert events.read_text().splitlines() == ["prefill", "reset", "prefill_agent"]
