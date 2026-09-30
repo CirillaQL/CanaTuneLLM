@@ -1,0 +1,12 @@
+{
+  "tag": "put",
+  "stages": ["warmup", "scans"],
+  "warmup_s": 90, "warmup_rate": 1.0,
+  "base_prefill_clock": 1545, "base_decode_clock": 1170,
+  "load_window_s": 90, "load_output": 64,
+  "saturation_ttft_ms": 3000, "stall_ms": 10000,
+  "scans": [
+    {"name": "cliff", "p": 1545, "d": 1170, "rates": [2, 3, 4, 5]},
+    {"name": "link2", "p": 1545, "d": 1170, "rates": [2, 3], "pairs": 2}
+  ]
+}

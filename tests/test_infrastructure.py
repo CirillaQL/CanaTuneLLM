@@ -103,3 +103,31 @@ def test_agent_allows_supported_clocks_above_min_and_lists_them() -> None:
             assert (await client.get("/gpus/3/clocks")).status_code == 404
 
     asyncio.run(run())
+
+
+def test_agent_net_counters(tmp_path) -> None:
+    import asyncio
+
+    import httpx
+
+    from canatune.infrastructure.gpu_agent import net_counters
+
+    for name, rx, tx in (("lo", 1, 1), ("eth0", 100, 200), ("ib0", 5, 6)):
+        stats = tmp_path / name / "statistics"
+        stats.mkdir(parents=True)
+        (stats / "rx_bytes").write_text(f"{rx}\n")
+        (stats / "tx_bytes").write_text(f"{tx}\n")
+    (tmp_path / "broken").mkdir()
+    assert net_counters(str(tmp_path)) == {
+        "eth0": {"rx_bytes": 100, "tx_bytes": 200},
+        "ib0": {"rx_bytes": 5, "tx_bytes": 6},
+    }
+    assert net_counters(str(tmp_path / "missing")) == {}
+    app = create_agent_app(ClockService(DryRunBackend([0]), [0]), net_root=str(tmp_path))
+
+    async def get():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://agent") as client:
+            return (await client.get("/net")).json()
+
+    assert asyncio.run(get())["interfaces"]["eth0"]["tx_bytes"] == 200

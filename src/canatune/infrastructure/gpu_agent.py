@@ -232,8 +232,36 @@ def _int_list(value: str, name: str) -> list[int]:
     return items
 
 
-def create_agent_app(service: ClockService) -> FastAPI:
+def net_counters(root: str = "/sys/class/net") -> dict[str, dict[str, int]]:
+    """Cumulative rx/tx bytes of every network interface except loopback (Linux sysfs;
+    empty elsewhere). The P->D KV transfers share the nodes' links, so byte rates
+    over a window give the link load of all groups together."""
+    out: dict[str, dict[str, int]] = {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return out
+    for name in names:
+        if name == "lo":
+            continue
+        counters = {}
+        for key in ("rx_bytes", "tx_bytes"):
+            try:
+                with open(os.path.join(root, name, "statistics", key)) as stream:
+                    counters[key] = int(stream.read().strip())
+            except (OSError, ValueError):
+                break
+        else:
+            out[name] = counters
+    return out
+
+
+def create_agent_app(service: ClockService, net_root: str = "/sys/class/net") -> FastAPI:
     app = FastAPI(title="CanaTune GPU agent")
+
+    @app.get("/net")
+    async def net() -> dict[str, Any]:
+        return {"time": time.time(), "interfaces": net_counters(net_root)}
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
