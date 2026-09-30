@@ -265,6 +265,7 @@ class CanaTuneRouter:
         ttft_ms: float | None,
         tpot_ms: float | None,
         output_tokens: int,
+        timing: Mapping[str, float | None] | None = None,
     ) -> None:
         if ticket.finished:
             return
@@ -317,6 +318,7 @@ class CanaTuneRouter:
                 "output_tokens": output_tokens,
                 "violated": violated,
                 "table_skip": skip,
+                "timing": None if timing is None else dict(timing),
             }
         )
 

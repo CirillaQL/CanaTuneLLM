@@ -354,6 +354,18 @@ every GPU's NVML energy counter through the node agents. The results are
 `load/requests.jsonl`, `energy.jsonl`, `timeline.jsonl` and `load_summary.json`,
 which gives per-phase outcomes, J per request and which Controller paths fired.
 
+**Model measurements (E1 + E2).** `scripts/measure_model.py` starts the service
+with the `round_robin` policy and clock control, then runs `canatune.measure` on
+the Canary pair outside the control loop: a prompt-length table per P clock, idle
+power, closed-loop decode windows per D clock, open-loop rate scans per P clock
+and for other length mixes. Every request records the P round trip, the gap and
+the decode first-token time, so TTFT can be split into its stages. Every window
+records vLLM counter deltas, energy per GPU and sampled queue state. Results are
+appended to `requests.jsonl` / `windows.jsonl`, and a rerun resumes after the
+last finished window. The proxy logs the same stage breakdown (`timing`) for
+production requests. `scripts/analysis/sparse_clock_check.py` checks offline
+whether a sparse clock design finds the lowest-energy clock of a dense sweep.
+
 Run the project checks with:
 
 ```bash

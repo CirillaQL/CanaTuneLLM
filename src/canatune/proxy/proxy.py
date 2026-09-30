@@ -191,6 +191,25 @@ class StreamTimer:
         return (times[-1] - times[0]) * 1000.0 / (len(times) - 1)
 
 
+def stage_ms(arrived: float, stamps: Mapping[str, float]) -> dict[str, float | None]:
+    """TTFT breakdown in ms: admission (Router wait), P round trip (proxy -> P -> proxy,
+    P queue + prefill + P front end), proxy gap before the decode call, and decode
+    first token (D front end + KV wait/load + first step). Missing stages are None."""
+
+    def span(a: str | None, b: str) -> float | None:
+        start = arrived if a is None else stamps.get(a)
+        end = stamps.get(b)
+        return None if start is None or end is None else (end - start) * 1000.0
+
+    return {
+        "admit_ms": span(None, "admitted"),
+        "to_prefill_ms": span("admitted" if "admitted" in stamps else None, "prefill_sent"),
+        "prefill_ms": span("prefill_sent", "prefill_done"),
+        "gap_ms": span("prefill_done", "decode_sent"),
+        "decode_first_ms": span("decode_sent", "first_token"),
+    }
+
+
 def create_proxy_router(
     config: Mapping[str, Any],
     client_factory: Callable[[], httpx.AsyncClient] | None = None,
@@ -237,6 +256,8 @@ def create_proxy_router(
     @router.post(path)
     async def completions(request: Request) -> Response:
         arrived = time.monotonic()
+        # Stage boundaries (monotonic) for the per-request TTFT breakdown (E0).
+        stamps: dict[str, float] = {}
         try:
             body = await request.json()
         except ValueError:
@@ -267,6 +288,7 @@ def create_proxy_router(
                     status_code=503,
                     headers={"X-CanaTune-Rejected": "1"},
                 )
+            stamps["admitted"] = time.monotonic()
             prefill = selector.endpoints[ticket.group.prefill]
             decode = selector.endpoints[ticket.group.decode]
         else:
@@ -285,6 +307,9 @@ def create_proxy_router(
             times = timer.token_times if timer is not None else []
             ttft_ms = (times[0] - arrived) * 1000.0 if times else None
             tpot_ms = timer.tpot_ms() if timer is not None else None
+            if times:
+                stamps["first_token"] = times[0]
+            timing = stage_ms(arrived, stamps)
             if ticket is not None:
                 runtime.router.finish(
                     ticket,
@@ -292,6 +317,7 @@ def create_proxy_router(
                     ttft_ms=ttft_ms,
                     tpot_ms=tpot_ms,
                     output_tokens=len(times),
+                    timing=timing,
                 )
             else:
                 baseline_log.write(
@@ -306,6 +332,7 @@ def create_proxy_router(
                         "ttft_ms": ttft_ms,
                         "tpot_ms": tpot_ms,
                         "output_tokens": len(times),
+                        "timing": timing,
                     }
                 )
 
@@ -325,9 +352,11 @@ def create_proxy_router(
 
         try:
             async with factory() as client:
+                stamps["prefill_sent"] = time.monotonic()
                 prefill_response = await client.post(
                     prefill.completions_url, json=prefill_body, headers=headers
                 )
+                stamps["prefill_done"] = time.monotonic()
             if prefill_response.status_code != 200:
                 finish("prefill_error", None)
                 return JSONResponse(
@@ -346,6 +375,7 @@ def create_proxy_router(
             decode_request = client.build_request(
                 "POST", decode.completions_url, json=body, headers=headers
             )
+            stamps["decode_sent"] = time.monotonic()
             decode_response = await client.send(decode_request, stream=True)
             if decode_response.status_code != 200:
                 await decode_response.aclose()

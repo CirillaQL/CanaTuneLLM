@@ -256,3 +256,21 @@ def test_cantune_lifespan_starts_and_stops_control_loops(tmp_path, monkeypatch) 
     asyncio.run(run())
     assert (tmp_path / "risk.json").exists()
     assert (tmp_path / "events.jsonl").read_text().count('"event": "tier"') >= 4
+
+
+def test_stage_ms_breaks_ttft_into_stages() -> None:
+    from canatune.proxy.proxy import stage_ms
+
+    stamps = {
+        "prefill_sent": 10.01,
+        "prefill_done": 10.16,
+        "decode_sent": 10.161,
+        "first_token": 10.4,
+    }
+    timing = stage_ms(10.0, stamps)
+    assert timing["admit_ms"] is None
+    assert timing["to_prefill_ms"] == pytest.approx(10.0)
+    assert timing["prefill_ms"] == pytest.approx(150.0)
+    assert timing["gap_ms"] == pytest.approx(1.0)
+    assert timing["decode_first_ms"] == pytest.approx(239.0)
+    assert stage_ms(10.0, {})["prefill_ms"] is None
