@@ -521,17 +521,70 @@ class TierLocator:
         )
         return alpha, limit
 
-    async def prefill_table(self, clock: ClockPoint, prompts: Sequence[int]) -> dict[int, float]:
-        """Single-request S(L) at `clock` (the clocks production runs at)."""
+    async def prefill_table(
+        self, clock: ClockPoint, prompts: Sequence[int], *, fresh: bool = False, idle: bool = False
+    ) -> dict[int, float]:
+        """Single-request S(L) at `clock` (the clocks production runs at). `fresh`
+        re-measures; `idle` also refreshes the idle TTFT and residence (the top clock)."""
         lengths = service_lengths(prompts, self.s.service_lengths)
+        key = ("service", clock, tuple(lengths))
+        if fresh:
+            self._cache.pop(key, None)
         samples = await self._cached(
-            ("service", clock, tuple(lengths)),
-            lambda: self.backend.service_times(clock, lengths * self.s.service_repeats),
+            key, lambda: self.backend.service_times(clock, lengths * self.s.service_repeats)
         )
         table = dict(_medians([(t, ms) for t, ms, _ in samples]))
         assert self.run is not None
-        self.run.evidence.setdefault("prefill_ms_by_clock", {})[clock.prefill_mhz] = table
+        ev = self.run.evidence
+        ev.setdefault("prefill_ms_by_clock", {})[clock.prefill_mhz] = table
+        if idle:
+            timed = [(t, ttft) for t, _, ttft in samples if ttft is not None]
+            ev["idle_ttft_ms"] = dict(_medians(timed)) or ev.get("idle_ttft_ms", {})
+            ev["residence_ms_by_length"] = dict(
+                _medians([(t, ttft - ms) for t, ms, ttft in samples if ttft is not None])
+            ) or ev.get("residence_ms_by_length", {})
         return table
+
+    @staticmethod
+    def table_conflicts(tables: Mapping[int, Mapping[int, float]], eps: float) -> set[int]:
+        """Clocks whose S(L) contradict each other: a higher P clock slower than a
+        lower one (beyond eps) at some length."""
+        out: set[int] = set()
+        clocks = sorted(tables)
+        for i, lo in enumerate(clocks):
+            for hi in clocks[i + 1 :]:
+                if any(
+                    n in tables[lo] and ms > (1 + eps) * tables[lo][n]
+                    for n, ms in tables[hi].items()
+                ):
+                    out |= {lo, hi}
+        return out
+
+    async def consistent_tables(self, top: ClockPoint, prompts: Sequence[int]) -> None:
+        """A higher P clock is never slower for one request, so a contradiction is a
+        disturbed measurement (warm-up, a connection being set up). The clocks
+        involved are measured once more; what still contradicts takes the envelope of
+        the lower clocks (a higher clock at least as fast)."""
+        assert self.run is not None
+        ev = self.run.evidence
+        tables = ev.get("prefill_ms_by_clock", {})
+        bad = self.table_conflicts(tables, self.s.eps)
+        record: dict[str, Any] = {"remeasured": sorted(bad), "envelope": []}
+        for f in sorted(bad):
+            clock = top if f == top.prefill_mhz else ClockPoint(f, top.decode_mhz)
+            await self.prefill_table(clock, prompts, fresh=True, idle=clock == top)
+        left = self.table_conflicts(tables, self.s.eps)
+        if left:
+            clocks = sorted(tables)
+            for i, f in enumerate(clocks):
+                for lo in clocks[:i]:
+                    for n in tables[f]:
+                        if n in tables[lo]:
+                            tables[f][n] = min(tables[f][n], tables[lo][n])
+            record["envelope"] = sorted(left)
+        ev["prefill_consistency"] = record
+        if bad:
+            self.log.write({"event": "locator_tables", **record})
 
     def calibrate(
         self,
@@ -960,6 +1013,7 @@ class TierLocator:
         for f in sorted(set(spread(grid, grid[0], f_eff, self.s.coarse_points)) | {f_h}):
             if f != top.prefill_mhz:
                 await self.prefill_table(ClockPoint(f, top.decode_mhz), prompts)
+        await self.consistent_tables(top, prompts)
 
         if previous is not None:
             f_d, b_star, wall = (

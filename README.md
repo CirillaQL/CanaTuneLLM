@@ -73,7 +73,7 @@ deploy ─> cold start ──────────────> publish ─> 
 | service | single requests at 16, 64, 256, ... up to the longest prompt (x3) at MAX: S(L), the KV residence (idle TTFT - prefill), prompts that miss the SLO even when idle |
 | ramp | at MAX: double the load until the violation bound exceeds theta, bisect → C0; the busy clock gives the power-capped ceiling |
 | search | coarse + refine of the P clock at 0.8·C0 by measured J/request → H |
-| tables | S(L) at every coarse P clock (the solver's choices) |
+| tables | S(L) at every coarse P clock (the solver's choices); a higher clock slower than a lower one (beyond eps) is measured again, then bounded by the lower clocks |
 | decode | J/token over the D clocks at 0.7·B* and at half that (D iteration vs running sequences); B* at the chosen and the top D clock |
 | joint | P at H with the D ladder at 0.8·C0 |
 | fill | windows at H over loads → C_H |
@@ -113,10 +113,13 @@ admit         to the most loaded feasible group (concentration keeps batches lar
 overload      (no group within the risk bound after max_wait_ms)
               reject: 503
               serve (default): rescue to the lowest-predicted group if it still meets
-              the SLO; a doomed request holds (first come first served) and backfills
-              only where a fresh request keeps backfill_slack_ms of slack (auto: the
-              lowest slack with observed risk <= theta / 2) and none is waiting;
-              503 after hold_max_ms. Hard limits are never overridden.
+              the SLO; a doomed request waits for a rescue until its SLO deadline
+              (TTFT SLO - the Canary's idle TTFT at its length), then is served best
+              effort, first come first served, only where a fresh request keeps
+              backfill_slack_ms of slack (auto: the lowest slack with observed risk
+              <= theta / 2) and no fresh or still-savable request waits; 503 after
+              hold_max_ms (the client's timeout, a policy). Hard limits are never
+              overridden.
 ```
 
 Rescues, backfills, holds and rejections are the pressure signal.

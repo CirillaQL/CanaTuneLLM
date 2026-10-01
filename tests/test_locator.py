@@ -445,3 +445,32 @@ def test_alpha_fit_reports_curvature() -> None:
         2e-5 * 2048**2 / (28 + 0.06 * 2048 + 2e-5 * 2048**2), rel=1e-3
     )
     assert curvature(linear[:2]) is None
+
+
+def test_contradicting_prefill_tables_are_measured_again() -> None:
+    # The first table (the top clock, right after start) carries +25 ms of warm-up.
+    backend = SurrogateBackend(seed=4)
+    original = backend.service_times
+    calls = []
+
+    async def first_disturbed(clock, prompts):
+        calls.append(clock)
+        out = await original(clock, prompts)
+        if len(calls) == 1:
+            out = [(p, ms + 25.0, ttft + 25.0) for p, ms, ttft in out]
+        return out
+
+    backend.service_times = first_disturbed
+    table = asyncio.run(TierLocator(backend, settings()).locate(PROMPT, [128, 512, 1024, 2048]))
+    ev = table.evidence
+    top = calls[0].prefill_mhz
+    assert top in ev["prefill_consistency"]["remeasured"]
+    assert not ev["prefill_consistency"]["envelope"]  # consistent after the re-measurement
+    assert not TierLocator.table_conflicts(ev["prefill_ms_by_clock"], 0.02)
+    assert ev["idle_ttft_ms"][128] < 180 + 28.1 + 0.0615 * 128 + 10  # refreshed too
+
+
+def test_persistent_contradictions_take_the_lower_clocks_envelope() -> None:
+    tables = {1080: {16: 44.0, 2048: 240.0}, 2520: {16: 67.0, 2048: 150.0}}
+    assert TierLocator.table_conflicts(tables, 0.02) == {1080, 2520}
+    assert not TierLocator.table_conflicts({1080: {16: 44.0}, 2520: {16: 44.5}}, 0.02)

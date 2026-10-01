@@ -110,14 +110,16 @@ router:
   admission: slack
   # After max_wait_ms without a group within the risk bound: reject (503), or serve:
   # rescue = dispatch at once to the lowest-predicted group if it still meets the
-  # SLO; doomed (SLO lost everywhere) = hold first come first served and backfill
-  # only where a fresh request would keep backfill_slack_ms of slack (late requests
-  # must not displace on-time ones); 503 after hold_max_ms. Hard limits (D walls,
-  # KV in flight) are never overridden. doomed: dispatch sends doomed ones at once.
+  # SLO; doomed (SLO lost everywhere) = wait for a rescue until the SLO deadline
+  # (TTFT SLO - the Canary's idle TTFT at that length), then best effort: first come
+  # first served, only where a fresh request would keep backfill_slack_ms of slack
+  # and no fresh or still-savable request waits (late requests must not displace
+  # on-time ones). Hard limits (D walls, KV in flight) are never overridden.
+  # doomed: dispatch sends doomed ones at once.
   overload: serve
   doomed: backfill
   backfill_slack_ms: auto     # auto: lowest slack with observed risk <= theta / 2
-  hold_max_ms: 30000
+  hold_max_ms: 30000          # policy: the client's timeout, then 503
 
 telemetry:
   enabled: true

@@ -546,6 +546,33 @@ def test_serve_holds_first_come_first_served_while_every_group_is_at_a_hard_limi
     assert router.rejections == 1 and router.state()["holding"] == 1  # `second` still waits
 
 
+def test_doomed_waits_for_a_rescue_until_its_slo_deadline_then_best_effort() -> None:
+    table = published()
+    table.evidence["idle_ttft_ms"] = {"128": 150.0, "2048": 250.0}  # the Canary's idle TTFT
+    clock, _, groups, _, router, _, _ = setup(table=table, admission="slack", overload="serve")
+    activate(groups)
+    assert router.deadline_ms(128) == pytest.approx(850)  # SLO - idle TTFT
+    assert router.deadline_ms(1088) == pytest.approx(800)  # interpolated
+    for g in groups:
+        g.inflight_bytes = 0.6e9  # every group at the KV gate
+    old, young = router.new_waiter(), router.new_waiter()
+    assert router.step(old, 128, True, 840.0) == "wait"  # deadline 850 ms: savable
+    assert router.step(young, 128, True, 200.0) == "wait"
+    clock.now += 0.1  # old passes its deadline, young is still within its own
+    assert router.state()["holding_expired"] == 1
+    groups[0].inflight_bytes = 0.0
+    assert router.step(old, 128, True, 940.0) == "wait"  # a savable holder goes first
+    t = router.step(young, 128, True, 300.0)
+    assert t.group is groups[0] and t.overflow is None  # met the SLO
+    router.prefill_done(t)
+    router.first_token(t)  # young's prompt is done: the group has spare capacity again
+    groups[0].inflight_bytes = 0.0
+    t = router.step(old, 128, True, 950.0)
+    assert t is not None and t.overflow == "backfill"  # then the late one, best effort
+    late = router.new_waiter()
+    assert router.step(late, 128, True, router.settings.hold_max_ms) == "reject"  # timeout
+
+
 def test_controller_boosts_on_overflow_pressure() -> None:
     clock, _, groups, _, router, controller, actuator = setup(
         table=published(), admission="slack", overload="serve"

@@ -21,10 +21,13 @@ parked group), and then, by `overload`:
     predicted TTFT would still meet the SLO, only not within the risk bound:
     dispatch there at once;
   - *doomed*: the SLO is lost on every group. Dispatching it anyway takes P,
-    link and D capacity from requests that can still make it. So it waits,
-    first come first served, and backfills: it is dispatched only where a fresh
-    request would keep `backfill_slack_ms` of slack and no fresh request is
-    waiting, late but without making others late (`hold_max_ms`, then 503).
+    link and D capacity from requests that can still make it. So it waits for a
+    rescue until its SLO deadline (TTFT SLO - the Canary's idle TTFT at its
+    length: past it no schedule can meet the SLO), and is then served best
+    effort: first come first served, only where a fresh request would keep
+    `backfill_slack_ms` of slack and while no fresh request and no holder
+    within its deadline waits, late but without making others late.
+    `hold_max_ms` is the client's timeout (a service policy), then 503.
     `doomed: dispatch` sends it at once instead (for comparison).
   Both count as pressure for the Controller (wake / abort Canary / MAX). The
   hard limits stay hard: the D receive buffer overflowing stalls the whole group.
@@ -54,6 +57,7 @@ from canatune.domain.admission import (
 )
 from canatune.domain.groups import Group, TierState
 from canatune.domain.load import LengthStats
+from canatune.domain.models import interpolate
 from canatune.domain.risk import Cell, RiskEstimate, RiskTable, is_violation
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import Telemetry
@@ -88,7 +92,7 @@ class RouterSettings:
     doomed: str = "backfill"  # serve: backfill (wait for spare capacity) or dispatch
     backfill_slack_ms: float | None = None  # backfill only where a fresh request keeps this
     # slack; None (auto): the lowest slack whose observed risk is <= theta / 2
-    hold_max_ms: float = 30000.0  # serve: longest hold while every group is at a hard limit
+    hold_max_ms: float = 30000.0  # serve: client timeout (policy): 503 after this long
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "RouterSettings":
@@ -220,6 +224,8 @@ class CanaTuneRouter:
         self._holding: deque[int] = deque()  # serve: waiters past max_wait, in arrival order
         self._held = 0  # waiters that ever entered the hold queue
         self._fresh: set[int] = set()  # waiters still within max_wait
+        self._expires: dict[int, float] = {}  # holder -> clock time its SLO is lost
+        self._idle_ttft: dict[int, float] = {}  # Canary: TTFT of one request when idle
         self._waiters = itertools.count(1)
         self.arrivals: deque[float] = deque(maxlen=100_000)  # offered requests (times)
         self.arrival_keep_s = 600.0  # >= every window asked of `offered` (Controller sets it)
@@ -265,6 +271,9 @@ class CanaTuneRouter:
         self._applied_key = key
         evidence = None if table is None else table.evidence
         self._costs = self._cost_book(evidence)
+        self._idle_ttft = {
+            int(k): float(v) for k, v in ((evidence or {}).get("idle_ttft_ms") or {}).items()
+        }
         admission = (evidence or {}).get("admission")
         if admission:
             self.predictor.set_prior(admission["predictor_coef"])
@@ -276,6 +285,13 @@ class CanaTuneRouter:
         """S(L) at P clock `mhz` (None: the highest measured)."""
         self._apply_table()
         return self._costs.for_clock(mhz)
+
+    def deadline_ms(self, tokens: int) -> float:
+        """Longest wait after which the SLO can still be met: TTFT SLO minus the
+        Canary's idle TTFT at this length (the SLO itself before that is measured)."""
+        self._apply_table()
+        idle = interpolate(self._idle_ttft, tokens) or 0.0
+        return max(0.0, self.settings.ttft_slo_ms - idle)
 
     def backfill_slack_ms(self) -> float:
         """Spare-capacity margin for backfilling doomed requests: configured, or the
@@ -507,18 +523,29 @@ class CanaTuneRouter:
         s = self.settings
         serve = s.overload == "serve" and not self.open_admission
         past_wait = waited_ms + s.retry_period_ms > s.max_wait_ms
+        now = self._clock()
         if serve and past_wait and waiter not in self._holding:
             self._holding.append(waiter)
+            self._expires[waiter] = now + (self.deadline_ms(tokens) - waited_ms) / 1000.0
             self._held += 1
             self._fresh.discard(waiter)
         elif not past_wait:
             self._fresh.add(waiter)
         # Priority: requests that can still meet the SLO first. Any holder may be
-        # rescued; a doomed one backfills only as the oldest holder and only while
-        # no fresh request is waiting for the same capacity (head-of-line blocking
-        # behind doomed requests halved the goodput under overload in the sim).
+        # rescued. A doomed one is served best effort only once its deadline has
+        # passed, as the oldest such holder, and only while no fresh request and no
+        # holder within its deadline waits for the same capacity (head-of-line
+        # blocking behind doomed requests halved the goodput under overload in the
+        # sim). doomed: dispatch keeps the oldest holder dispatching at once.
         holder = serve and past_wait
-        head = holder and self._holding[0] == waiter and not self._fresh
+        if not holder or self._fresh:
+            head = False
+        elif s.doomed == "dispatch":
+            head = self._holding[0] == waiter
+        else:
+            expired = [w for w in self._holding if self._expires[w] <= now]
+            live = len(expired) < len(self._holding)
+            head = bool(expired) and expired[0] == waiter and not live
         ticket = self.try_admit(tokens, exact, waited_ms, rescue=holder, backfill=head)
         if ticket is not None:
             self._release(waiter)
@@ -532,6 +559,7 @@ class CanaTuneRouter:
 
     def _release(self, waiter: int) -> None:
         self._fresh.discard(waiter)
+        self._expires.pop(waiter, None)
         try:
             self._holding.remove(waiter)
         except ValueError:
@@ -676,5 +704,6 @@ class CanaTuneRouter:
             "backfill_slack_ms": self.backfill_slack_ms(),
             "overflows": dict(self.overflows),
             "holding": len(self._holding),
+            "holding_expired": sum(1 for w in self._holding if self._expires[w] <= self._clock()),
             "groups": [g.snapshot() for g in self.groups],
         }
