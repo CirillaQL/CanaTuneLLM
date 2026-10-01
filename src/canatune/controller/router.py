@@ -4,9 +4,14 @@ Cold start (no tier table published): every request is admitted and spread to
 the least-loaded active group; all production groups run at MAX meanwhile.
 
 With a published table, for each routable group the Router checks
-* the online risk table at the group's effective clock point (risk <= theta),
-* the D-side KV wall: D concurrency below B* and KV usage below the limit the
-  Canary measured,
+* hard limits: D concurrency below B*, D KV usage below the Canary's limit, and
+  (admission `slack`) the KV bytes in flight to its D below a fraction of the
+  connector's receive buffer (r7: the capacity cliff and the D crashes came from
+  that buffer overflowing),
+* the SLO risk: `slack` predicts the request's TTFT from the group's state (own
+  prefill cost, pending P work, KV in flight, requests decoding) and looks up the
+  violation risk of that predicted slack; `cells` (v1) looks up the risk table
+  cell (clock point, queue, prompt bucket, D busy),
 and admits to the most loaded feasible group (concentration keeps batches large).
 Otherwise it waits briefly within the TTFT budget, then rejects (HTTP 503).
 Reservations are taken synchronously inside the event loop, so two requests can
@@ -16,12 +21,19 @@ never both see the same free slot.
 import asyncio
 import itertools
 import math
+import os
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from canatune.domain.admission import (
+    PrefillCost,
+    SlackRisk,
+    TtftPredictor,
+    kv_bytes_from_model_dir,
+)
 from canatune.domain.groups import Group, TierState
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import Cell, RiskEstimate, RiskTable, is_violation
@@ -51,6 +63,10 @@ class RouterSettings:
     d_busy_min_running: int
     load_window_s: float
     chars_per_token: float
+    admission: str = "slack"  # slack (state-based) or cells (v1 risk table)
+    kv_bytes_per_token: float = 131072.0
+    kv_buffer_bytes: float = 1e9  # the KV connector's receive buffer on D
+    kv_inflight_fraction: float = 0.5  # r6b/r7: > 0.5 buffer in flight -> 58-67 % violated
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "RouterSettings":
@@ -70,7 +86,31 @@ class RouterSettings:
             d_busy_min_running=int(raw.get("d_busy_min_running", 1)),
             load_window_s=float(controller.get("load_window_s", 10.0)),
             chars_per_token=_positive(raw, "chars_per_token", 4.0),
+            admission=_admission(raw),
+            kv_bytes_per_token=float(kv_bytes_setting(config)),
+            kv_buffer_bytes=float(config.get("kv_transfer", {}).get("kv_buffer_bytes", 1e9)),
+            kv_inflight_fraction=_positive(raw, "kv_inflight_fraction", 0.5),
         )
+
+
+def _admission(raw: Mapping[str, Any]) -> str:
+    value = raw.get("admission", "slack")
+    if value not in ("slack", "cells"):
+        raise RouterConfigError("router.admission must be slack or cells")
+    return value
+
+
+def kv_bytes_setting(config: Mapping[str, Any]) -> float:
+    """kv_transfer.kv_bytes_per_token, else from the model's config.json
+    (MODEL_PATH / CANATUNE_MODEL_PATH), else Mistral-7B bf16."""
+    value = config.get("kv_transfer", {}).get("kv_bytes_per_token")
+    if value:
+        return float(value)
+    for env in ("CANATUNE_MODEL_PATH", "MODEL_PATH"):
+        found = kv_bytes_from_model_dir(os.environ.get(env))
+        if found:
+            return float(found)
+    return 131072.0
 
 
 def prompt_tokens(body: Mapping[str, Any], chars_per_token: float) -> tuple[int, bool]:
@@ -102,6 +142,10 @@ class Ticket:
     snapshot: dict[str, Any] = field(default_factory=dict)
     first_token_at: float | None = None
     finished: bool = False
+    stage: str = "prefill"  # prefill -> transfer (P returned) -> decode (first token)
+    s_own_ms: float = 0.0
+    features: tuple[float, ...] = ()
+    predicted_ms: float | None = None
 
 
 class CanaTuneRouter:
@@ -117,6 +161,8 @@ class CanaTuneRouter:
         log: JsonlLog | None = None,
         clock: Callable[[], float] = time.monotonic,
         clock_epochs: Mapping[str, int] | None = None,
+        predictor: TtftPredictor | None = None,
+        slack: SlackRisk | None = None,
     ) -> None:
         self.groups = list(groups)
         self.table = table
@@ -132,11 +178,39 @@ class CanaTuneRouter:
         self.admitted = 0
         # SLO outcomes of risk-admitted production requests (drift detection).
         self.outcomes: deque[bool] = deque(maxlen=500)
+        self.predictor = predictor or TtftPredictor()
+        self.slack = slack or SlackRisk(min_samples=table.min_samples)
+        self._cost_key: object = None
+        self._cost = PrefillCost()
+        self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
 
     @property
     def open_admission(self) -> bool:
         """Cold start: no tier table yet, admit everything."""
         return self.tiers.table is None
+
+    def prefill_cost(self) -> PrefillCost:
+        """S(L) from the Canary's single-request length table in the published tier
+        table (evidence.alpha_fit.prefill_ms_by_length); a generic curve before."""
+        table = self.tiers.table
+        key = None if table is None else table.published_at
+        if key != self._cost_key:
+            lut = None
+            if table is not None:
+                lut = (table.evidence.get("alpha_fit") or {}).get("prefill_ms_by_length")
+            self._cost = PrefillCost({int(k): float(v) for k, v in (lut or {}).items()})
+            self._cost_key = key
+        return self._cost
+
+    def _predict(self, group: Group, s_own_ms: float) -> tuple[tuple[float, ...], float]:
+        x = self.predictor.features(
+            s_own_ms, group.pending_ms, group.inflight_bytes, group.n_decoding
+        )
+        return x, self.predictor.predict(x)
+
+    def _kv_blocked(self, group: Group) -> bool:
+        s = self.settings
+        return group.inflight_bytes >= s.kv_inflight_fraction * s.kv_buffer_bytes
 
     # ---- state ---------------------------------------------------------------------
 
@@ -164,22 +238,37 @@ class CanaTuneRouter:
         return busy, None
 
     def candidates(self, tokens: int) -> list[tuple[Group, Cell, RiskEstimate | None, bool]]:
-        """Groups that may take this request now, with their risk cell."""
+        """Groups that may take this request now, with their risk cell (the slack
+        estimate, when that decided, is kept in self._slack_by_group)."""
         out = []
+        self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
+        s_own = self.prefill_cost()(tokens)
         for group in self.groups:
             if not group.routable:
                 continue
             assert group.effective is not None
+            x, predicted = self._predict(group, s_own)
             if self.open_admission:
                 d_busy = group.n_inflight > group.n_await
                 cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
+                self._slack_by_group[group.name] = (x, predicted, None)
                 out.append((group, cell, None, d_busy))
                 continue
             d_busy, blocked = self._decode_state(group)
             if blocked is not None:
                 continue
             cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
+            if self.settings.admission == "slack":
+                if self._kv_blocked(group):
+                    continue
+                slack = self.slack.estimate(self.settings.ttft_slo_ms - predicted)
+                self._slack_by_group[group.name] = (x, predicted, slack)
+                if slack.risk <= self.settings.theta:
+                    estimate = RiskEstimate(slack.risk, f"slack_{slack.source}", slack.samples)
+                    out.append((group, cell, estimate, d_busy))
+                continue
             estimate = self.table.lookup(group.effective, group.n_await, tokens, d_busy)
+            self._slack_by_group[group.name] = (x, predicted, None)
             if estimate.risk <= self.settings.theta:
                 out.append((group, cell, estimate, d_busy))
         return out
@@ -204,6 +293,8 @@ class CanaTuneRouter:
                 ),
             )
         now = self._clock()
+        x, predicted, _ = self._slack_by_group.get(group.name, ((), None, None))
+        s_own = self.prefill_cost()(tokens)
         ticket = Ticket(
             id=next(self._ids),
             group=group,
@@ -222,8 +313,17 @@ class CanaTuneRouter:
                 "tier": group.tier.value,
                 "clock": None if group.effective is None else group.effective.key(),
                 "open_admission": self.open_admission,
+                "pending_ms": round(group.pending_ms, 1),
+                "inflight_mb": round(group.inflight_bytes / 1e6, 1),
+                "n_decoding": group.n_decoding,
+                "predicted_ms": None if predicted is None else round(predicted, 1),
             },
+            s_own_ms=s_own,
+            features=tuple(x),
+            predicted_ms=predicted,
         )
+        group.n_at_p += 1
+        group.pending_ms += s_own
         group.n_await += 1
         group.t_await += tokens
         group.n_inflight += 1
@@ -250,12 +350,36 @@ class CanaTuneRouter:
 
     # ---- request lifecycle -----------------------------------------------------------
 
+    def _kv_bytes(self, ticket: Ticket) -> float:
+        return ticket.prompt_tokens * self.settings.kv_bytes_per_token
+
+    def _leave_stage(self, ticket: Ticket) -> None:
+        group = ticket.group
+        if ticket.stage == "prefill":
+            group.n_at_p -= 1
+            group.pending_ms = max(0.0, group.pending_ms - ticket.s_own_ms)
+        elif ticket.stage == "transfer":
+            group.inflight_bytes = max(0.0, group.inflight_bytes - self._kv_bytes(ticket))
+        elif ticket.stage == "decode":
+            group.n_decoding -= 1
+
+    def prefill_done(self, ticket: Ticket) -> None:
+        """P returned: its KV now travels to (or waits in the buffer of) the D."""
+        if ticket.finished or ticket.stage != "prefill":
+            return
+        self._leave_stage(ticket)
+        ticket.stage = "transfer"
+        ticket.group.inflight_bytes += self._kv_bytes(ticket)
+
     def first_token(self, ticket: Ticket) -> None:
         if ticket.first_token_at is not None or ticket.finished:
             return
         ticket.first_token_at = self._clock()
         ticket.group.n_await -= 1
         ticket.group.t_await -= ticket.prompt_tokens
+        self._leave_stage(ticket)
+        ticket.stage = "decode"
+        ticket.group.n_decoding += 1
 
     def finish(
         self,
@@ -272,6 +396,8 @@ class CanaTuneRouter:
         if ticket.first_token_at is None:
             ticket.group.n_await -= 1
             ticket.group.t_await -= ticket.prompt_tokens
+        self._leave_stage(ticket)
+        ticket.stage = "done"
         ticket.group.n_inflight -= 1
         ticket.finished = True
 
@@ -296,6 +422,10 @@ class CanaTuneRouter:
             self.table.record(ticket.cell, bool(violated))
             if ticket.estimate is not None:
                 self.outcomes.append(bool(violated))
+            if ticket.features and ticket.predicted_ms is not None and ttft_ms is not None:
+                # Slack as predicted at admission (the model in force then), then refit.
+                self.slack.record(self.settings.ttft_slo_ms - ticket.predicted_ms, bool(violated))
+                self.predictor.record(ticket.features, ttft_ms)
         if status == "ok" and self.lengths is not None:
             self.lengths.record(ticket.prompt_tokens, output_tokens)
         self.log.write(
@@ -318,12 +448,16 @@ class CanaTuneRouter:
                 "output_tokens": output_tokens,
                 "violated": violated,
                 "table_skip": skip,
+                "predicted_ms": ticket.predicted_ms,
                 "timing": None if timing is None else dict(timing),
             }
         )
 
     def state(self) -> dict[str, Any]:
         return {
+            "admission": self.settings.admission,
+            "predictor": self.predictor.state(),
+            "slack": self.slack.to_json(),
             "open_admission": self.open_admission,
             "admitted": self.admitted,
             "rejections": self.rejections,

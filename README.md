@@ -106,6 +106,33 @@ R(clock point, N_await bucket, L_in bucket, D busy)
 - The table starts empty on a new cluster. The Canary's last step fills the H
   cells before production switches to H.
 
+### State-based admission (`router.admission: slack`, default)
+
+Measured in r6b/r7: the capacity cliff came from the KV connector's receive buffer
+on D overflowing (P then retries its sends and stalls; on L4 the fallback GPU
+allocation crashed D), and a request's TTFT depends on the work ahead of it, not on
+a queue count. Per group the Router tracks, from the proxy's stage events
+(P sent → P returned → first token → done):
+
+```text
+pending P work   = sum S(L) of requests at P      S(L): Canary length table (plateau + slope)
+KV in flight     = sum L x KV bytes/token of requests between P return and first token
+decoding         = requests past their first token
+predicted TTFT   = linear model over (S(L_own), pending, KV in flight, decoding),
+                   refitted online on clean samples (ridge towards the r6b/r7 fit)
+slack            = TTFT SLO - predicted TTFT  ->  risk of that slack bucket (Wilson UCB)
+```
+
+Hard limits: KV in flight to the group's D <= `kv_inflight_fraction` (0.5) x
+`kv_transfer.kv_buffer_bytes` (r6b/r7: above half the buffer 58-67 % of requests
+violated), plus the D concurrency and KV usage limits. Then slack risk <= theta.
+Sparse slack buckets with >= 200 ms of predicted slack are admitted to learn;
+below that they pool with lower-slack buckets. Offline replay (train on one run,
+test on the other, `scripts/analysis/admission_replay.py`): more requests admitted
+and fewer wrongly rejected than the v1 cells, violations below theta in both
+directions. Text prompts are tokenized with the model's tokenizer (`MODEL_PATH`)
+when available. `router.admission: cells` keeps the v1 table below.
+
 ### Router (per request; never changes clocks)
 
 ```text
@@ -113,7 +140,8 @@ cold start (no table):  admit; send to the least-loaded active group
 with a table:
   for each active group g:
       D check:  D running+waiting (or g's in-flight) + 1 <= B*, and KV usage <= kv_limit
-      risk:     R(effective clock of g, N_await(g), L_in, D busy(g)) <= theta (10 %)
+      slack:    KV in flight(g) <= 0.5 x buffer and risk(slack of predicted TTFT) <= theta
+      cells:    R(effective clock of g, N_await(g), L_in, D busy(g)) <= theta (10 %)
   admit to the MOST loaded feasible group        # concentrate for batching
   none: retry within max_wait_ms, then reject 503 (X-CanaTune-Rejected: 1)
 ```
@@ -194,8 +222,7 @@ in turn, no admission, no clock control) or `cantune`.
 **Not in v1:** cross-pair P→D routing, several Routers, relaxed SLO for long
 prompts, per-iteration clock changes, D frequency steps (detected and reported as
 `decode_wall: false`, but D stays single-clock), shadow requests, a passive
-energy table for drift detection, a tokenizer for text prompts (their length is
-estimated and they never enter the risk table).
+energy table for drift detection.
 
 **Outputs.** With `CANATUNE_RECORD_DIR` set:
 

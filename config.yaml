@@ -71,6 +71,8 @@ kv_transfer:
   prefill_send_type: PUT_ASYNC  # K1b: TTFT 25-38 % lower than PUT
   disable_prefix_cache: true
   disable_chunked_prefill: true
+  kv_buffer_bytes: 1.0e9      # P2pNccl kv_buffer_size on D (vLLM default 1e9)
+  kv_bytes_per_token: null    # null: from the model's config.json (Mistral-7B bf16: 131072)
 
 proxy:
   enabled: true
@@ -97,7 +99,13 @@ router:
   retry_period_ms: 20
   snapshot_max_age_s: 1.0     # older /metrics snapshots count as unknown (unsafe)
   d_busy_min_running: 1       # D counts as busy with >= this many running sequences
-  chars_per_token: 4          # estimate for text prompts; such samples skip the table
+  chars_per_token: 4          # estimate for text prompts without a tokenizer (skip the tables)
+  tokenizer: null             # model dir for exact prompt lengths; default MODEL_PATH
+  # slack: predict TTFT from the group's state (own prefill cost, pending P work, KV
+  # in flight, requests decoding) and admit when the predicted-slack bucket's risk
+  # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy).
+  admission: slack
+  kv_inflight_fraction: 0.5   # KV in flight to a D <= 0.5 x kv_transfer.kv_buffer_bytes
 
 telemetry:
   enabled: true

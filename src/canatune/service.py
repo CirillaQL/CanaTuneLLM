@@ -13,6 +13,7 @@ from canatune.controller.locator import LocatorSettings, ProbeBackend, TierLocat
 from canatune.controller.probe import CanaryProbe, ProbeSettings
 from canatune.controller.router import CanaTuneRouter, RouterSettings
 from canatune.controller.tier_controller import ControllerSettings, TierController
+from canatune.domain.admission import SlackRisk
 from canatune.domain.groups import (
     ClockPoint,
     Group,
@@ -86,6 +87,7 @@ class Runtime:
         self.stop.set()
         await asyncio.gather(*self.tasks, return_exceptions=True)
         self.router.table.save()
+        self.router.slack.save()
 
 
 def identity(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -176,6 +178,11 @@ def build_runtime(
 
     groups = build_groups(config)
     router_settings = RouterSettings.from_config(config)
+    slack = SlackRisk(
+        min_samples=int(risk_raw.get("min_samples", 20)),
+        path=None if not risk_raw.get("path") else f"{risk_raw['path']}.slack.json",
+    )
+    slack.load()
     router = CanaTuneRouter(
         groups,
         table,
@@ -184,6 +191,7 @@ def build_runtime(
         lengths=lengths,
         telemetry=telemetry,
         log=requests_log,
+        slack=slack,
     )
 
     clock_control = dict(config.get("clock_control", {}))

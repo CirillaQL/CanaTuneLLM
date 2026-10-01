@@ -191,6 +191,25 @@ class StreamTimer:
         return (times[-1] - times[0]) * 1000.0 / (len(times) - 1)
 
 
+def load_tokenizer(config: Mapping[str, Any]) -> Any:
+    """HF tokenizer of the served model (router.tokenizer, CANATUNE_TOKENIZER or
+    MODEL_PATH); None when unavailable: text prompts are then estimated and never
+    enter the risk tables."""
+    path = (
+        os.environ.get("CANATUNE_TOKENIZER")
+        or config.get("router", {}).get("tokenizer")
+        or os.environ.get("MODEL_PATH")
+    )
+    if not path:
+        return None
+    try:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(path)
+    except Exception:
+        return None
+
+
 def stage_ms(arrived: float, stamps: Mapping[str, float]) -> dict[str, float | None]:
     """TTFT breakdown in ms: admission (Router wait), P round trip (proxy -> P -> proxy,
     P queue + prefill + P front end), proxy gap before the decode call, and decode
@@ -243,6 +262,16 @@ def create_proxy_router(
         else os.path.join(record_dir, "requests.jsonl")
     )
     chars_per_token = float(config.get("router", {}).get("chars_per_token", 4.0))
+    tokenizer = load_tokenizer(config)
+
+    def count_tokens(body: Mapping[str, Any]) -> tuple[int, bool]:
+        """Exact prompt length: token ids as given, text through the model's tokenizer
+        (special tokens included, as vLLM counts them); estimated without one."""
+        prompt = body.get("prompt")
+        if tokenizer is not None and isinstance(prompt, str):
+            return max(1, len(tokenizer(prompt).input_ids)), True
+        return prompt_tokens(body, chars_per_token)
+
     router = APIRouter()
 
     @router.get("/health")
@@ -273,7 +302,7 @@ def create_proxy_router(
         if not isinstance(body.get("stream", False), bool):
             return JSONResponse({"error": "stream must be a boolean"}, status_code=400)
         try:
-            tokens, exact = prompt_tokens(body, chars_per_token)
+            tokens, exact = count_tokens(body)
         except ValueError as error:
             if runtime is not None:
                 return JSONResponse({"error": str(error)}, status_code=400)
@@ -357,6 +386,8 @@ def create_proxy_router(
                     prefill.completions_url, json=prefill_body, headers=headers
                 )
                 stamps["prefill_done"] = time.monotonic()
+            if prefill_response.status_code == 200 and ticket is not None:
+                runtime.router.prefill_done(ticket)
             if prefill_response.status_code != 200:
                 finish("prefill_error", None)
                 return JSONResponse(

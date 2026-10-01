@@ -211,6 +211,11 @@ class Group:
     n_await: int = 0
     t_await: int = 0
     n_inflight: int = 0
+    # Stage state for state-based admission (P -> KV transfer -> decode):
+    n_at_p: int = 0  # sent to P, P not returned yet
+    pending_ms: float = 0.0  # sum of their single-request prefill cost S(L)
+    inflight_bytes: float = 0.0  # KV of requests between P return and first token
+    n_decoding: int = 0  # first token out, not finished
     admissions: deque[tuple[float, int]] = field(default_factory=deque)
 
     @property
@@ -245,4 +250,8 @@ class Group:
             "n_await": self.n_await,
             "t_await": self.t_await,
             "n_inflight": self.n_inflight,
+            "n_at_p": self.n_at_p,
+            "pending_ms": round(self.pending_ms, 1),
+            "inflight_mb": round(self.inflight_bytes / 1e6, 1),
+            "n_decoding": self.n_decoding,
         }

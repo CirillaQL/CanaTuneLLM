@@ -42,9 +42,10 @@ def published(**kwargs) -> TierTable:
     return TierTable(**values)
 
 
-def setup(table=None, telemetry=None, store=None):
+def setup(table=None, telemetry=None, store=None, admission="cells"):
     config = load_config()
     config["controller"]["stagger_s"] = 0.0
+    config["router"]["admission"] = admission
     clock = FakeClock()
     risk = RiskTable.from_config(config["risk"], identity(config))
     groups = build_groups(config)
@@ -346,3 +347,97 @@ def test_length_shift_ignores_median_flips_of_a_discrete_mix() -> None:
     for _ in range(400):
         live.record(2048, 256)
     assert live.summary().shifted(reference.summary(), 0.30)
+
+
+# ---- state-based (slack) admission -------------------------------------------------
+
+
+def test_stage_accounting_follows_a_request_through_p_transfer_and_decode() -> None:
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack")
+    activate(groups)
+    t = router.try_admit(1024, True)
+    g = t.group
+    assert (g.n_at_p, g.n_decoding, g.inflight_bytes) == (1, 0, 0)
+    assert g.pending_ms == pytest.approx(t.s_own_ms) and t.s_own_ms > 0
+    router.prefill_done(t)
+    assert (g.n_at_p, g.pending_ms) == (0, 0) and g.inflight_bytes == 1024 * 131072
+    router.first_token(t)
+    assert g.inflight_bytes == 0 and g.n_decoding == 1
+    router.finish(t, status="ok", ttft_ms=300, tpot_ms=60, output_tokens=8)
+    assert (g.n_at_p, g.n_decoding, g.inflight_bytes, g.n_inflight) == (0, 0, 0, 0)
+    # a failure in the transfer stage releases the in-flight bytes too
+    t2 = router.try_admit(512, True)
+    router.prefill_done(t2)
+    router.finish(t2, status="decode_error", ttft_ms=None, tpot_ms=None, output_tokens=0)
+    assert t2.group.inflight_bytes == 0
+
+
+def test_cold_slack_admits_with_margin_then_learns() -> None:
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack")
+    activate(groups)
+    t = router.try_admit(128, True)  # prior model: ~160 ms predicted, slack ~840 ms
+    assert t is not None and t.estimate.source == "slack_cold"
+    router.first_token(t)
+    router.finish(t, status="ok", ttft_ms=1500, tpot_ms=60, output_tokens=8)
+    # requests in that slack bucket keep violating: once it has min_samples, it closes
+    refused_after = None
+    for i in range(40):
+        tk = router.try_admit(128, True)
+        if tk is None:
+            refused_after = i
+            break
+        router.first_token(tk)
+        router.finish(tk, status="ok", ttft_ms=1500, tpot_ms=60, output_tokens=8)
+    assert refused_after is not None and refused_after <= 25
+
+
+def test_kv_in_flight_gate_blocks_the_group_until_its_d_takes_the_kv() -> None:
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack")
+    activate(groups)
+    for g in groups:
+        g.inflight_bytes = 0.6e9  # > 0.5 x 1 GB buffer
+    assert router.try_admit(128, True) is None
+    groups[1].inflight_bytes = 0.1e9
+    t = router.try_admit(128, True)
+    assert t is not None and t.group is groups[1]
+
+
+def test_predictor_refits_towards_observed_ttft() -> None:
+    from canatune.domain.admission import TtftPredictor
+
+    p = TtftPredictor(refit_every=10, ridge=0.01)
+    for pending in range(0, 500, 5):
+        x = p.features(50, pending, 0, 0)
+        p.record(x, 200 + 2.0 * pending)  # true pending weight 2.0 (prior 0.6)
+    assert p.coef[2] == pytest.approx(2.0, rel=0.1)
+    assert p.predict(p.features(50, 300, 0, 0)) == pytest.approx(800, rel=0.1)
+
+
+def test_slack_risk_pools_sparse_buckets_with_riskier_ones(tmp_path) -> None:
+    from canatune.domain.admission import SlackRisk
+
+    s = SlackRisk(min_samples=20, cold_margin_ms=200, path=tmp_path / "s.json")
+    for _ in range(30):
+        s.record(50, True)  # little slack: violated
+    for _ in range(5):
+        s.record(150, False)  # sparse, little slack: pooled with the risky buckets below
+    assert s.estimate(150).source == "pooled" and s.estimate(150).risk > 0.1
+    # sparse with enough slack: admitted to learn (never pooled shut)
+    assert s.estimate(450).source == "cold" and s.estimate(450).risk == 0.0
+    assert s.estimate(-1000).risk == 1.0
+    s.save()
+    t = SlackRisk(min_samples=20, path=tmp_path / "s.json")
+    t.load()
+    assert t.to_json() == s.to_json()
+
+
+def test_kv_bytes_per_token_from_model_config() -> None:
+    from canatune.domain.admission import kv_bytes_per_token
+
+    mistral = {
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "hidden_size": 4096,
+    }
+    assert kv_bytes_per_token(mistral) == 131072

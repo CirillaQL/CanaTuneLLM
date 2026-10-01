@@ -127,11 +127,12 @@ def test_stream_requires_real_decode_sse() -> None:
     asyncio.run(run())
 
 
-def make_cantune(handler):
+def make_cantune(handler, admission="cells"):
     from canatune.service import build_runtime
 
     config = load_config()
     config["routing"]["policy"] = "cantune"
+    config["router"]["admission"] = admission
     config["telemetry"]["enabled"] = False
     config["topology"]["prefill_nodegroup"]["node"] = "127.0.0.1"
     config["topology"]["decode_nodegroup"]["node"] = "127.0.0.2"
@@ -226,6 +227,57 @@ def test_cantune_cold_start_admits_all_then_risk_admission() -> None:
         await asyncio.gather(*runtime.tasks, return_exceptions=True)
 
     asyncio.run(run())
+
+
+def test_cantune_slack_admission_tracks_stages_through_the_proxy() -> None:
+    from canatune.domain.groups import ClockPoint, TierTable
+
+    tokens = b'data: {"choices":[{"text":"t"}]}\n\n' * 3 + b"data: [DONE]\n\n"
+    seen = {}
+
+    class SSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            # The decode call starts after P returned: the KV is in flight now.
+            group = runtime_ref["rt"].router.groups[1]
+            seen["inflight"] = group.inflight_bytes
+            seen["at_p"] = group.n_at_p
+            yield tokens
+
+    def handler(request):
+        if request.url.port < 8200:
+            return httpx.Response(200, json={"choices": []})
+        return httpx.Response(
+            200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
+        )
+
+    runtime_ref = {}
+
+    async def run():
+        client, runtime = make_cantune(handler, admission="slack")
+        runtime_ref["rt"] = runtime
+        table = TierTable(ClockPoint(900, 450), ClockPoint(1815, 1050), 3000.0, 460.0)
+        table.evidence = {"alpha_fit": {"prefill_ms_by_length": {"128": 40, "2048": 150}}}
+        runtime.controller.tiers.table = table
+        await runtime.start()
+        runtime.stop.set()
+        async with client:
+            response = await client.post(
+                "/v1/completions",
+                json={"model": "m", "prompt": [5] * 1000, "max_tokens": 3, "stream": True},
+            )
+            assert response.status_code == 200
+            record = runtime.router.log.recent[-1]
+            assert record["status"] == "ok" and record["predicted_ms"] is not None
+            assert record["timing"]["prefill_ms"] is not None
+            state = (await client.get("/canatune/state")).json()["router"]
+            assert state["admission"] == "slack"
+            g1 = next(g for g in state["groups"] if g["name"] == "G1")
+            assert (g1["n_at_p"], g1["inflight_mb"], g1["n_decoding"]) == (0, 0, 0)
+        await asyncio.gather(*runtime.tasks, return_exceptions=True)
+
+    asyncio.run(run())
+    assert seen == {"inflight": 1000 * 131072, "at_p": 0}
+    assert runtime_ref["rt"].router.predictor.state()["samples"] == 1
 
 
 def test_cantune_lifespan_starts_and_stops_control_loops(tmp_path, monkeypatch) -> None:
