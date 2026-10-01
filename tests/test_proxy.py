@@ -127,12 +127,13 @@ def test_stream_requires_real_decode_sse() -> None:
     asyncio.run(run())
 
 
-def make_cantune(handler, admission="cells"):
+def make_cantune(handler, admission="cells", overload="reject"):
     from canatune.service import build_runtime
 
     config = load_config()
     config["routing"]["policy"] = "cantune"
     config["router"]["admission"] = admission
+    config["router"]["overload"] = overload
     config["telemetry"]["enabled"] = False
     config["topology"]["prefill_nodegroup"]["node"] = "127.0.0.1"
     config["topology"]["decode_nodegroup"]["node"] = "127.0.0.2"

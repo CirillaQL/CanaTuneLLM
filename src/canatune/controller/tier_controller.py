@@ -4,12 +4,13 @@ Cold start (no tier table): every production group is active at MAX and the
 Router admits everything; the Controller neither consolidates nor switches.
 Once the Canary publishes a table, production groups move to H one at a time,
 and from then on the Controller
-* wakes a parked group when the Router rejected requests or the mean active
-  load exceeds `wake_load_fraction * C_H`; if nothing is parked it asks the
-  Canary to abort its experiment; if the Canary is not experimenting either, it
-  raises the most loaded working group to MAX (pressure order: wake -> abort
-  Canary -> MAX -> reject), so C_H never caps what MAX could serve; groups go
-  back to H once the mean load stays below `park_load_fraction * C_H` for
+* wakes a parked group when the Router rejected, held or overflowed requests
+  (`router.pressure`) or the mean active load exceeds `wake_load_fraction *
+  C_H`; if nothing is parked it asks the Canary to abort its experiment; if
+  the Canary is not experimenting either, it raises the most loaded working
+  group to MAX (pressure order: wake -> abort Canary -> MAX -> reject), so C_H
+  never caps what MAX could serve; groups go back to H once the mean load stays
+  below `park_load_fraction * C_H` for
   `t_down_s`,
 * switches L/H per group when the Canary published an L tier,
 * drains and parks the least-loaded group when the rest could carry the total
@@ -203,8 +204,9 @@ class TierController:
         if table is None:
             return  # cold start: everything at MAX, nothing to decide
         s = self.settings
-        new_rejections = self.router.rejections - self._rejections_seen
-        self._rejections_seen = self.router.rejections
+        # Rejections, or (overload: serve) overflows beyond the risk bound.
+        new_rejections = self.router.pressure - self._rejections_seen
+        self._rejections_seen = self.router.pressure
         loads = self.loads(now)
         active = [g for g in self.groups if g.state is GroupState.ACTIVE]
         capacity = table.capacity_h

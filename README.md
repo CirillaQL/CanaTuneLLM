@@ -133,6 +133,40 @@ and fewer wrongly rejected than the v1 cells, violations below theta in both
 directions. Text prompts are tokenized with the model's tokenizer (`MODEL_PATH`)
 when available. `router.admission: cells` keeps the v1 table below.
 
+### Overload: serve instead of reject (`router.overload: serve`, default)
+
+In production a request at risk is served on the best group rather than refused.
+After `max_wait_ms` without a group within the risk bound (the slack counts the
+time already waited at the proxy; the predictor learns the part after dispatch):
+
+```text
+rescue    best group (lowest predicted TTFT, within the hard limits) still meets
+          the SLO                          -> dispatch there now (any waiter)
+doomed    SLO lost on every group          -> hold, first come first served, and
+          backfill: dispatch only where a fresh request would keep
+          backfill_slack_ms (400) of slack and no fresh request is waiting;
+          503 after hold_max_ms (30 s)
+hard      KV in flight / D walls           -> never overridden (buffer overflow
+          stalls the group and crashed D in r7): hold
+```
+
+Rescues, backfills and holds count as pressure (wake → abort Canary → MAX), like
+rejections did. Doomed requests are not dispatched at once (`doomed: dispatch`):
+under sustained overload a late request takes capacity from an on-time one.
+Simulation calibrated on r6b/r7 (`scripts/analysis/overload_sim.py`, smoke-2
+profile, two pairs, 5 seeds; overload phase at C_H = 6 req/s, past MAX capacity):
+
+| policy | goodput | served | rejected |
+|---|---|---|---|
+| default system (round robin, MAX) | 11 % | 100 % | 0 |
+| CanaTune, reject | 81 % | 81 % | 226 |
+| CanaTune, serve, doomed dispatched | 69 % | 92 % | 94 |
+| CanaTune, serve, doomed backfilled | 79 % | 86 % | 165 |
+
+At C_H = 4-5 (overload within MAX capacity) serve matches reject's goodput and
+rejects fewer. What cannot be served within `hold_max_ms` under sustained
+overload is still refused: serving it would only make every request late.
+
 ### Router (per request; never changes clocks)
 
 ```text

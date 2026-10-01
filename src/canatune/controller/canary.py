@@ -74,7 +74,7 @@ class CanaryScheduler:
         self.last_end: float | None = None
         self.explore_s = 0.0
         self._started_at: float | None = None
-        self._rejections_seen = controller.router.rejections
+        self._rejections_seen = controller.router.pressure
         self._last_rejection_at = float("-inf")
         self._reference: LengthSummary | None = None
         self._draining_since: float | None = None
@@ -93,7 +93,7 @@ class CanaryScheduler:
     # ---- conditions -----------------------------------------------------------------
 
     def _note_rejections(self) -> None:
-        rejections = self.controller.router.rejections
+        rejections = self.controller.router.pressure  # rejections + overflows
         if rejections != self._rejections_seen:
             self._rejections_seen = rejections
             self._last_rejection_at = self._clock()

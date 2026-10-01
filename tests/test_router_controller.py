@@ -1,6 +1,7 @@
 """Router admission and Controller tiering with fake clocks (no GPUs, no vLLM)."""
 
 import asyncio
+import dataclasses
 
 import pytest
 
@@ -42,10 +43,11 @@ def published(**kwargs) -> TierTable:
     return TierTable(**values)
 
 
-def setup(table=None, telemetry=None, store=None, admission="cells"):
+def setup(table=None, telemetry=None, store=None, admission="cells", overload="reject"):
     config = load_config()
     config["controller"]["stagger_s"] = 0.0
     config["router"]["admission"] = admission
+    config["router"]["overload"] = overload
     clock = FakeClock()
     risk = RiskTable.from_config(config["risk"], identity(config))
     groups = build_groups(config)
@@ -169,6 +171,7 @@ def test_decode_kv_limit_from_telemetry() -> None:
 def test_bounded_wait_admits_once_a_slot_frees() -> None:
     _, risk, groups, tiers, _, _, _ = setup(table=published(decode_max_running=1))
     config = load_config()
+    config["router"]["overload"] = "reject"
     router = CanaTuneRouter(groups[1:2], risk, RouterSettings.from_config(config), tiers)
     activate(groups[1:2])
     make_safe(risk, H)
@@ -441,3 +444,79 @@ def test_kv_bytes_per_token_from_model_config() -> None:
         "hidden_size": 4096,
     }
     assert kv_bytes_per_token(mistral) == 131072
+
+
+def test_serve_rescues_to_the_lowest_predicted_group_and_counts_pressure() -> None:
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack", overload="serve")
+    activate(groups)
+    for g in groups:
+        g.pending_ms = 4000.0
+    groups[1].pending_ms = 300.0  # within the SLO, but its slack bucket is risky
+    for _ in range(30):
+        router.slack.record(1000 - 400 - router._predict(groups[1], 33)[1], True)
+    t = router.step(router.new_waiter(), 128, True, 400.0)
+    assert t.group is groups[1] and t.overflow == "rescue"
+    assert t.estimate.source == "overflow_rescue" and router.pressure >= 1
+    assert t.slack_ms == pytest.approx(1000 - 400 - t.predicted_ms)
+    # overflow outcomes stay out of the drift signal; the predictor learns TTFT - wait
+    router.first_token(t)
+    t.wait_ms = 400.0
+    router.finish(t, status="ok", ttft_ms=1500, tpot_ms=60, output_tokens=8)
+    assert len(router.outcomes) == 0
+    assert router.predictor.samples[-1][1] == pytest.approx(1100)
+
+
+def test_serve_doomed_backfills_spare_capacity_or_dispatches_by_setting() -> None:
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack", overload="serve")
+    activate(groups)
+    for g in groups:
+        g.pending_ms = 4000.0  # SLO lost everywhere
+    waiter = router.new_waiter()
+    assert router.step(waiter, 128, True, 1000.0) == "wait"  # no spare capacity: hold
+    groups[2].pending_ms = 0.0  # feasible for a fresh request: backfill it
+    t = router.step(waiter, 128, True, 1100.0)
+    assert t.group is groups[2] and t.overflow == "backfill"
+    assert router.state()["holding"] == 0
+
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack", overload="serve")
+    router = CanaTuneRouter(
+        groups,
+        router.table,
+        dataclasses.replace(router.settings, doomed="dispatch"),
+        router.tiers,
+    )
+    activate(groups)
+    for g in groups:
+        g.pending_ms = 4000.0
+    groups[1].pending_ms = 2500.0
+    t = router.step(router.new_waiter(), 128, True, 1000.0)
+    assert t.group is groups[1] and t.overflow == "doomed"
+
+
+def test_serve_holds_first_come_first_served_while_every_group_is_at_a_hard_limit() -> None:
+    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack", overload="serve")
+    activate(groups)
+    for g in groups:
+        g.inflight_bytes = 0.6e9  # KV gate: a hard limit, never overflowed
+    first, second = router.new_waiter(), router.new_waiter()
+    assert router.step(first, 128, True, 1000.0) == "wait"
+    assert router.step(second, 128, True, 1000.0) == "wait"
+    groups[0].inflight_bytes = 0.0  # free again
+    assert router.step(second, 128, True, 1000.0) == "wait"  # not the oldest holder
+    t = router.step(first, 128, True, 1000.0)
+    assert t.group is groups[0] and t.overflow == "backfill"
+    for g in groups:
+        g.inflight_bytes = 0.6e9
+    late = router.new_waiter()
+    assert router.step(late, 128, True, router.settings.hold_max_ms) == "reject"
+    assert router.rejections == 1 and router.state()["holding"] == 1  # `second` still waits
+
+
+def test_controller_boosts_on_overflow_pressure() -> None:
+    clock, _, groups, _, router, controller, actuator = setup(
+        table=published(), admission="slack", overload="serve"
+    )
+    activate(groups)
+    router.overflows["doomed"] += 3
+    asyncio.run(controller.tick())
+    assert any(g.tier is Tier.MAX for g in groups)
