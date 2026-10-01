@@ -127,7 +127,7 @@ def test_calibration_recovers_the_state_model_and_seeds_slack() -> None:
 
 
 def test_probe_records_the_state_each_request_was_sent_into() -> None:
-    from tests.test_probe import FakeAgent, make_probe
+    from test_probe import FakeAgent, make_probe
 
     probe, _ = make_probe([], FakeAgent())
     probe._at_prefill = {99: 512}
