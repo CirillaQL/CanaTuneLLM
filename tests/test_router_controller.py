@@ -356,6 +356,25 @@ def test_failed_lock_is_retried_and_the_group_is_not_counted_meanwhile() -> None
     assert g.effective is not None and g.name not in controller._retry
 
 
+def test_failed_lock_on_a_cold_start_is_retried_before_any_table() -> None:
+    clock, _, groups, _, router, controller, actuator = setup()
+    real = actuator.lock
+
+    async def down(ref, mhz):
+        raise RuntimeError("agent unreachable")
+
+    actuator.lock = down
+    asyncio.run(controller.start())
+    g = next(x for x in groups if x.state is GroupState.ACTIVE)
+    assert g.effective is None and g.name in controller._retry
+    actuator.lock = real  # the agent is back; still no table
+    for _ in range(6):
+        clock.now += controller.settings.t_down_s
+        asyncio.run(controller.tick())
+    assert controller.tiers.table is None
+    assert g.effective == MAX and g.name not in controller._retry
+
+
 def test_pressure_with_nothing_parked_aborts_canary() -> None:
     clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups[1:])

@@ -258,10 +258,10 @@ class TierController:
     async def tick(self) -> None:
         now = self._clock()
         await self._log_energy(now)
+        await self._retry_locks(now)  # also on a cold start: a group locked to MAX
         table = self.tiers.table
         if table is None:
             return  # cold start: everything at MAX, nothing to decide
-        await self._retry_locks(now)
         new_pressure = self.router.pressure - self._rejections_seen
         self._rejections_seen = self.router.pressure
         active = [g for g in self.groups if g.state is GroupState.ACTIVE]
