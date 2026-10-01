@@ -474,3 +474,22 @@ def test_persistent_contradictions_take_the_lower_clocks_envelope() -> None:
     tables = {1080: {16: 44.0, 2048: 240.0}, 2520: {16: 67.0, 2048: 150.0}}
     assert TierLocator.table_conflicts(tables, 0.02) == {1080, 2520}
     assert not TierLocator.table_conflicts({1080: {16: 44.0}, 2520: {16: 44.5}}, 0.02)
+
+
+def test_relocation_keeps_the_cluster_model() -> None:
+    """A P-only relocation reuses park and D: their evidence comes along, so the
+    published table still carries a model for the solver."""
+    from canatune.domain.models import ClusterModel
+
+    prompts = [128, 1024, 2048]
+    first = asyncio.run(TierLocator(SurrogateBackend(seed=3), settings()).locate(PROMPT, prompts))
+    backend = SurrogateBackend(seed=4)
+    again = asyncio.run(TierLocator(backend, settings()).locate(PROMPT, prompts, previous=first))
+    ev = again.evidence
+    assert ev["idle_power_w"] == first.evidence["idle_power_w"]
+    assert ev["decode"]["reused_from_previous"]
+    assert ev["decode"]["kv_capacity_tokens"] == first.evidence["decode"]["kv_capacity_tokens"]
+    model = ClusterModel.from_json(ev["model"])
+    old = ClusterModel.from_json(first.evidence["model"])
+    assert model.decode == old.decode and model.power_decode == old.power_decode
+    assert model.power_prefill and model.b_star == old.b_star

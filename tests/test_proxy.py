@@ -334,3 +334,54 @@ def test_stage_ms_breaks_ttft_into_stages() -> None:
     assert timing["gap_ms"] == pytest.approx(1.0)
     assert timing["decode_first_ms"] == pytest.approx(239.0)
     assert stage_ms(10.0, {})["prefill_ms"] is None
+
+
+@pytest.mark.parametrize("stage", ["prefill", "decode"])
+def test_cancelled_request_releases_its_reservation(stage) -> None:
+    """A request cancelled after admission and before streaming (client gone,
+    timeout, shutdown) leaves no count behind in the Router."""
+    from canatune.domain.groups import ClockPoint, TierTable
+
+    entered = asyncio.Event()
+
+    async def handler(request):
+        is_prefill = request.url.port < 8200
+        if (stage == "prefill") == is_prefill:
+            entered.set()
+            await asyncio.Event().wait()  # never answers
+        return httpx.Response(200, json={"choices": []})
+
+    async def run():
+        client, runtime = make_cantune(handler, admission="slack")
+        table = TierTable(ClockPoint(900, 450), ClockPoint(1815, 1050), 3000.0, 460.0)
+        table.evidence = {
+            "prefill_ms_by_clock": {"1815": {"128": 40, "2048": 150}},
+            "admission": {
+                "predictor_coef": [150.0, 1.0, 1.0, 800.0, 2.0],
+                "slack_counts": {str(b): [50, 0] for b in range(9, 14)},
+                "kv_gate_fraction": 0.5,
+            },
+        }
+        runtime.controller.tiers.table = table
+        await runtime.start()
+        runtime.stop.set()
+        async with client:
+            task = asyncio.create_task(
+                client.post(
+                    "/v1/completions",
+                    json={"model": "m", "prompt": [5] * 500, "max_tokens": 3, "stream": True},
+                )
+            )
+            await asyncio.wait_for(entered.wait(), 5)
+            busy = [g for g in runtime.router.groups if g.n_inflight]
+            assert len(busy) == 1
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        group = busy[0]
+        assert (group.n_inflight, group.n_at_p, group.n_await) == (0, 0, 0)
+        assert group.pending_ms == 0 and group.inflight_bytes == 0
+        assert runtime.router.log.recent[-1]["status"] == "client_disconnected"
+        await asyncio.gather(*runtime.tasks, return_exceptions=True)
+
+    asyncio.run(run())

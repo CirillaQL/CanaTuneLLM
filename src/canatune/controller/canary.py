@@ -148,7 +148,9 @@ class CanaryScheduler:
         if canary is None:
             return False, "no_canary"
         others = [
-            g for g in self.controller.groups if g is not canary and g.state is GroupState.ACTIVE
+            g
+            for g in self.controller.groups
+            if g is not canary and g.state is GroupState.ACTIVE and g.effective is not None
         ]
         if not others:
             return False, "no_other_active_group"

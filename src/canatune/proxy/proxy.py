@@ -332,7 +332,13 @@ def create_proxy_router(
                 )
             return JSONResponse({"error": str(error)}, status_code=400)
 
+        finished = False
+
         def finish(status: str, timer: StreamTimer | None) -> None:
+            nonlocal finished
+            if finished:
+                return
+            finished = True
             times = timer.token_times if timer is not None else []
             ttft_ms = (times[0] - arrived) * 1000.0 if times else None
             tpot_ms = timer.tpot_ms() if timer is not None else None
@@ -379,88 +385,102 @@ def create_proxy_router(
             prefill_body["max_completion_tokens"] = 1
         prefill_body.pop("stream_options", None)
 
+        # Admitted but not yet streaming: a cancellation (client gone, timeout,
+        # shutdown) is no HTTPError, so the reservation is released here.
+        handed_off = False
+        clients: list[httpx.AsyncClient] = []
         try:
-            async with factory() as client:
-                stamps["prefill_sent"] = time.monotonic()
-                prefill_response = await client.post(
-                    prefill.completions_url, json=prefill_body, headers=headers
-                )
-                stamps["prefill_done"] = time.monotonic()
-            if prefill_response.status_code == 200 and ticket is not None:
-                runtime.router.prefill_done(ticket)
-            if prefill_response.status_code != 200:
+            try:
+                async with factory() as client:
+                    stamps["prefill_sent"] = time.monotonic()
+                    prefill_response = await client.post(
+                        prefill.completions_url, json=prefill_body, headers=headers
+                    )
+                    stamps["prefill_done"] = time.monotonic()
+                if prefill_response.status_code == 200 and ticket is not None:
+                    runtime.router.prefill_done(ticket)
+                if prefill_response.status_code != 200:
+                    finish("prefill_error", None)
+                    return JSONResponse(
+                        {"error": f"prefill returned HTTP {prefill_response.status_code}"},
+                        status_code=502,
+                        headers=response_headers,
+                    )
+            except httpx.HTTPError:
                 finish("prefill_error", None)
                 return JSONResponse(
-                    {"error": f"prefill returned HTTP {prefill_response.status_code}"},
-                    status_code=502,
-                    headers=response_headers,
+                    {"error": "prefill request failed"}, status_code=502, headers=response_headers
                 )
-        except httpx.HTTPError:
-            finish("prefill_error", None)
-            return JSONResponse(
-                {"error": "prefill request failed"}, status_code=502, headers=response_headers
-            )
 
-        client = factory()
-        try:
-            decode_request = client.build_request(
-                "POST", decode.completions_url, json=body, headers=headers
-            )
-            stamps["decode_sent"] = time.monotonic()
-            decode_response = await client.send(decode_request, stream=True)
-            if decode_response.status_code != 200:
-                await decode_response.aclose()
-                await client.aclose()
-                finish("decode_error", None)
-                return JSONResponse(
-                    {"error": f"decode returned HTTP {decode_response.status_code}"},
-                    status_code=502,
-                    headers=response_headers,
+            client = factory()
+            clients.append(client)
+            try:
+                decode_request = client.build_request(
+                    "POST", decode.completions_url, json=body, headers=headers
                 )
-            content_type = decode_response.headers.get("content-type", "application/json")
-            if body.get("stream") is True:
-                if "text/event-stream" not in content_type.lower():
+                stamps["decode_sent"] = time.monotonic()
+                decode_response = await client.send(decode_request, stream=True)
+                if decode_response.status_code != 200:
                     await decode_response.aclose()
                     await client.aclose()
                     finish("decode_error", None)
                     return JSONResponse(
-                        {"error": "decode did not return an SSE stream"},
+                        {"error": f"decode returned HTTP {decode_response.status_code}"},
                         status_code=502,
                         headers=response_headers,
                     )
-
-                timer = StreamTimer()
-
-                async def stream() -> AsyncIterator[bytes]:
-                    status = "client_disconnected"
-                    try:
-                        async for chunk in decode_response.aiter_raw():
-                            if timer.feed(chunk) and ticket is not None:
-                                runtime.router.first_token(ticket)
-                            yield chunk
-                        status = "ok"
-                    except httpx.HTTPError:
-                        status = "decode_error"
-                    finally:
-                        finish(status, timer)
+                content_type = decode_response.headers.get("content-type", "application/json")
+                if body.get("stream") is True:
+                    if "text/event-stream" not in content_type.lower():
                         await decode_response.aclose()
                         await client.aclose()
+                        finish("decode_error", None)
+                        return JSONResponse(
+                            {"error": "decode did not return an SSE stream"},
+                            status_code=502,
+                            headers=response_headers,
+                        )
 
-                return StreamingResponse(
-                    stream(), media_type="text/event-stream", headers=response_headers
+                    timer = StreamTimer()
+
+                    async def stream() -> AsyncIterator[bytes]:
+                        status = "client_disconnected"
+                        try:
+                            async for chunk in decode_response.aiter_raw():
+                                if timer.feed(chunk) and ticket is not None:
+                                    runtime.router.first_token(ticket)
+                                yield chunk
+                            status = "ok"
+                        except httpx.HTTPError:
+                            status = "decode_error"
+                        finally:
+                            finish(status, timer)
+                            await decode_response.aclose()
+                            await client.aclose()
+
+                    handed_off = True  # stream() finishes the request from here on
+                    return StreamingResponse(
+                        stream(), media_type="text/event-stream", headers=response_headers
+                    )
+
+                result = await decode_response.aread()
+                await decode_response.aclose()
+                await client.aclose()
+                # Non-streaming: TTFT is unknown, so the outcome never enters the risk table.
+                finish("ok", None)
+                return Response(content=result, media_type=content_type, headers=response_headers)
+            except httpx.HTTPError:
+                await client.aclose()
+                finish("decode_error", None)
+                return JSONResponse(
+                    {"error": "decode request failed"}, status_code=502, headers=response_headers
                 )
 
-            result = await decode_response.aread()
-            await decode_response.aclose()
-            await client.aclose()
-            # Non-streaming: TTFT is unknown, so the outcome never enters the risk table.
-            finish("ok", None)
-            return Response(content=result, media_type=content_type, headers=response_headers)
-        except httpx.HTTPError:
-            await client.aclose()
-            finish("decode_error", None)
-            return JSONResponse(
-                {"error": "decode request failed"}, status_code=502, headers=response_headers
-            )
+        finally:
+            if not handed_off:
+                for c in clients:
+                    if not c.is_closed:
+                        await c.aclose()
+                finish("client_disconnected", None)  # no-op once finished
 
     return router

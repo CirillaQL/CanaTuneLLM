@@ -350,6 +350,7 @@ class TierLocator:
         self._clock = clock
         self._cache: dict[tuple, _Cached] = {}
         self.run: LocatorRun | None = None
+        self._previous: TierTable | None = None  # the table a relocation builds on
         self.mean_prompt = 512.0  # of the current probe length distribution
 
     # ---- cached measurements ------------------------------------------------------------
@@ -657,6 +658,14 @@ class TierLocator:
         decode = fit_decode(d_points)
         power_p = fit_power(idle_p, p_windows)
         power_d = fit_power(idle_d, d_windows)
+        previous = self._previous
+        old = (previous.evidence.get("model") if previous is not None else None) or None
+        if old is not None:
+            # A relocation reuses D: its iteration and power fits come from the run
+            # that measured D (this run has no D windows of its own).
+            reused = ClusterModel.from_json(old)
+            decode = decode or reused.decode
+            power_d = power_d or reused.power_decode
         # SLO-limited P utilization: the highest P utilization among windows that met
         # the target (a measured lower bound; at C_H the limit may be D or KV, the
         # low-clock windows of the search push P itself further).
@@ -1000,7 +1009,15 @@ class TierLocator:
         self.mean_prompt = mean_prompt
         hw = await self.backend.hardware()
         top = ClockPoint(hw.prefill_clocks[-1], hw.decode_clocks[-1])
-        park = previous.park if previous is not None else await self.park(hw)
+        self._previous = previous
+        if previous is not None:
+            # Reused park point: its idle power readings (the power model's base) too.
+            park = previous.park
+            idle = previous.evidence.get("idle_power_w")
+            if idle:
+                self.run.evidence["idle_power_w"] = idle
+        else:
+            park = await self.park(hw)
         self.backend.set_prompt_limit(None)
         alpha, limit = await self.alpha(top, prompts)
         mean_prompt = self.mean_prompt = self.backend.set_prompt_limit(limit)
@@ -1021,7 +1038,7 @@ class TierLocator:
                 previous.decode_max_running,
                 previous.decode_wall,
             )
-            d_evidence = {"reused_from_previous": True}
+            d_evidence = {**(previous.evidence.get("decode") or {}), "reused_from_previous": True}
         else:
             f_d, b_star, wall, d_evidence = await self.decode(hw, f_eff)
 

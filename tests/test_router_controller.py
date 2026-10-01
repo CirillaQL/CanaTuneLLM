@@ -327,6 +327,35 @@ def test_static_comparison_keeps_every_group_at_h_without_a_solver() -> None:
     assert all(g.state is GroupState.ACTIVE and g.tier is Tier.H for g in groups)
 
 
+def test_failed_lock_is_retried_and_the_group_is_not_counted_meanwhile() -> None:
+    clock, _, groups, _, router, controller, actuator = setup()
+    asyncio.run(controller.start())
+    groups[0].state = GroupState.ACTIVE
+    asyncio.run(controller.publish(published(model=True), "test"))
+    g = groups[1]
+    g.state = GroupState.PARK
+    asyncio.run(controller.set_tier(g, Tier.PARK, "test"))
+    real = actuator.lock
+
+    async def down(ref, mhz):
+        raise RuntimeError("agent unreachable")
+
+    actuator.lock = down
+    assert asyncio.run(controller.wake("test")) is g
+    assert g.state is GroupState.ACTIVE and g.effective is None  # not routable
+    asyncio.run(controller.tick())  # retried and failed again: backing off
+    assert g.effective is None and g.name in controller._retry
+    routable = [x for x in groups if x.state is GroupState.ACTIVE and x.effective is not None]
+    assert g not in routable
+    actuator.lock = real  # the agent is back
+    for _ in range(6):
+        clock.now += controller.settings.t_down_s
+        asyncio.run(controller.tick())
+        if g.effective is not None:
+            break
+    assert g.effective is not None and g.name not in controller._retry
+
+
 def test_pressure_with_nothing_parked_aborts_canary() -> None:
     clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups[1:])

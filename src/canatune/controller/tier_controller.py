@@ -112,6 +112,8 @@ class TierController:
         self._pressure_at = float("-inf")
         self._rejections_seen = 0
         self._last_energy_log = float("-inf")
+        # Groups whose last clock lock failed: name -> (next retry time, backoff s).
+        self._retry: dict[str, tuple[float, float]] = {}
         # Set by the Canary scheduler: abort an experiment; -> whether one was aborted.
         self.on_pressure: Callable[[str], bool] | None = None
 
@@ -145,8 +147,16 @@ class TierController:
                 self._lock(group.decode, target.decode_mhz),
             )
         )
+        if group.tier is tier:
+            if ok:
+                self._retry.pop(group.name, None)
+            else:
+                # Retry from tick(), backing off from period_s up to t_down_s.
+                _, delay = self._retry.get(group.name, (0.0, self.settings.period_s / 2))
+                delay = min(2 * delay, self.settings.t_down_s)
+                self._retry[group.name] = (self._clock() + delay, delay)
         if tier is not Tier.PARK and group.tier is tier:
-            # On failure keep the conservative point; a later tick retries.
+            # On failure keep the conservative point (None after Park: not routable).
             if ok:
                 group.effective = target
             elif old is not None:
@@ -251,6 +261,7 @@ class TierController:
         table = self.tiers.table
         if table is None:
             return  # cold start: everything at MAX, nothing to decide
+        await self._retry_locks(now)
         new_pressure = self.router.pressure - self._rejections_seen
         self._rejections_seen = self.router.pressure
         active = [g for g in self.groups if g.state is GroupState.ACTIVE]
@@ -269,6 +280,17 @@ class TierController:
             await self._unboost(active, now)
         await self._plan(now)
         await self._finish_draining()
+
+    async def _retry_locks(self, now: float) -> None:
+        """Lock again the groups whose last lock failed (their target is unchanged)."""
+        for group in self.groups:
+            due = self._retry.get(group.name)
+            if due is None or now < due[0]:
+                continue
+            if group.state in (GroupState.ACTIVE, GroupState.PARK):
+                await self.set_tier(group, group.tier, "retry")
+            else:
+                self._retry.pop(group.name, None)  # draining/exploring: not ours to lock
 
     async def _boost(self, active: Sequence[Group], reason: str) -> None:
         """Raise the most loaded working group to MAX (one per tick)."""
@@ -306,8 +328,10 @@ class TierController:
         while self._demand and self._demand[0][0] < now - s.t_down_s:
             self._demand.popleft()
         active = [g for g in self.groups if g.state is GroupState.ACTIVE]
+        # Capacity counts only routable groups (a failed lock after Park leaves none).
+        routable = [g for g in active if g.effective is not None]
         point = self.tiers.clocks(Tier.H)
-        current = solver.evaluate(demand, lengths, max(len(active), 1), point)
+        current = solver.evaluate(demand, lengths, max(len(routable), 1), point)
         up = not current.feasible  # the current configuration cannot carry the demand
         # Plan for the peak demand of the last t_down_s (both directions): the chosen
         # configuration then stays feasible while the demand moves below that peak.
@@ -320,7 +344,7 @@ class TierController:
         held = now - (self._target_since or now) >= s.t_down_s
         calm = now - self._pressure_at >= s.t_down_s
         gain = current.power_w - target.power_w > s.switch_gain * current.power_w
-        if key == (len(active), point):
+        if key == (len(routable), point):
             return
         if not (up or (held and calm and gain)):
             return
@@ -330,7 +354,7 @@ class TierController:
                 "t": round(now, 1),
                 "rate_rps": round(rate, 3),
                 "burst": round(burst, 3),
-                "from": {"n": len(active), "point": point.key(), "power_w": current.power_w},
+                "from": {"n": len(routable), "point": point.key(), "power_w": current.power_w},
                 "to": {"n": target.n, "point": target.point.key(), "power_w": target.power_w},
                 "feasible": target.feasible,
                 "binding": target.binding,
@@ -343,12 +367,14 @@ class TierController:
             for group in active:
                 if group.tier is Tier.H and group.effective != target.point:
                     await self.set_tier(group, Tier.H, "plan")
-        while len(active) < target.n:
+        while len(routable) < target.n:
             woken = await self.wake("plan")
             if woken is None:
                 break
             active.append(woken)
-        if len(active) > max(target.n, s.min_active_groups):
+            if woken.effective is not None:
+                routable.append(woken)
+        if len(routable) > max(target.n, s.min_active_groups):
             # Drain one group per step: the Canary first so it is free to explore.
             victim = min(active, key=lambda g: (not g.canary, g.n_inflight, g.pending_ms))
             victim.state = GroupState.DRAINING
