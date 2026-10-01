@@ -235,6 +235,21 @@ def test_consolidation_parks_at_park_clocks_and_pressure_wakes() -> None:
     assert len([g for g in groups if g.state is GroupState.ACTIVE]) == 2
 
 
+def test_consolidation_drains_the_busier_canary_before_production() -> None:
+    clock, _, groups, _, router, controller, _ = setup()
+    asyncio.run(controller.start())
+    groups[0].state = GroupState.ACTIVE
+    asyncio.run(controller.publish(published(), "test"))
+    for _ in range(4):
+        clock.now += 31
+        groups[0].record_admission(clock.now, 512, 10.0)  # the Canary carries the traffic
+        asyncio.run(controller.tick())
+        asyncio.run(controller.tick())
+    # otherwise the Canary ends up the only active group and can never explore
+    assert groups[0].state is not GroupState.ACTIVE
+    assert any(g.state is GroupState.ACTIVE and not g.canary for g in groups)
+
+
 def test_no_parking_right_after_rejections() -> None:
     clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups)

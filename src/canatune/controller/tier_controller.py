@@ -299,8 +299,9 @@ class TierController:
         if now - self._consolidate_since < s.t_down_s:
             return
         self._consolidate_since = None
-        # Drain the least-loaded group; the Canary first so it is free to explore.
-        victim = min(active, key=lambda g: (loads[g.name], not g.canary, g.n_inflight))
+        # Drain the Canary first so it is free to explore (it cannot start while it is
+        # the only active group), then the least-loaded production group.
+        victim = min(active, key=lambda g: (not g.canary, loads[g.name], g.n_inflight))
         victim.state = GroupState.DRAINING
         self.log.write({"event": "drain", "group": victim.name, "total_load": total})
 
