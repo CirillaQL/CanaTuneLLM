@@ -27,6 +27,11 @@ Procedure (design v2 §6.2; validated offline by replaying K2/K3b/K4a data):
 10. fill    windows at H over several loads so the risk table has samples before
             production switches to it; C_H = highest load meeting the target,
             bisected between the last feasible and the first infeasible load
+11. admission  single-request length tables at H (and L) besides MAX (S(L) per
+            clock: plateau + slope); from every probe of the run (state at send ->
+            TTFT, SLO): the TTFT predictor's coefficients, the slack risk seed and
+            the KV-in-flight gate (`domain.calibration`), so production starts
+            from this cluster's own measurements, not from offline fits
 
 Every window result is cached, so an aborted run resumes where it stopped.
 The locator never touches production: the backend drives only the Canary pair.
@@ -39,6 +44,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
+from canatune.domain.admission import PRIOR_COEF, CostBook
+from canatune.domain.calibration import calibrate_admission, fit_plateau_slope
 from canatune.domain.groups import ClockPoint, TierTable
 from canatune.infrastructure.records import JsonlLog
 
@@ -75,6 +82,7 @@ class WindowResult:
     decode_kv_max: float | None = None
     decode_running_max: float | None = None  # sequences D actually ran (telemetry)
     aborted: bool = False
+    samples: list = field(default_factory=list, repr=False)  # ProbeSample per request
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -165,6 +173,8 @@ class LocatorSettings:
     decode_window_s: float = 60.0  # closed windows: several requests per worker (r4: 20 s)
     decode_clock_repeats: int = 2  # D clock choice: median J/token of this many windows
     service_repeats: int = 3
+    service_lengths: tuple[int, ...] = ()  # extra S(L) lengths; () = 16, 64, 256, ... up
+    # to the longest probe length (the plateau and its knee need short lengths)
     cache_ttl_s: float = 3600.0
 
     @classmethod
@@ -174,8 +184,9 @@ class LocatorSettings:
         raw.setdefault("theta", config.get("router", {}).get("theta", 0.1))
         raw["ttft_slo_ms"] = float(slo["ttft_ms"])
         raw["tpot_slo_ms"] = float(slo["tpot_ms"])
-        if "fill_load_fractions" in raw:
-            raw["fill_load_fractions"] = tuple(raw["fill_load_fractions"])
+        for key in ("fill_load_fractions", "service_lengths"):
+            if key in raw:
+                raw[key] = tuple(raw[key])
         known = set(cls.__dataclass_fields__)
         unknown = set(raw) - known
         if unknown:
@@ -288,6 +299,29 @@ class LocatorRun:
     windows: int = 0
     reused: int = 0
     evidence: dict[str, Any] = field(default_factory=dict)
+    samples: list = field(default_factory=list)  # ProbeSample of every window
+
+
+@dataclass(frozen=True)
+class AdmissionInputs:
+    """What the admission calibration needs besides the windows (config + priors)."""
+
+    kv_bytes_per_token: float = 131072.0
+    kv_buffer_bytes: float = 1e9
+    gate_prior: float = 0.5  # share of the buffer in flight before it is measured
+    predictor_prior: tuple[float, ...] = PRIOR_COEF
+
+
+def service_lengths(prompts: Sequence[int], extra: Sequence[int] = ()) -> list[int]:
+    """Probe lengths plus a geometric ladder 16, 64, 256, ... below the longest."""
+    top = max(prompts)
+    ladder = list(extra)
+    if not ladder:
+        n = 16
+        while n < top:
+            ladder.append(n)
+            n *= 4
+    return sorted(set(prompts) | {n for n in ladder if n <= top})
 
 
 # ---- the locator ------------------------------------------------------------------------
@@ -301,9 +335,11 @@ class TierLocator:
         *,
         log: JsonlLog | None = None,
         clock: Callable[[], float] = time.monotonic,
+        admission: AdmissionInputs | None = None,
     ) -> None:
         self.backend = backend
         self.s = settings
+        self.admission = admission or AdmissionInputs()
         self.log = log or JsonlLog(None)
         self._clock = clock
         self._cache: dict[tuple, _Cached] = {}
@@ -326,11 +362,14 @@ class TierLocator:
         hit = self._cache.get(key)
         if hit is not None and self._clock() - hit.at <= self.s.cache_ttl_s:
             self.run.reused += 1
+            if isinstance(hit.result, WindowResult):
+                self.run.samples.extend(hit.result.samples)
             return hit.result
         result = await measure()
         self._cache[key] = _Cached(result, self._clock())
         self.run.windows += 1
         if isinstance(result, WindowResult):
+            self.run.samples.extend(result.samples)
             self.log.write({"event": "locator_window", **result.summary()})
         return result
 
@@ -431,7 +470,7 @@ class TierLocator:
         """-> (alpha tokens, largest prompt that meets the TTFT target when idle;
         None when every tested length does)."""
         self._phase("alpha")
-        lengths = sorted(set(prompts))
+        lengths = service_lengths(prompts, self.s.service_lengths)
         samples = await self._cached(
             ("service", top, tuple(lengths)),
             lambda: self.backend.service_times(top, lengths * self.s.service_repeats),
@@ -463,9 +502,45 @@ class TierLocator:
                 },
                 "idle_ttft_ms": idle_ttft,
                 "prompt_limit": limit,
+                "prefill_ms_by_clock": {
+                    top.prefill_mhz: dict(_medians([(t, ms) for t, ms, _ in samples]))
+                },
             }
         )
         return alpha, limit
+
+    async def prefill_table(self, clock: ClockPoint, prompts: Sequence[int]) -> dict[int, float]:
+        """Single-request S(L) at `clock` (the clocks production runs at)."""
+        lengths = service_lengths(prompts, self.s.service_lengths)
+        samples = await self._cached(
+            ("service", clock, tuple(lengths)),
+            lambda: self.backend.service_times(clock, lengths * self.s.service_repeats),
+        )
+        table = dict(_medians([(t, ms) for t, ms, _ in samples]))
+        assert self.run is not None
+        self.run.evidence.setdefault("prefill_ms_by_clock", {})[clock.prefill_mhz] = table
+        return table
+
+    def calibrate(self) -> None:
+        """Plateau + slope per measured clock and the admission parameters from every
+        probe of this run (evidence["prefill_fit"], evidence["admission"])."""
+        assert self.run is not None
+        tables = self.run.evidence.get("prefill_ms_by_clock", {})
+        self.run.evidence["prefill_fit"] = {f: fit_plateau_slope(t) for f, t in tables.items()}
+        a = self.admission
+        result = calibrate_admission(
+            self.run.samples,
+            CostBook(tables),
+            prior=a.predictor_prior,
+            ttft_slo_ms=self.s.ttft_slo_ms,
+            theta=self.s.theta,
+            kv_bytes_per_token=a.kv_bytes_per_token,
+            buffer_bytes=a.kv_buffer_bytes,
+            gate_prior=a.gate_prior,
+        )
+        if result is not None:
+            self.run.evidence["admission"] = result
+            self.log.write({"event": "locator_admission", **result})
 
     async def ramp(
         self, hw: Hardware, top: ClockPoint, alpha: float, mean_prompt: float
@@ -790,6 +865,11 @@ class TierLocator:
                 f_l = None  # L was only checked with D at its ceiling
         h = ClockPoint(f_h, f_d)
         capacity = await self.fill(h, c0, alpha)
+        self._phase("admission")
+        for f in {f_h} | ({f_l} if f_l is not None else set()):
+            if f != top.prefill_mhz:
+                await self.prefill_table(ClockPoint(f, top.decode_mhz), prompts)
+        self.calibrate()
 
         assert self.run is not None
         self.run.evidence.update(

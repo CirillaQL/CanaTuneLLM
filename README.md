@@ -119,19 +119,58 @@ pending P work   = sum S(L) of requests at P      S(L): Canary length table (pla
 KV in flight     = sum L x KV bytes/token of requests between P return and first token
 decoding         = requests past their first token
 predicted TTFT   = linear model over (S(L_own), pending, KV in flight, decoding),
-                   refitted online on clean samples (ridge towards the r6b/r7 fit)
+                   initial fit from the Canary's windows, refitted online on clean
+                   production samples (ridge towards the Canary's fit)
 slack            = TTFT SLO - predicted TTFT  ->  risk of that slack bucket (Wilson UCB)
 ```
 
-Hard limits: KV in flight to the group's D <= `kv_inflight_fraction` (0.5) x
-`kv_transfer.kv_buffer_bytes` (r6b/r7: above half the buffer 58-67 % of requests
-violated), plus the D concurrency and KV usage limits. Then slack risk <= theta.
+Hard limits: KV in flight to the group's D <= the gate x
+`kv_transfer.kv_buffer_bytes` (the gate is measured by the Canary; the prior
+`kv_inflight_fraction` 0.5 until then; r6b/r7: above half the buffer 58-67 % of
+requests violated), plus the D concurrency and KV usage limits. Then slack risk <= theta.
 Sparse slack buckets with >= 200 ms of predicted slack are admitted to learn;
 below that they pool with lower-slack buckets. Offline replay (train on one run,
 test on the other, `scripts/analysis/admission_replay.py`): more requests admitted
 and fewer wrongly rejected than the v1 cells, violations below theta in both
 directions. Text prompts are tokenized with the model's tokenizer (`MODEL_PATH`)
 when available. `router.admission: cells` keeps the v1 table below.
+
+### Deployment inputs and self-calibration
+
+On a new cluster nothing comes from offline tests. Inputs: the model's
+`config.json` (`MODEL_PATH`), the GPU models (`topology.*.gpu_type`, datasheet
+table in `domain/priors.py`, or `cluster.gpu_specs`), `kv_transfer.kv_buffer_bytes`
+and `kv_transfer.link_gbps`, plus the policy (SLOs, theta, `hold_max_ms`).
+
+```text
+priors (cold start)   roofline from the specs: S(L) plateau = weights / P bandwidth,
+                      slope = 2 x params / P FLOPS (scaled by clock), D iteration =
+                      weights / D bandwidth, D KV capacity, TTFT predictor prior
+                      (proxy + 2 D iterations, own/pending S(L) x 1, KV in flight /
+                      link, decoding x per-sequence cost)
+Canary (locator)      S(L) at MAX, H and L (16, 64, 256, ... up to the longest
+                      prompt) -> plateau + slope per clock; every probe records the
+                      state it was sent into -> predictor coefficients (TTFT <= 2 x
+                      SLO), two-fold slack seed for the risk table, the KV-in-flight
+                      gate (first bin clearly above theta)  -> evidence.admission
+production            S(L) by the group's clock; the published calibration replaces
+                      the priors; online refits; backfill margin = lowest slack
+                      with observed risk <= theta / 2
+```
+
+Simulated on four unseen "clusters" with only these inputs
+(`scripts/analysis/selfcal_sim.py`: the real locator over a probe backend that
+simulates the pair, then production on the smoke-2 profile, 3 seeds):
+
+| cluster | C_H found | KV gate | goodput priors only | goodput calibrated | energy vs default |
+|---|---|---|---|---|---|
+| L40S / L4 (r6b physics) | 4.0 req/s | 0.2 | 97.7 % | 98.8 % | -26 % |
+| 2 Gb/s link | 0.9 req/s | 0.1 | 90.6 % | 96.4 % | -19 % |
+| kv_buffer 0.3 GB | 4.0 req/s | 0.5 | 97.4 % | 98.5 % | -30 % |
+| H100 / A100, 25 Gb/s | 22.4 req/s | 0.5 | 99.4 % | 99.5 % | -51 % |
+
+The power model of the simulation is synthetic (energy falls with the clock, so H
+lands on the lowest clocks); goodput is bounded by theta = 10 % by design.
 
 ### Overload: serve instead of reject (`router.overload: serve`, default)
 

@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from canatune.domain.admission import (
+    CostBook,
     PrefillCost,
     SlackRisk,
     TtftPredictor,
@@ -54,6 +55,7 @@ from canatune.domain.admission import (
 )
 from canatune.domain.groups import Group, TierState
 from canatune.domain.load import LengthStats
+from canatune.domain.priors import Priors
 from canatune.domain.risk import Cell, RiskEstimate, RiskTable, is_violation
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import Telemetry
@@ -84,10 +86,12 @@ class RouterSettings:
     admission: str = "slack"  # slack (state-based) or cells (v1 risk table)
     kv_bytes_per_token: float = 131072.0
     kv_buffer_bytes: float = 1e9  # the KV connector's receive buffer on D
-    kv_inflight_fraction: float = 0.5  # r6b/r7: > 0.5 buffer in flight -> 58-67 % violated
+    kv_inflight_fraction: float = 0.5  # prior share of the buffer in flight; the Canary
+    # measures this cluster's knee (evidence.admission.kv_gate_fraction)
     overload: str = "reject"  # reject, or serve: rescue to the best group / backfill
     doomed: str = "backfill"  # serve: backfill (wait for spare capacity) or dispatch
-    backfill_slack_ms: float = 400.0  # backfill only where a fresh request keeps this slack
+    backfill_slack_ms: float | None = None  # backfill only where a fresh request keeps this
+    # slack; None (auto): the lowest slack whose observed risk is <= theta / 2
     hold_max_ms: float = 30000.0  # serve: longest hold while every group is at a hard limit
 
     @classmethod
@@ -115,12 +119,21 @@ class RouterSettings:
             overload=_choice(raw, "overload", ("reject", "serve"), "reject"),
             hold_max_ms=_positive(raw, "hold_max_ms", 30000),
             doomed=_choice(raw, "doomed", ("backfill", "dispatch"), "backfill"),
-            backfill_slack_ms=float(raw.get("backfill_slack_ms", 400.0)),
+            backfill_slack_ms=_auto_ms(raw, "backfill_slack_ms"),
         )
 
 
 def _admission(raw: Mapping[str, Any]) -> str:
     return _choice(raw, "admission", ("slack", "cells"), "slack")
+
+
+def _auto_ms(raw: Mapping[str, Any], key: str) -> float | None:
+    value = raw.get(key, "auto")
+    if value in (None, "auto"):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise RouterConfigError(f"router.{key} must be auto or a non-negative number")
+    return float(value)
 
 
 def _choice(raw: Mapping[str, Any], key: str, allowed: Sequence[str], default: str) -> str:
@@ -195,6 +208,7 @@ class CanaTuneRouter:
         clock_epochs: Mapping[str, int] | None = None,
         predictor: TtftPredictor | None = None,
         slack: SlackRisk | None = None,
+        priors: Priors | None = None,
     ) -> None:
         self.groups = list(groups)
         self.table = table
@@ -215,10 +229,14 @@ class CanaTuneRouter:
         self._waiters = itertools.count(1)
         # SLO outcomes of risk-admitted production requests (drift detection).
         self.outcomes: deque[bool] = deque(maxlen=500)
-        self.predictor = predictor or TtftPredictor()
+        self.priors = priors
+        self.predictor = predictor or (
+            TtftPredictor(priors.predictor_coef()) if priors is not None else TtftPredictor()
+        )
         self.slack = slack or SlackRisk(min_samples=table.min_samples)
-        self._cost_key: object = None
-        self._cost = PrefillCost()
+        self.kv_fraction = settings.kv_inflight_fraction
+        self._applied_key: object = None
+        self._costs = self._cost_book(None)
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
 
     @property
@@ -226,18 +244,58 @@ class CanaTuneRouter:
         """Cold start: no tier table yet, admit everything."""
         return self.tiers.table is None
 
-    def prefill_cost(self) -> PrefillCost:
-        """S(L) from the Canary's single-request length table in the published tier
-        table (evidence.alpha_fit.prefill_ms_by_length); a generic curve before."""
+    def _cost_book(self, evidence: Mapping[str, Any] | None) -> CostBook:
+        """S(L) per P clock: the Canary's tables (evidence.prefill_ms_by_clock, or the
+        MAX table of older tier tables); before any, the spec priors."""
+        tables: dict[int, dict[int, float]] = {}
+        if evidence:
+            for mhz, lut in (evidence.get("prefill_ms_by_clock") or {}).items():
+                tables[int(mhz)] = {int(k): float(v) for k, v in lut.items()}
+            old = (evidence.get("alpha_fit") or {}).get("prefill_ms_by_length")
+            if not tables and old:
+                tables[self.tiers.max_point.prefill_mhz] = {
+                    int(k): float(v) for k, v in old.items()
+                }
+        fallback = None
+        if self.priors is not None:
+            top = self.tiers.max_point.prefill_mhz
+            priors = self.priors
+            fallback = lambda mhz: priors.prefill_table((mhz or top) / top)  # noqa: E731
+        return CostBook(tables, fallback)
+
+    def _apply_table(self) -> None:
+        """On a newly published tier table: its S(L) tables, and the admission
+        parameters the Canary calibrated (predictor prior, slack seed, KV gate)."""
         table = self.tiers.table
         key = None if table is None else table.published_at
-        if key != self._cost_key:
-            lut = None
-            if table is not None:
-                lut = (table.evidence.get("alpha_fit") or {}).get("prefill_ms_by_length")
-            self._cost = PrefillCost({int(k): float(v) for k, v in (lut or {}).items()})
-            self._cost_key = key
-        return self._cost
+        if key == self._applied_key:
+            return
+        self._applied_key = key
+        evidence = None if table is None else table.evidence
+        self._costs = self._cost_book(evidence)
+        admission = (evidence or {}).get("admission")
+        if admission:
+            self.predictor.set_prior(admission["predictor_coef"])
+            self.slack.set_seed(admission.get("slack_counts") or {})
+            self.kv_fraction = float(
+                admission.get("kv_gate_fraction") or self.settings.kv_inflight_fraction
+            )
+            self.log.write({"event": "admission_calibration", "published_at": key, **admission})
+
+    def prefill_cost(self, mhz: int | None = None) -> PrefillCost:
+        """S(L) at P clock `mhz` (None: the highest measured)."""
+        self._apply_table()
+        return self._costs.for_clock(mhz)
+
+    def backfill_slack_ms(self) -> float:
+        """Spare-capacity margin for backfilling doomed requests: configured, or the
+        lowest slack from which the risk table is safe at theta / 2 (until observed,
+        0.4 x the TTFT SLO)."""
+        s = self.settings
+        if s.backfill_slack_ms is not None:
+            return s.backfill_slack_ms
+        safe = self.slack.safe_slack(s.theta / 2)
+        return max(0.0, safe) if safe is not None else 0.4 * s.ttft_slo_ms
 
     def _predict(self, group: Group, s_own_ms: float) -> tuple[tuple[float, ...], float]:
         x = self.predictor.features(
@@ -247,7 +305,7 @@ class CanaTuneRouter:
 
     def _kv_blocked(self, group: Group) -> bool:
         s = self.settings
-        return group.inflight_bytes >= s.kv_inflight_fraction * s.kv_buffer_bytes
+        return group.inflight_bytes >= self.kv_fraction * s.kv_buffer_bytes
 
     # ---- state ---------------------------------------------------------------------
 
@@ -283,11 +341,11 @@ class CanaTuneRouter:
         out = []
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
         self._within_limits: list[tuple[Group, Cell, bool]] = []
-        s_own = self.prefill_cost()(tokens)
         for group in self.groups:
             if not group.routable:
                 continue
             assert group.effective is not None
+            s_own = self.prefill_cost(group.effective.prefill_mhz)(tokens)
             x, predicted = self._predict(group, s_own)
             if self.open_admission:
                 d_busy = group.n_inflight > group.n_await
@@ -350,7 +408,7 @@ class CanaTuneRouter:
             else:
                 # Spare capacity: feasible for a fresh request with backfill_slack_ms
                 # to spare, so the late request does not take an on-time one's place.
-                spare = self.candidates(tokens, self.settings.backfill_slack_ms)
+                spare = self.candidates(tokens, self.backfill_slack_ms())
                 if not spare:
                     return None
                 kind = "backfill"
@@ -378,7 +436,9 @@ class CanaTuneRouter:
             )
         now = self._clock()
         x, predicted, _ = self._slack_by_group.get(group.name, ((), None, None))
-        s_own = self.prefill_cost()(tokens)
+        s_own = self.prefill_cost(None if group.effective is None else group.effective.prefill_mhz)(
+            tokens
+        )
         ticket = Ticket(
             id=next(self._ids),
             group=group,
@@ -603,6 +663,8 @@ class CanaTuneRouter:
             "admitted": self.admitted,
             "rejections": self.rejections,
             "overload": self.settings.overload,
+            "kv_gate_fraction": self.kv_fraction,
+            "backfill_slack_ms": self.backfill_slack_ms(),
             "overflows": dict(self.overflows),
             "holding": len(self._holding),
             "groups": [g.snapshot() for g in self.groups],

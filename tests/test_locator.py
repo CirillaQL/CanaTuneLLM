@@ -308,7 +308,8 @@ def test_failed_alpha_is_measured_again_on_retry() -> None:
     with pytest.raises(LocatorError):
         asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
     table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
-    assert len(calls) == 2 and table.alpha_tokens > 0
+    # the retry measures alpha again (call 2); then S(L) at H unless H is the top clock
+    assert len(calls) in (2, 3) and table.alpha_tokens > 0
 
 
 def test_decode_runs_with_p_at_the_ceiling_and_needs_25pct_for_a_step() -> None:

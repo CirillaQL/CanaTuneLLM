@@ -26,6 +26,7 @@ from typing import Any
 import httpx
 
 from canatune.controller.locator import Hardware, WindowResult
+from canatune.domain.calibration import ProbeSample
 from canatune.domain.groups import ClockPoint, Group
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable, is_violation
@@ -62,6 +63,10 @@ class ProbeOutcome:
     tpot_ms: float | None
     n_await_at_send: int
     d_busy_at_send: bool
+    # State at send for the admission calibration (P -> KV transfer -> decode):
+    at_prefill: tuple[int, ...] = ()  # prompt lengths of probes still at P
+    inflight_tokens: int = 0  # prompt tokens between P's return and first token
+    decoding_at_send: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,6 +129,9 @@ class CanaryProbe:
         self.prompt_limit: int | None = None  # set by the locator (idle TTFT check)
         self._n_await = 0
         self._decoding = 0
+        self._at_prefill: dict[int, int] = {}  # probe id -> prompt tokens
+        self._inflight_tokens = 0
+        self._ids = 0
         self.service_source = "http"  # how service_times measured prefill ("metrics" or "http")
 
     # ---- clocks and readings -------------------------------------------------------------
@@ -219,18 +227,26 @@ class CanaryProbe:
         transport_id = pd_transport_id(f"canary-{uuid.uuid4().hex}", self.prefill, self.decode)
         headers = {"X-Request-Id": transport_id}
         n_await, d_busy = self._n_await, self._decoding > 0
+        at_prefill = tuple(self._at_prefill.values())
+        inflight, decoding_now = self._inflight_tokens, self._decoding
+        self._ids += 1
+        probe_id = self._ids
         self._n_await += 1
+        self._at_prefill[probe_id] = prompt_tokens
+        stage = "prefill"
         sent = time.monotonic()
         prefill_ms = ttft_ms = tpot_ms = None
         timer = StreamTimer()
         status = "ok"
-        decoding = False
         try:
             prefill_body = {**body, "stream": False, "max_tokens": 1}
             response = await client.post(
                 self.prefill.completions_url, json=prefill_body, headers=headers
             )
             prefill_ms = (time.monotonic() - sent) * 1000.0
+            self._at_prefill.pop(probe_id, None)
+            self._inflight_tokens += prompt_tokens
+            stage = "transfer"
             if response.status_code != 200:
                 raise httpx.HTTPError(f"prefill HTTP {response.status_code}")
             async with client.stream(
@@ -242,16 +258,20 @@ class CanaryProbe:
                     if timer.feed(chunk) and ttft_ms is None:
                         ttft_ms = (timer.token_times[0] - sent) * 1000.0
                         self._n_await -= 1
+                        self._inflight_tokens -= prompt_tokens
                         self._decoding += 1
-                        decoding = True
+                        stage = "decode"
             tpot_ms = timer.tpot_ms()
         except Exception as error:  # a failed probe is data, never a crash (cancel passes)
             status = f"error: {error!r}"
         finally:
-            if decoding:
+            if stage == "decode":
                 self._decoding -= 1
             else:
                 self._n_await -= 1
+                if stage == "transfer":
+                    self._inflight_tokens -= prompt_tokens
+                self._at_prefill.pop(probe_id, None)
         outcome = ProbeOutcome(
             status,
             prompt_tokens,
@@ -261,6 +281,9 @@ class CanaryProbe:
             tpot_ms,
             n_await,
             d_busy,
+            at_prefill,
+            inflight,
+            decoding_now,
         )
         return outcome
 
@@ -343,6 +366,21 @@ class CanaryProbe:
         decode_tokens: float | None = None,
     ) -> WindowResult:
         ok = [o for o in outcomes if o.status == "ok"]
+        probe_samples = [
+            ProbeSample(
+                clock.prefill_mhz,
+                clock.decode_mhz,
+                o.prompt_tokens,
+                o.at_prefill,
+                o.inflight_tokens,
+                o.decoding_at_send,
+                o.ttft_ms,
+                is_violation(
+                    o.ttft_ms, o.tpot_ms, ttft_slo_ms=self.ttft_slo_ms, tpot_slo_ms=self.tpot_slo_ms
+                ),
+            )
+            for o in ok
+        ]
         first, last = samples[0], samples[-1]  # explicit readings around the probes
         duration = last[0] - first[0]
         p_j = (last[1]["energy_mj"] - first[1]["energy_mj"]) / 1000.0
@@ -379,6 +417,7 @@ class CanaryProbe:
             decode_kv_max=max((s.kv_usage or 0.0 for s in decode_snaps), default=None),
             decode_running_max=max((s.running or 0.0 for s in decode_snaps), default=None),
             aborted=aborted,
+            samples=probe_samples,
         )
 
     async def open_window(

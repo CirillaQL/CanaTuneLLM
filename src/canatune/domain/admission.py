@@ -20,14 +20,16 @@ import os
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 FEATURES = ("intercept", "s_own_ms", "pending_ms", "inflight_gb", "decoding")
-# Offline fit on r6b + r7 (ms, ms/ms, ms/ms, ms/GB, ms/request); refitted online.
-PRIOR_COEF = (120.0, 1.3, 0.6, 800.0, 10.0)
+# Generic fallback (ms, ms/ms, ms/ms, ms/GB, ms/request), used only when the model
+# or GPU spec is unknown: the deployment's prior comes from `priors.Priors`, the
+# Canary's calibration windows replace it, production refits it online.
+PRIOR_COEF = (150.0, 1.0, 1.0, 800.0, 2.0)
 
 
 def kv_bytes_per_token(model_config: Mapping[str, Any], dtype_bytes: int = 2) -> int:
@@ -51,13 +53,13 @@ def kv_bytes_from_model_dir(path: str | os.PathLike | None) -> int | None:
 
 
 class PrefillCost:
-    """Single-request prefill time S(L) in ms: piecewise linear over the measured
-    length table (plateau + slope, r6b), extrapolated with the last segment."""
+    """Single-request prefill time S(L) in ms: piecewise linear over a length table
+    (measured: plateau + slope), extrapolated with the last segment."""
 
     def __init__(self, table: Mapping[int, float] | None = None) -> None:
         points = sorted((int(k), float(v)) for k, v in (table or {}).items())
-        # Cold start (no table yet): r6b-like plateau + slope at MAX.
-        self.points = points if len(points) >= 2 else [(128, 33.0), (3072, 228.0)]
+        # No table and no priors: a generic plateau + slope (only for cold start).
+        self.points = points if len(points) >= 2 else [(256, 35.0), (4096, 340.0)]
 
     def __call__(self, length: int) -> float:
         pts = self.points
@@ -68,6 +70,34 @@ class PrefillCost:
                 return y0 + (y1 - y0) * (length - x0) / (x1 - x0)
         (x0, y0), (x1, y1) = pts[-2], pts[-1]
         return y1 + (y1 - y0) * (length - x1) / (x1 - x0)
+
+
+class CostBook:
+    """S(L) per P clock: the Canary's tables measured at several clocks; a clock
+    without one uses the nearest measured clock (prefill time only shortens with
+    the clock: the nearest table at or below it is the conservative choice), and
+    without any measurement the spec priors (`fallback(clock_mhz)`)."""
+
+    def __init__(
+        self,
+        tables: Mapping[int, Mapping[int, float]] | None = None,
+        fallback: "Callable[[int], Mapping[int, float]] | None" = None,
+    ) -> None:
+        self.costs = {int(f): PrefillCost(t) for f, t in (tables or {}).items() if len(t) >= 2}
+        self.fallback = fallback
+        self._fallback_costs: dict[int, PrefillCost] = {}
+
+    def for_clock(self, mhz: int | None) -> PrefillCost:
+        if self.costs:
+            if mhz is None:
+                return self.costs[max(self.costs)]
+            below = [f for f in self.costs if f <= mhz]
+            return self.costs[max(below) if below else min(self.costs)]
+        key = int(mhz or 0)
+        if key not in self._fallback_costs:
+            table = None if self.fallback is None else self.fallback(key)
+            self._fallback_costs[key] = PrefillCost(table)
+        return self._fallback_costs[key]
 
 
 def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
@@ -119,6 +149,31 @@ class TtftPredictor:
     def predict(self, x: Sequence[float]) -> float:
         with self._lock:
             return sum(c * v for c, v in zip(self.coef, x))
+
+    def set_prior(self, prior: Sequence[float]) -> None:
+        """New prior (the Canary's calibration): the coefficients restart from it and
+        the production samples kept so far refit towards it."""
+        with self._lock:
+            self.prior = [float(c) for c in prior]
+            self.coef = list(self.prior)
+            if len(self.samples) >= self.refit_every:
+                self._refit()
+
+    def fit(
+        self, samples: Sequence[tuple[Sequence[float], float]], ridge: float = 5.0
+    ) -> list[float]:
+        """Ridge fit of `samples` (features, TTFT ms) towards the prior; -> coefficients
+        (the predictor itself is not changed). The ridge weighs the prior like that
+        many samples: a calibration's hundreds of samples dominate it, while online
+        refits (`self.ridge`) stay close to the calibration."""
+        probe = TtftPredictor(
+            self.prior, window=max(len(samples), 1), ridge=ridge, clip_ms=self.clip_ms
+        )
+        for x, y in samples:
+            probe.samples.append((tuple(x), min(float(y), self.clip_ms)))
+        if probe.samples:
+            probe._refit()
+        return list(probe.coef)
 
     def record(self, x: Sequence[float], ttft_ms: float) -> None:
         with self._lock:
@@ -190,7 +245,35 @@ class SlackRisk:
         self.cold_margin_ms = cold_margin_ms
         self.path = None if path is None else Path(path)
         self.counts: dict[int, list[int]] = {}  # bucket -> [admitted, violated]
+        self.seed: dict[int, list[int]] = {}  # the Canary's calibration windows
         self._lock = threading.Lock()
+
+    def set_seed(self, counts: Mapping[Any, Sequence[int]]) -> None:
+        """Counts from the Canary's calibration windows, added to production's own
+        (replaced, not accumulated, by each new calibration)."""
+        with self._lock:
+            self.seed = {int(b): [int(c[0]), int(c[1])] for b, c in counts.items()}
+
+    def _cell(self, b: int) -> list[int]:
+        own = self.counts.get(b, [0, 0])
+        seed = self.seed.get(b, [0, 0])
+        return [own[0] + seed[0], own[1] + seed[1]]
+
+    def safe_slack(self, target: float) -> float | None:
+        """Lowest predicted slack from which every observed bucket upwards has a
+        violation bound <= target (None: not observed yet)."""
+        with self._lock:
+            buckets = sorted(set(self.counts) | set(self.seed))
+            observed = [b for b in buckets if self._cell(b)[0] >= self.min_samples]
+            safe = None
+            for b in sorted(observed, reverse=True):
+                n, k = self._cell(b)
+                if wilson_ucb(k, n) > target:
+                    break
+                safe = b
+        if safe is None or safe == 0:
+            return None
+        return self.edges[safe - 1]
 
     def bucket(self, slack_ms: float) -> int:
         return sum(slack_ms >= e for e in self.edges)
@@ -204,15 +287,17 @@ class SlackRisk:
     def estimate(self, slack_ms: float) -> SlackEstimate:
         b = self.bucket(slack_ms)
         with self._lock:
-            n, k = self.counts.get(b, [0, 0])
+            n, k = self._cell(b)
             if n >= self.min_samples:
                 return SlackEstimate(b, wilson_ucb(k, n), n, "observed")
             if slack_ms >= self.cold_margin_ms:
                 return SlackEstimate(b, 0.0, n, "cold")
             pn, pk = n, k
-            for lower in sorted((c for c in self.counts if c < b), reverse=True):
-                pn += self.counts[lower][0]
-                pk += self.counts[lower][1]
+            lower_buckets = {c for c in set(self.counts) | set(self.seed) if c < b}
+            for lower in sorted(lower_buckets, reverse=True):
+                cn, ck = self._cell(lower)
+                pn += cn
+                pk += ck
                 if pn >= self.min_samples:
                     return SlackEstimate(b, wilson_ucb(pk, pn), pn, "pooled")
         return SlackEstimate(b, 1.0, n, "cold")
@@ -222,6 +307,7 @@ class SlackRisk:
             return {
                 "edges_ms": self.edges,
                 "counts": {str(b): list(c) for b, c in sorted(self.counts.items())},
+                "seed": {str(b): list(c) for b, c in sorted(self.seed.items())},
             }
 
     def load(self) -> None:
@@ -232,6 +318,7 @@ class SlackRisk:
             return  # other buckets: start empty rather than mix
         with self._lock:
             self.counts = {int(b): [int(v[0]), int(v[1])] for b, v in raw["counts"].items()}
+            self.seed = {int(b): [int(v[0]), int(v[1])] for b, v in raw.get("seed", {}).items()}
 
     def save(self) -> None:
         if self.path is None:

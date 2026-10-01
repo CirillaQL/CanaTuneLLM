@@ -22,6 +22,14 @@ runtime:
     NCCL_SOCKET_IFNAME: "^lo"
     NCCL_DEBUG: INFO
 
+# Known before deployment: the model (config.json under MODEL_PATH) and the GPU
+# models (topology.*.gpu_type). Priors for cold start come from these and GPU
+# datasheets (canatune.domain.priors); everything else the Canary measures.
+# cluster.gpu_specs.{prefill,decode}: {memory_gb, bandwidth_gbs, bf16_tflops} for
+# GPUs missing from the datasheet table.
+cluster:
+  gpu_specs: {}
+
 model:
   name: mistralai/Mistral-7B-v0.1
   snapshot_root: /path/to/model/snapshots
@@ -73,6 +81,7 @@ kv_transfer:
   disable_chunked_prefill: true
   kv_buffer_bytes: 1.0e9      # P2pNccl kv_buffer_size on D (vLLM default 1e9)
   kv_bytes_per_token: null    # null: from the model's config.json (Mistral-7B bf16: 131072)
+  link_gbps: 10               # P -> D NIC speed (datasheet): prior of the in-flight KV cost
 
 proxy:
   enabled: true
@@ -105,7 +114,8 @@ router:
   # in flight, requests decoding) and admit when the predicted-slack bucket's risk
   # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy).
   admission: slack
-  kv_inflight_fraction: 0.5   # KV in flight to a D <= 0.5 x kv_transfer.kv_buffer_bytes
+  kv_inflight_fraction: 0.5   # prior gate on KV in flight (x kv_buffer_bytes) until the
+                              # Canary measures this cluster's knee
   # After max_wait_ms without a group within the risk bound: reject (503), or serve:
   # rescue = dispatch at once to the lowest-predicted group if it still meets the
   # SLO; doomed (SLO lost everywhere) = hold first come first served and backfill
@@ -114,7 +124,7 @@ router:
   # KV in flight) are never overridden. doomed: dispatch sends doomed ones at once.
   overload: serve
   doomed: backfill
-  backfill_slack_ms: 400
+  backfill_slack_ms: auto     # auto: lowest slack with observed risk <= theta / 2
   hold_max_ms: 30000
 
 telemetry:

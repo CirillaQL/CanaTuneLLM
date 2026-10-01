@@ -1,5 +1,6 @@
-"""Discrete-event simulation of the P/D pairs, calibrated on r6b / r7, driving the
-real CanaTune Router and Controller on a simulated clock.
+"""Discrete-event simulation of P/D pairs driving the real CanaTune Router and
+Controller on a simulated clock. The hardware is a `Physics` instance; REFERENCE
+is calibrated on r6b / r7 (L40S P, L4 D, Mistral-7B).
 
 Compares, on the same arrival trace (the smoke-2 load profile):
   baseline  round robin over all pairs at MAX (default system: no admission)
@@ -7,24 +8,25 @@ Compares, on the same arrival trace (the smoke-2 load profile):
   serve     CanaTune, state-based admission, overload: serve (rescue, backfill doomed)
   serve_dispatch   the same, doomed requests dispatched at once (naive serve-all)
 
-Physics per pair (sources in brackets):
-  P   batches everything queued (<= 8192 tokens): t0 + beta_f * max(sum L, L*)
-      [r6b plateau + slope: t0 ~30 ms, L* ~200, beta 68 / 75 / 113 us/token at
-      2520 / 1545 / 1080 MHz]
+Physics per pair (REFERENCE values, sources in brackets):
+  P   batches everything queued (<= 8192 tokens): t0 + beta_f * max(sum L, L*);
+      beta_f = beta_top x f_eff / min(f, f_eff): above f_eff the power cap holds
+      the clock [r6b: t0 ~30 ms, L* ~200, beta 68 / 75 / 113 us/token at 2520 /
+      1545 / 1080 MHz, 2520 capped near 1550-1700]
   KV  L x 131072 bytes; P hands each request's KV to D's receive buffer (1 GB);
       a full buffer makes P retry the send every 50 ms and start nothing else
       [r7: "Peer Out Of Memory" retries, P stalls, congestion collapse]; the KV
-      crosses a per-pair link of 3.8 Gb/s [r7 single-pair peak]
-  D   iterations of alpha_D + delta_D * running ms [IBM fit, r6b: 1170 MHz
+      crosses a per-pair link (6 Gb/s)
+  D   iterations of alpha_D(f) + delta_D(f) x running ms [IBM fit, r6b: 1170 MHz
       57 + 1.38 X, 2040 MHz 55 + 1.41 X, 735 MHz 60 + 2.16 X]; a request joins
       at an iteration start once its KV arrived and D's KV cache has room for
-      prompt + output (26k tokens: the 22-24 sequence wall of ~1k-token requests;
-      then the long mix fails near 2 req/s, the default mix near 5 and the short
-      mix runs past 6, as in r7), which frees its buffer; first token one
-      iteration later plus a fixed D-first overhead
+      prompt + output (26k tokens: then the long mix fails near 2 req/s, the
+      default mix near 5 and the short mix runs past 6, as in r7), which frees its
+      buffer; first token one iteration later plus a fixed D-first overhead
   fixed proxy / HTTP overhead before P [smoke 2 timing: ~40 ms]
-Clock changes are instantaneous and energy is not modelled: group-seconds active
-and at MAX are the energy proxies (park and lower clocks save, MAX costs).
+  power  idle + utilization x dynamic(f / f_top) per GPU (synthetic: L40S-like P
+      up to ~325 W, L4-like D up to 72 W); parked groups idle at the lowest clock
+Clock changes are instantaneous.
 
   python scripts/analysis/overload_sim.py [--calibrate] [--profile ...] [--out DIR]
 """
@@ -44,35 +46,74 @@ from canatune import loadgen
 from canatune.config import load_config
 from canatune.controller.router import CanaTuneRouter, RouterSettings, Ticket
 from canatune.controller.tier_controller import ControllerSettings, TierController
+from canatune.domain.calibration import ProbeSample
 from canatune.domain.groups import ClockPoint, Group, GroupState, Tier, TierState, TierTable
+from canatune.domain.priors import Priors
 from canatune.domain.risk import RiskTable
 from canatune.infrastructure.clocks import NullClockActuator
 
-KV_BYTES_PER_TOKEN = 131072
-KV_BUFFER_BYTES = 1e9
-LINK_BYTES_S = 6e9 / 8
-SEND_RETRY_S = 0.05
-P_T0_MS, P_LSTAR = 30.0, 200
-P_BETA_MS = {2520: 0.068, 1545: 0.075, 1080: 0.113}
-P_BATCH_TOKENS = 8192
-D_ITER = {2040: (55.0, 1.41), 1170: (57.0, 1.38), 735: (60.0, 2.16)}
-D_KV_TOKENS = 26000
-B_STAR = 40  # Canary's clean D concurrency for the default mix (published B*)
-D_FIRST_EXTRA_MS = 60.0
-OVERHEAD_MS = 40.0
 TTFT_SLO_MS, TPOT_SLO_MS = 1000.0, 200.0
 
-MAX = ClockPoint(2520, 2040)
+
+@dataclass(frozen=True)
+class Physics:
+    """One kind of P/D pair (what the simulated cluster really is)."""
+
+    name: str = "reference"
+    kv_bytes_per_token: float = 131072
+    kv_buffer_bytes: float = 1e9
+    link_bytes_s: float = 6e9 / 8
+    send_retry_s: float = 0.05
+    p_t0_ms: float = 30.0
+    p_lstar: int = 200
+    p_beta_top_ms: float = 0.068  # ms per token at f_eff and above
+    p_f_eff: int = 1700  # the power cap holds P near this clock
+    p_batch_tokens: int = 8192
+    d_alpha_ms: float = 55.0
+    d_delta_ms: float = 1.41
+    d_f_knee: int = 1150  # below it D iterations stretch
+    d_kv_tokens: int = 26000
+    d_first_extra_ms: float = 60.0
+    overhead_ms: float = 40.0
+    p_clocks: tuple[int, ...] = (1080, 1290, 1545, 1755, 2010, 2265, 2520)
+    d_clocks: tuple[int, ...] = (735, 960, 1170, 1395, 1605, 2040)
+    p_idle_w: float = 35.0
+    p_dyn_w: float = 290.0
+    d_idle_w: float = 16.0
+    d_dyn_w: float = 56.0
+
+    @property
+    def max_point(self) -> ClockPoint:
+        return ClockPoint(self.p_clocks[-1], self.d_clocks[-1])
+
+    def p_beta(self, f: int) -> float:
+        return self.p_beta_top_ms * self.p_f_eff / min(f, self.p_f_eff)
+
+    def prefill_ms(self, f: int, tokens: int) -> float:
+        return self.p_t0_ms + self.p_beta(f) * max(tokens, self.p_lstar)
+
+    def d_iter_ms(self, f: int, running: int) -> float:
+        stretch = max(1.0, self.d_f_knee / f)
+        return self.d_alpha_ms * stretch**0.2 + self.d_delta_ms * stretch * running
+
+    def p_power(self, f: int, util: float) -> float:
+        x = min(f, self.p_clocks[-1]) / self.p_clocks[-1]
+        return self.p_idle_w * (0.75 + 0.25 * x) + util * self.p_dyn_w * x**2.4
+
+    def d_power(self, f: int, util: float) -> float:
+        x = f / self.d_clocks[-1]
+        return self.d_idle_w * (0.75 + 0.25 * x) + util * self.d_dyn_w * x**2.0
+
+
+REFERENCE = Physics()
+MAX = REFERENCE.max_point
 H = ClockPoint(1545, 1170)
 PARK = ClockPoint(1080, 735)
+B_STAR = 40  # Canary's clean D concurrency for the default mix (published B*)
 ALPHA_TOKENS = 650.0
 LENGTHS = [(128, 64), (512, 64), (1024, 64)]  # canary.default_lengths
 # Canary single-request length table at H (r6b/r7 medians at 1545 MHz)
 LUT_H = {16: 45, 128: 52, 256: 58, 512: 75, 1024: 98, 2048: 177, 3072: 264}
-
-
-def nearest(table: dict, mhz: int):
-    return table[min(table, key=lambda f: abs(f - mhz))]
 
 
 @dataclass
@@ -89,10 +130,9 @@ class Req:
     done: float | None = None
     emitted: int = 0
     status: str = "pending"  # ok / rejected
-
-    @property
-    def kv(self) -> float:
-        return self.prompt * KV_BYTES_PER_TOKEN
+    kv: float = 0.0
+    state: tuple = ()  # (at P prompts, in-flight tokens, decoding) at dispatch
+    worker: int | None = None  # closed loop: the worker that sends the next one
 
 
 @dataclass
@@ -108,6 +148,14 @@ class Pair:
     d_running: list = field(default_factory=list)
     d_looping: bool = False
     send_retries: int = 0
+    at_p: dict = field(default_factory=dict)  # request id -> prompt (dispatch .. P done)
+    inflight_tokens: int = 0  # P done .. first token
+    decoding: int = 0
+    p_busy_s: float = 0.0
+    d_busy_s: float = 0.0
+    d_waiting_max: int = 0
+    d_running_max: int = 0
+    d_kv_max: float = 0.0
 
 
 class Sim:
@@ -118,7 +166,12 @@ class Sim:
         clocks: ClockPoint = MAX,
         capacity_rps=4.0,
         router_overrides: dict | None = None,
+        *,
+        phys: Physics = REFERENCE,
+        table: TierTable | None = None,
+        priors: Priors | None = None,
     ):
+        self.phys = phys
         self.router_overrides = router_overrides or {}
         self.now = 0.0
         self.events: list = []
@@ -128,35 +181,41 @@ class Sim:
         self.rr = itertools.cycle(self.pairs)
         self.requests: list[Req] = []
         self.timeline: list[dict] = []
+        self.energy_j = 0.0
         self.router = self.controller = None
+        self.on_done = None  # closed loop: callback(req)
+        self._last_busy = {p.name: (0.0, 0.0) for p in self.pairs}
         if policy != "baseline":
-            self._cantune(capacity_rps)
+            self._cantune(capacity_rps, table, priors)
 
     # ---- CanaTune --------------------------------------------------------------------
 
-    def _cantune(self, capacity_rps: float) -> None:
+    def _cantune(self, capacity_rps: float, table: TierTable | None, priors) -> None:
         config = load_config()
         config["router"]["admission"] = "slack"
         config["router"]["overload"] = "reject" if self.policy == "reject" else "serve"
         config["router"]["doomed"] = "dispatch" if self.policy == "serve_dispatch" else "backfill"
         config["controller"]["stagger_s"] = 0.0
+        config["kv_transfer"]["kv_buffer_bytes"] = self.phys.kv_buffer_bytes
+        config["kv_transfer"]["kv_bytes_per_token"] = self.phys.kv_bytes_per_token
         config["router"].update(self.router_overrides)
         groups = [Group(p.name, f"P{i}", f"D{i}") for i, p in enumerate(self.pairs)]
-        mean_prompt = sum(p for p, _ in LENGTHS) / len(LENGTHS)
-        table = TierTable(
-            park=PARK,
-            h=H,
-            capacity_h=capacity_rps * (mean_prompt + ALPHA_TOKENS),
-            alpha_tokens=ALPHA_TOKENS,
-            decode_max_running=B_STAR,
-            published_at=1.0,
-            evidence={"alpha_fit": {"prefill_ms_by_length": LUT_H}},
-        )
-        tiers = TierState(max_point=MAX, table=table)
+        if table is None:  # hand-set REFERENCE table (the overload study)
+            mean_prompt = sum(p for p, _ in LENGTHS) / len(LENGTHS)
+            table = TierTable(
+                park=PARK,
+                h=H,
+                capacity_h=capacity_rps * (mean_prompt + ALPHA_TOKENS),
+                alpha_tokens=ALPHA_TOKENS,
+                decode_max_running=B_STAR,
+                published_at=1.0,
+                evidence={"alpha_fit": {"prefill_ms_by_length": LUT_H}},
+            )
+        tiers = TierState(max_point=self.phys.max_point, table=table)
         risk = RiskTable.from_config(config["risk"], {"sim": True})
         clock = lambda: self.now  # noqa: E731
         self.router = CanaTuneRouter(
-            groups, risk, RouterSettings.from_config(config), tiers, clock=clock
+            groups, risk, RouterSettings.from_config(config), tiers, clock=clock, priors=priors
         )
         self.controller = TierController(
             groups,
@@ -168,8 +227,9 @@ class Sim:
             clock=clock,
         )
         self.groups = {g.name: g for g in groups}
-        for g in groups:
-            g.state, g.tier, g.effective = GroupState.ACTIVE, Tier.H, H
+        for g, p in zip(groups, self.pairs):
+            g.state, g.tier, g.effective = GroupState.ACTIVE, Tier.H, table.h
+            p.clock = table.h
 
     # ---- event loop ------------------------------------------------------------------
 
@@ -181,6 +241,9 @@ class Sim:
             self.at(
                 a.at_s, self.arrive, Req(a.index, a.at_s, a.phase, a.prompt_tokens, a.output_tokens)
             )
+        self.loop(end_s)
+
+    def loop(self, end_s: float) -> None:
         if self.controller is not None:
             self.at(0.0, self.tick)
         self.at(0.0, self.sample)
@@ -203,13 +266,25 @@ class Sim:
         row = {"t": round(self.now, 1)}
         for p in self.pairs:
             g = self.groups.get(p.name) if self.router else None
+            state = "active" if g is None else g.state.value
             row[p.name] = {
-                "state": "active" if g is None else g.state.value,
+                "state": state,
                 "tier": "max" if g is None else g.tier.value,
                 "buffer_mb": round(p.buffer / 1e6),
                 "running": len(p.d_running),
                 "p_queue": len(p.p_queue),
             }
+            # Energy of the last second: utilization at the current clocks; parked
+            # groups idle at the lowest clocks.
+            p_last, d_last = self._last_busy[p.name]
+            p_util = min(1.0, p.p_busy_s - p_last)
+            d_util = min(1.0, p.d_busy_s - d_last)
+            self._last_busy[p.name] = (p.p_busy_s, p.d_busy_s)
+            if state == "park":
+                f_p, f_d = self.phys.p_clocks[0], self.phys.d_clocks[0]
+            else:
+                f_p, f_d = p.clock.prefill_mhz, p.clock.decode_mhz
+            self.energy_j += self.phys.p_power(f_p, p_util) + self.phys.d_power(f_d, d_util)
         if self.router is not None:
             row["holding"] = len(self.router._holding)
         self.timeline.append(row)
@@ -218,6 +293,7 @@ class Sim:
     # ---- admission -------------------------------------------------------------------
 
     def arrive(self, r: Req) -> None:
+        r.kv = r.prompt * self.phys.kv_bytes_per_token
         self.requests.append(r)
         if self.router is None:
             self.dispatch(r, next(self.rr))
@@ -237,7 +313,9 @@ class Sim:
 
     def dispatch(self, r: Req, pair: Pair) -> None:
         r.pair = pair
-        self.at(self.now + OVERHEAD_MS / 1000.0, self.p_enqueue, r)
+        r.state = (tuple(pair.at_p.values()), pair.inflight_tokens, pair.decoding)
+        pair.at_p[r.id] = r.prompt
+        self.at(self.now + self.phys.overhead_ms / 1000.0, self.p_enqueue, r)
 
     # ---- P ---------------------------------------------------------------------------
 
@@ -249,34 +327,36 @@ class Sim:
         if pair.p_busy or pair.unsent or not pair.p_queue:
             return
         batch, tokens = [], 0
-        while pair.p_queue and (not batch or tokens + pair.p_queue[0].prompt <= P_BATCH_TOKENS):
+        limit = self.phys.p_batch_tokens
+        while pair.p_queue and (not batch or tokens + pair.p_queue[0].prompt <= limit):
             r = pair.p_queue.popleft()
             batch.append(r)
             tokens += r.prompt
-        beta = nearest(P_BETA_MS, pair.clock.prefill_mhz)
         pair.p_busy = True
-        self.at(
-            self.now + (P_T0_MS + beta * max(tokens, P_LSTAR)) / 1000.0, self.p_done, pair, batch
-        )
+        dur = self.phys.prefill_ms(pair.clock.prefill_mhz, tokens) / 1000.0
+        pair.p_busy_s += dur
+        self.at(self.now + dur, self.p_done, pair, batch)
 
     def p_done(self, pair: Pair, batch: list) -> None:
         pair.p_busy = False
         pair.unsent.extend(batch)
         for r in batch:
+            pair.at_p.pop(r.id, None)
+            pair.inflight_tokens += r.prompt
             if r.ticket is not None:
                 self.router.prefill_done(r.ticket)
         self.send(pair)
 
     def send(self, pair: Pair) -> None:
-        while pair.unsent and pair.buffer + pair.unsent[0].kv <= KV_BUFFER_BYTES:
+        while pair.unsent and pair.buffer + pair.unsent[0].kv <= self.phys.kv_buffer_bytes:
             r = pair.unsent.popleft()
             pair.buffer += r.kv
             start = max(self.now, pair.link_free)
-            pair.link_free = start + r.kv / LINK_BYTES_S
+            pair.link_free = start + r.kv / self.phys.link_bytes_s
             self.at(pair.link_free, self.kv_arrived, r)
         if pair.unsent:  # buffer full: P retries the send and starts nothing else
             pair.send_retries += 1
-            self.at(self.now + SEND_RETRY_S, self.send, pair)
+            self.at(self.now + self.phys.send_retry_s, self.send, pair)
         else:
             self.p_start(pair)
 
@@ -291,32 +371,37 @@ class Sim:
     def d_iter(self, pair: Pair) -> None:
         joined = []
         used = sum(r.prompt + r.output for r in pair.d_running)
-        while (
-            pair.d_ready and used + pair.d_ready[0].prompt + pair.d_ready[0].output <= D_KV_TOKENS
-        ):
+        cap = self.phys.d_kv_tokens
+        while pair.d_ready and used + pair.d_ready[0].prompt + pair.d_ready[0].output <= cap:
             r = pair.d_ready.popleft()
             used += r.prompt + r.output
             pair.buffer -= r.kv  # pulled into D's KV cache
             joined.append(r)
         pair.d_running.extend(joined)
+        pair.d_waiting_max = max(pair.d_waiting_max, len(pair.d_ready))
+        pair.d_running_max = max(pair.d_running_max, len(pair.d_running))
+        pair.d_kv_max = max(pair.d_kv_max, used / cap)
         if not pair.d_running:
             pair.d_looping = False
             return
         if joined:
             self.send(pair)  # buffer space for P's pending sends
-        a, d = nearest(D_ITER, pair.clock.decode_mhz)
-        dur = (a + d * len(pair.d_running)) / 1000.0
+        dur = self.phys.d_iter_ms(pair.clock.decode_mhz, len(pair.d_running)) / 1000.0
+        pair.d_busy_s += dur
         self.at(self.now + dur, self.d_end, pair, joined)
 
     def d_end(self, pair: Pair, joined: list) -> None:
         for r in list(pair.d_running):
             if r in joined:
-                r.first = self.now + D_FIRST_EXTRA_MS / 1000.0
+                r.first = self.now + self.phys.d_first_extra_ms / 1000.0
+                pair.inflight_tokens -= r.prompt
+                pair.decoding += 1
                 if r.ticket is not None:
                     self.router.first_token(r.ticket)
             r.emitted += 1
             if r.emitted >= r.output:
                 pair.d_running.remove(r)
+                pair.decoding -= 1
                 r.done = max(self.now, r.first)
                 r.status = "ok"
                 if r.ticket is not None:
@@ -327,11 +412,27 @@ class Sim:
                         tpot_ms=self.tpot(r),
                         output_tokens=r.output,
                     )
+                if self.on_done is not None:
+                    self.on_done(r)
         self.d_iter(pair)
 
     @staticmethod
     def tpot(r: Req) -> float | None:
         return None if r.output <= 1 else (r.done - r.first) * 1000.0 / (r.output - 1)
+
+    def probe_sample(self, r: Req) -> ProbeSample:
+        at_p, inflight, decoding = r.state
+        ttft = None if r.first is None else (r.first - r.at) * 1000.0
+        return ProbeSample(
+            r.pair.clock.prefill_mhz,
+            r.pair.clock.decode_mhz,
+            r.prompt,
+            at_p,
+            inflight,
+            decoding,
+            ttft,
+            None if r.status != "ok" else violated(r),
+        )
 
 
 # ---- summaries ---------------------------------------------------------------------------
