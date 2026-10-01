@@ -313,6 +313,20 @@ def test_plan_scales_up_at_once_and_down_only_after_the_dwell() -> None:
     assert tiers.working != working or any(g.state is GroupState.DRAINING for g in groups)
 
 
+def test_static_comparison_keeps_every_group_at_h_without_a_solver() -> None:
+    clock, _, groups, _, router, controller, _ = setup()
+    controller.settings = dataclasses.replace(controller.settings, solver=False)
+    asyncio.run(controller.start())
+    groups[0].state = GroupState.ACTIVE
+    asyncio.run(controller.publish(published(model=True), "test"))
+    assert controller.solver() is None
+    for _ in range(4):
+        clock.now += 31
+        asyncio.run(controller.tick())
+    assert controller.plan is None
+    assert all(g.state is GroupState.ACTIVE and g.tier is Tier.H for g in groups)
+
+
 def test_pressure_with_nothing_parked_aborts_canary() -> None:
     clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups[1:])

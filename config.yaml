@@ -137,6 +137,7 @@ controller:
   min_active_groups: 1
   stagger_s: 2.0              # groups move to a new tier one at a time
   energy_log_period_s: 5
+  solver: true                # false: every group at the Canary's H (static comparison)
 
 # Online risk table R(clock point, N_await, L_in, D busy) (design v2 section 4.1).
 # Starts empty on a new cluster; production runs at MAX and admits everything

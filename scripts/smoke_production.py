@@ -7,6 +7,11 @@ admission, consolidation (drain + park), waking, boosting to MAX and back, and a
 Canary recheck aborted under pressure all run on real GPUs. The trace is saved
 (trace.json) for the baseline.
 
+SMOKE_MODE=static: the same trace (SMOKE_TRACE) through the `cantune` policy with
+controller.solver false, starting from the tier table the cantune run published
+(CANATUNE_TIER_TABLE, a copy): no new calibration, every group at the Canary's H,
+only the pressure path (wake, boost to MAX). The solver's comparison.
+
 SMOKE_MODE=baseline: the same trace (SMOKE_TRACE) through the `round_robin`
 policy with clocks left to the driver (the default deployment), for the energy
 comparison. Configure every pair as a production pair for this run.
@@ -17,11 +22,11 @@ so the agents run; the baseline never locks a clock).
 
 Environment: everything `canatune.controller.process_controller` needs, plus
   SMOKE_OUT          directory for the results (required)
-  SMOKE_MODE         cantune | baseline
+  SMOKE_MODE         cantune | static | baseline
   SMOKE_DEADLINE_S   cantune: seconds to wait for the publish (default 3000)
   SMOKE_PROFILE      load profile, name:seconds:load[:action],... (default: loadgen's)
   SMOKE_SEED         trace seed (default 20261001)
-  SMOKE_TRACE        baseline: trace.json written by the cantune run (required)
+  SMOKE_TRACE        static, baseline: trace.json written by the cantune run (required)
 
 Exit status: 0 done, 2 no table before the deadline, 3 the service stopped early,
 4 the service never became ready, 5 calibration kept failing, 6 the load run failed.
@@ -130,7 +135,7 @@ def warm_pairs(client: httpx.Client, config: dict, endpoints: dict, model: str) 
 def wait_ready(client: httpx.Client, base: str, mode: str, controller) -> int | None:
     """-> None when ready, else an exit status."""
     started = time.monotonic()
-    path = "/canatune/state" if mode == "cantune" else "/health"
+    path = "/canatune/state" if mode != "baseline" else "/health"
     while time.monotonic() - started < READY_TIMEOUT_S:
         if controller.poll() is not None:
             log(f"service stopped early ({controller.returncode})")
@@ -262,12 +267,14 @@ def main() -> int:
     out = Path(os.environ["SMOKE_OUT"])
     out.mkdir(parents=True, exist_ok=True)
     mode = os.environ.get("SMOKE_MODE", "cantune")
-    if mode not in ("cantune", "baseline"):
-        raise SystemExit("SMOKE_MODE must be cantune or baseline")
+    if mode not in ("cantune", "static", "baseline"):
+        raise SystemExit("SMOKE_MODE must be cantune, static or baseline")
     config = load_config(os.environ["CANATUNE_CONFIG"])
     policy = config["routing"]["policy"]
-    if (mode == "cantune") != (policy == "cantune"):
+    if (mode != "baseline") != (policy == "cantune"):
         raise SystemExit(f"SMOKE_MODE={mode} does not match routing.policy={policy}")
+    if (mode == "static") == bool(config["controller"].get("solver", True)):
+        raise SystemExit(f"SMOKE_MODE={mode} needs controller.solver {mode != 'static'}")
     proxy = config["proxy"]
     host = "127.0.0.1" if proxy["host"] == "0.0.0.0" else proxy["host"]
     base = f"http://{host}:{proxy['port']}"
@@ -314,6 +321,15 @@ def main() -> int:
                     for k in ("h", "park", "l", "capacity_h", "alpha_tokens", "decode_max_running")
                 }
                 loadgen.save_trace(out / "trace.json", meta, arrivals)
+            elif mode == "static":
+                # The stored table is loaded at start: no calibration to wait for.
+                failed, table = wait_publish(client, base, controller, 60.0)
+                if failed is not None:
+                    log("the stored tier table was not loaded")
+                    status = failed
+                    return status
+                summary["reached_h"] = wait_h(client, base, table)
+                meta, arrivals = loadgen.load_trace(os.environ["SMOKE_TRACE"])
             else:
                 meta, arrivals = loadgen.load_trace(os.environ["SMOKE_TRACE"])
                 # Driver-managed clocks: never inherit locks from an earlier run.
@@ -335,8 +351,8 @@ def main() -> int:
                     model=model,
                     out_dir=out / "load",
                     agents=agents,
-                    state_poll=mode == "cantune",
-                    actions=mode == "cantune",
+                    state_poll=mode != "baseline",
+                    actions=mode != "baseline",
                 ).run()
             )
             status = 0
@@ -348,7 +364,7 @@ def main() -> int:
                 tpot_slo_ms=float(slo["tpot_ms"]),
                 gpu_names=gpu_names,
             )
-            if mode == "cantune":
+            if mode != "baseline":
                 result.update(event_checks(record_dir, run, meta))
             (out / "load_summary.json").write_text(json.dumps(result, indent=2) + "\n")
             for name, phase in result["phases"].items():

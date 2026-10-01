@@ -108,7 +108,7 @@ class CanaryScheduler:
         table = self.controller.tiers.table
         if table is None:
             return "full", "cold_start"
-        if self.controller.tiers.model_json() is None:
+        if self.controller.settings.solver and self.controller.tiers.model_json() is None:
             return "full", "no_model"
         if self._reference is not None and not self.lengths.using_default:
             if self.lengths.summary().shifted(self._reference, self.s.length_shift):
@@ -152,9 +152,7 @@ class CanaryScheduler:
         ]
         if not others:
             return False, "no_other_active_group"
-        if self.controller.tiers.model_json() is not None and not self.controller.can_carry(
-            len(others), now
-        ):
+        if self.controller.solver() is not None and not self.controller.can_carry(len(others), now):
             return False, "others_cannot_carry"
         return True, "ok"
 

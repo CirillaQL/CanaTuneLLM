@@ -55,6 +55,7 @@ class ControllerSettings:
     burst_window_s: float = 120.0
     burst_bucket_s: float = 10.0
     switch_gain: float = 0.02  # = canary.locator.eps (measurement noise band)
+    solver: bool = True  # False: every group stays at the Canary's H (static comparison)
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControllerSettings":
@@ -73,6 +74,7 @@ class ControllerSettings:
             ),
             stagger_s=float(raw.get("stagger_s", 2.0)),
             energy_log_period_s=float(raw.get("energy_log_period_s", 5.0)),
+            solver=bool(raw.get("solver", True)),
         )
 
 
@@ -209,7 +211,7 @@ class TierController:
     def solver(self) -> Solver | None:
         """Solver over the published cluster model (rebuilt when a table is published
         or the Canary's verification capped a point)."""
-        raw = self.tiers.model_json()
+        raw = self.tiers.model_json() if self.settings.solver else None
         key = None if raw is None else (self.tiers.table.published_at, str(raw.get("caps")))
         if key != self._solver_key:
             self._solver_key = key
