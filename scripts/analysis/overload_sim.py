@@ -129,6 +129,7 @@ class Req:
     first: float | None = None
     done: float | None = None
     emitted: int = 0
+    last_token: float | None = None  # time of the last emitted token
     status: str = "pending"  # ok / rejected
     kv: float = 0.0
     state: tuple = ()  # (at P prompts, in-flight tokens, decoding) at dispatch
@@ -195,7 +196,9 @@ class Sim:
     def _cantune(self, table: TierTable) -> None:
         config = load_config()
         config["router"]["admission"] = "slack"
-        config["router"]["overload"] = "reject" if self.policy == "reject" else "serve"
+        config["router"]["overload"] = {"reject": "reject", "best_effort": "best_effort"}.get(
+            self.policy, "serve"
+        )
         config["router"]["doomed"] = "dispatch" if self.policy == "serve_dispatch" else "backfill"
         config["controller"]["stagger_s"] = 0.0
         config["kv_transfer"]["kv_buffer_bytes"] = self.phys.kv_buffer_bytes
@@ -391,6 +394,10 @@ class Sim:
                 pair.decoding += 1
                 if r.ticket is not None:
                     self.router.first_token(r.ticket)
+            elif r.ticket is not None and r.last_token is not None:
+                # As the proxy does per streamed chunk: the latest token spacing.
+                self.router.token_progress(r.ticket, (self.now - r.last_token) * 1000.0)
+            r.last_token = self.now
             r.emitted += 1
             if r.emitted >= r.output:
                 pair.d_running.remove(r)

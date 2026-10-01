@@ -653,12 +653,8 @@ def test_best_effort_signals_before_wait_budget_and_serves_late_requests():
     for g in groups:
         g.pending_ms = 4000
     waiter = router.new_waiter()
-    assert router.step(waiter, 128, True, 0) == "wait"
+    ticket = router.step(waiter, 128, True, 0)
     assert router.pressure_event.is_set() and router.risk_signals == 1
-    assert router.step(waiter, 128, True, 20) == "wait"
-    assert router.risk_signals == 1
-    router.full_effort = True
-    ticket = router.step(waiter, 128, True, 1500)
     assert ticket.overflow == "best_effort"
     assert router.rejections == 0
 
@@ -685,8 +681,11 @@ def test_full_effort_wakes_all_and_prevents_energy_plans_until_calm():
         table=published(model=True), admission="slack", overload="best_effort"
     )
     activate(groups[:1])
-    router.signal_pressure("test")
+    controller.settings = dataclasses.replace(controller.settings, confirm_s=0)
+    ticket = router.try_admit(128, True)
+    ticket.admitted_at -= 3  # unfinished production request, severe measured TTFT
     asyncio.run(controller.tick())
+    router.finish(ticket, status="error", ttft_ms=None, tpot_ms=None, output_tokens=0)
     assert router.full_effort
     assert all(g.routable and g.tier is Tier.MAX for g in groups)
     clock.now += 5
@@ -710,12 +709,12 @@ def test_router_pressure_wakes_controller_before_period():
         await asyncio.sleep(0.01)
         router.signal_pressure("test")
         for _ in range(50):
-            if router.full_effort:
+            if controller.mode == "warning":
                 break
             await asyncio.sleep(0.01)
         stop.set()
         await asyncio.wait_for(task, 1)
-        assert router.full_effort
+        assert controller.mode == "warning" and not router.full_effort
     asyncio.run(run())
 
 
@@ -729,7 +728,7 @@ def test_best_effort_service_timeout_is_enforced_even_when_capacity_frees():
     assert router.admitted == 0 and router.state()["queued"] == 0
 
 
-def test_decode_tpot_risk_triggers_full_effort_but_is_not_a_hard_wall():
+def test_decode_tpot_prediction_warns_but_is_not_a_hard_wall():
     table = published(model=True)
     table.evidence["model"]["decode"] = {"1500": [250, 0]}
     _, _, groups, _, router, _, _ = setup(
@@ -737,10 +736,8 @@ def test_decode_tpot_risk_triggers_full_effort_but_is_not_a_hard_wall():
     )
     activate(groups)
     waiter = router.new_waiter()
-    assert router.step(waiter, 128, True, 0) == "wait"
-    assert router.risk_signals == 1
-    router.full_effort = True
-    assert router.step(waiter, 128, True, 20).overflow == "best_effort"
+    assert router.step(waiter, 128, True, 0).overflow == "best_effort"
+    assert router.risk_signals == 1 and not router.full_effort
 
 
 def test_cold_full_effort_returns_to_calibration_after_idle_cooldown():
@@ -748,10 +745,327 @@ def test_cold_full_effort_returns_to_calibration_after_idle_cooldown():
         table=None, admission="slack", overload="best_effort"
     )
     activate(groups)
-    router.signal_pressure("test")
+    controller.settings = dataclasses.replace(controller.settings, confirm_s=0)
+    ticket = router.try_admit(128, True)
+    ticket.admitted_at -= 3  # unfinished production request, severe measured TTFT
     asyncio.run(controller.tick())
+    router.finish(ticket, status="error", ttft_ms=None, tpot_ms=None, output_tokens=0)
     assert router.full_effort
     clock.now += controller.settings.t_down_s + 1
     asyncio.run(controller.tick())
     assert not router.full_effort
     assert all(g.tier is Tier.MAX for g in groups)
+
+
+def record_production(router, ttft=950, tpot=100, count=5, tokens=128):
+    for _ in range(count):
+        ticket = router.try_admit(tokens, True, best_effort=True)
+        assert ticket is not None
+        router.finish(ticket, status="ok", ttft_ms=ttft, tpot_ms=tpot, output_tokens=64)
+
+
+def test_prediction_alone_warns_without_expansion_or_max():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])
+    groups[1].pending_ms = 4000
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    router.finish(ticket, status="ok", ttft_ms=100, tpot_ms=60, output_tokens=64)
+    asyncio.run(controller.tick())
+    clock.now += 5
+    asyncio.run(controller.tick())
+    assert controller.mode == "warning" and not router.full_effort
+    assert len([g for g in groups if g.routable]) == 1
+    assert groups[1].tier is Tier.H
+
+
+def test_production_confirmation_expands_then_persistent_pressure_enters_max():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])
+    router.signal_pressure("prediction")
+    record_production(router)
+    asyncio.run(controller.tick())
+    assert controller.mode == "confirming" and not router.full_effort
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+    assert controller.mode == "expanding" and not router.full_effort
+    assert sum(g.routable for g in groups) == 2
+    assert all(g.tier is Tier.H for g in groups if g.routable)
+    # Old pre-expansion samples alone cannot trigger MAX, even after the grace period.
+    clock.now += controller.settings.expansion_grace_s
+    asyncio.run(controller.tick())
+    assert not router.full_effort
+    record_production(router)
+    asyncio.run(controller.tick())
+    clock.now += controller.settings.expansion_grace_s
+    asyncio.run(controller.tick())
+    assert controller.mode == "full_effort" and router.full_effort
+    assert all(g.routable and g.tier is Tier.MAX for g in groups)
+
+
+def test_static_expands_using_measured_equivalent_token_capacity():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(capacity_h=1000), admission="slack", overload="best_effort"
+    )
+    controller.settings = dataclasses.replace(controller.settings, solver=False)
+    activate(groups[1:2])
+    for _ in range(3):
+        router.new_waiter()  # 3 req/s; C_H/(512+460) = 1.029 req/s/group
+    record_production(router, tokens=512)
+    asyncio.run(controller.tick())
+    clock.now += controller.settings.confirm_s
+    for _ in range(3):
+        router.new_waiter()
+    asyncio.run(controller.tick())
+    assert controller.mode == "expanding"
+    assert sum(g.routable for g in groups) == 3
+    assert not router.full_effort
+
+
+def test_one_violation_does_not_confirm_and_intrinsically_long_ttft_is_excluded():
+    table = published()
+    table.evidence["idle_ttft_ms"] = {"128": 100, "2048": 1200}
+    clock, _, groups, _, router, controller, _ = setup(
+        table=table, admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    record_production(router, ttft=1500, count=1)
+    asyncio.run(controller.tick())
+    assert controller.mode == "energy"
+    clock.now += controller.settings.feedback_window_s + 1
+    record_production(router, ttft=1500, tokens=2048)
+    clock.now += 3
+    asyncio.run(controller.tick())
+    assert controller.mode == "energy" and not router.full_effort
+
+
+def test_live_decode_stall_confirms_without_waiting_for_request_completion():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])  # the others parked: expansion has groups to wake
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    clock.now += 0.25
+    asyncio.run(controller.tick())
+    assert controller.mode == "confirming" and not ticket.finished
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+    assert controller.mode == "expanding" and not router.full_effort
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+    assert router.full_effort and not ticket.finished
+
+
+def test_confirmed_pressure_with_every_group_serving_goes_straight_to_max():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    controller.settings = dataclasses.replace(controller.settings, solver=False)
+    activate(groups)  # static: nothing parked, expansion cannot add capacity
+    record_production(router)
+    asyncio.run(controller.tick())
+    assert controller.mode == "confirming"
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+    assert controller.mode == "full_effort" and router.full_effort  # no expansion grace
+    assert all(g.tier is Tier.MAX for g in groups)
+
+
+def test_stream_feedback_counts_requests_and_cancellation_cleans_it_up():
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    for _ in range(20):
+        router.token_progress(ticket, 100)
+    assert router.production_feedback(10, 5, 0.9)["samples"] == 1
+    router.finish(ticket, status="client_disconnected", ttft_ms=None, tpot_ms=None, output_tokens=0)
+    assert not router._live and not router._production
+
+
+def test_solver_capacity_prediction_cannot_expand_without_production_confirmation():
+    _, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])
+    for _ in range(100):
+        router.new_waiter()
+    asyncio.run(controller.tick())
+    assert controller.mode == "warning" and not router.full_effort
+    assert sum(g.routable for g in groups) == 1
+
+
+def test_old_first_token_latency_is_not_refreshed_by_new_tokens_or_completion():
+    clock, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    router.observe_latency(ticket, 1200, 300)
+    cutoff = clock.now + 1
+    clock.now += 2
+    router.token_progress(ticket, 50)
+    router.finish(ticket, status="ok", ttft_ms=1200, tpot_ms=300, output_tokens=64)
+    feedback = router.production_feedback(10, 1, 0.9, since=cutoff)
+    assert feedback["samples"] == 1 and not feedback["pressure"]
+
+
+def test_expansion_recovers_without_max_if_fresh_feedback_is_healthy():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])
+    record_production(router)
+    asyncio.run(controller.tick())
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+    assert controller.mode == "expanding"
+    clock.now += 1
+    record_production(router, ttft=150, tpot=50)
+    asyncio.run(controller.tick())
+    clock.now += controller.settings.t_down_s
+    asyncio.run(controller.tick())
+    assert controller.mode == "energy" and not router.full_effort
+    assert all(g.tier is Tier.H for g in groups if g.routable)
+
+
+def test_severe_production_wait_must_persist_before_emergency_max():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    clock.now += 2.1
+    asyncio.run(controller.tick())
+    assert controller.mode == "confirming" and not router.full_effort
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+    assert router.full_effort
+    assert all(g.tier is Tier.MAX for g in groups)
+    router.finish(ticket, status="client_disconnected", ttft_ms=None, tpot_ms=None, output_tokens=0)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"feedback_window_s": 0}, {"feedback_window_s": float("nan")},
+    {"feedback_min_samples": 0}, {"feedback_near_slo": 1.1},
+    {"confirm_s": -1}, {"expansion_grace_s": float("inf")},
+])
+def test_invalid_feedback_settings_are_rejected(kwargs):
+    from canatune.controller.tier_controller import ControllerConfigError
+
+    with pytest.raises(ControllerConfigError):
+        ControllerSettings(**kwargs)
+
+
+def test_a_prompt_larger_than_the_kv_gate_is_admitted_on_an_empty_link() -> None:
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    router._apply_table()
+    router.kv_fraction = 0.2  # gate 0.2 GB: a 2048-token prompt (0.27 GB) exceeds it
+    big = 2048
+    assert big * router.settings.kv_bytes_per_token > 0.2 * router.settings.kv_buffer_bytes
+    assert not router._kv_blocked(groups[1], big)  # alone on an empty link
+    groups[1].inflight_bytes = 0.1e9
+    assert router._kv_blocked(groups[1], big)  # would pass the gate with others in flight
+    groups[1].inflight_bytes = 0.0
+    assert router.try_admit(big, True, 0.0, best_effort=True) is not None
+
+
+@pytest.mark.parametrize("full_effort", [False, True])
+def test_best_effort_b_star_warns_but_does_not_limit_decode_throughput(full_effort):
+    clock = FakeClock()
+    telemetry = Telemetry({}, period_s=1, client_factory=lambda: None, clock=clock)
+    _, _, groups, _, router, _, _ = setup(
+        table=published(decode_max_running=24, decode_kv_limit=0.9),
+        telemetry=telemetry, admission="slack", overload="best_effort",
+    )
+    activate(groups[1:2])
+    group = groups[1]
+    group.n_inflight = group.n_decoding = 28
+    if full_effort:
+        group.tier, group.effective = Tier.MAX, MAX
+    router.full_effort = full_effort
+    telemetry.update(group.decode, EndpointSnapshot(clock.now, 28, 4, 0.5, 0, True))
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    assert ticket.group is group and ticket.overflow == "best_effort"
+    assert group.n_inflight == 29 and router.state()["queued"] == 0
+    assert router.risk_signals == 1
+
+
+def test_prefill_reservations_are_not_counted_as_b_star_decode_sequences():
+    _, _, groups, _, router, _, _ = setup(
+        table=published(decode_max_running=24), admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])
+    group = groups[1]
+    group.n_inflight = group.n_await = group.n_at_p = 24
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    assert ticket.group is group and ticket.overflow is None
+    assert router.risk_signals == 0
+
+
+@pytest.mark.parametrize("blocked", ["kv_usage", "transfer_buffer", "stale"])
+def test_full_effort_still_enforces_kv_and_telemetry_guards(blocked):
+    clock = FakeClock()
+    telemetry = Telemetry({}, period_s=1, client_factory=lambda: None, clock=clock)
+    _, _, groups, _, router, _, _ = setup(
+        table=published(decode_max_running=24, decode_kv_limit=0.9),
+        telemetry=telemetry, admission="slack", overload="best_effort",
+    )
+    activate(groups[1:2])
+    group = groups[1]
+    router.full_effort = True
+    snapshot_at = clock.now - 5 if blocked == "stale" else clock.now
+    telemetry.update(group.decode, EndpointSnapshot(
+        snapshot_at, 28, 0, 0.95 if blocked == "kv_usage" else 0.5, 0, True,
+    ))
+    if blocked == "transfer_buffer":
+        group.inflight_bytes = 0.6e9
+    assert router.step(router.new_waiter(), 128, True, 0) == "wait"
+    assert router.admitted == 0
+
+
+def test_repeated_prediction_warnings_do_not_starve_solver_or_restart_target_hold():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    target_since = None
+    for _ in range(7):
+        router.signal_pressure("prediction_only")
+        asyncio.run(controller.tick())
+        if target_since is None:
+            target_since = controller._target_since
+        assert controller._pressure_at == float("-inf")
+        if clock.now < target_since + controller.settings.t_down_s:
+            assert controller._target_since == target_since
+        clock.now += 5
+    plans = [e for e in controller.log.recent if e.get("event") == "plan"]
+    assert plans and plans[0]["to"]["n"] == 1
+    assert not router.full_effort
+    assert sum(g.state is GroupState.PARK for g in groups) >= 1
+
+
+@pytest.mark.parametrize("mode", ["warning", "confirming"])
+def test_feedback_observation_modes_do_not_block_draining_cleanup(mode):
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    groups[2].state = GroupState.DRAINING
+    if mode == "warning":
+        router.signal_pressure("prediction")
+    else:
+        record_production(router)
+    asyncio.run(controller.tick())
+    assert controller.mode == mode
+    assert groups[2].state is GroupState.PARK and groups[2].tier is Tier.PARK

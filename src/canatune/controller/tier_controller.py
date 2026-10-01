@@ -4,9 +4,10 @@ Cold start (no tier table): every production group is active at MAX and the
 Router admits everything; the Controller does nothing else.
 
 With a table, every tick:
-* best-effort pressure: an event wakes control immediately; wake all parked groups,
-  lock MAX, cancel/join the Canary experiment and confirm vLLM idle before reuse.
-  Hold full effort until t_down_s without pressure and the working point is feasible.
+* best-effort stages: prediction warning -> persistent Production latency confirms
+  pressure -> expand at measured working capacity -> MAX/reclaim Canary only after
+  expansion fails or unfinished work is severely stalled. Recover after a quiet
+  t_down_s using actual feedback, not a model-only feasibility decision.
   Legacy overload policies retain incremental wake/abort/boost behavior.
 * plan (the Canary's cluster model, `domain.models.Solver`): from the offered
   request rate (Router arrivals over `load_window_s`; its burst factor over
@@ -27,6 +28,7 @@ With a table, every tick:
 """
 
 import asyncio
+import math
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -55,7 +57,20 @@ class ControllerSettings:
     burst_window_s: float = 120.0
     burst_bucket_s: float = 10.0
     switch_gain: float = 0.02  # = canary.locator.eps (measurement noise band)
+    feedback_window_s: float = 10.0
+    feedback_min_samples: int = 5
+    feedback_near_slo: float = 0.9
+    confirm_s: float = 2.0
+    expansion_grace_s: float = 3.0
     solver: bool = True  # False: every group stays at the Canary's H (static comparison)
+
+    def __post_init__(self) -> None:
+        durations = (self.feedback_window_s, self.confirm_s, self.expansion_grace_s)
+        if (not all(math.isfinite(v) for v in durations)
+                or self.feedback_window_s <= 0 or self.feedback_min_samples < 1
+                or not 0 < self.feedback_near_slo <= 1
+                or self.confirm_s < 0 or self.expansion_grace_s < 0):
+            raise ControllerConfigError("invalid production feedback settings")
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControllerSettings":
@@ -75,6 +90,11 @@ class ControllerSettings:
             stagger_s=float(raw.get("stagger_s", 2.0)),
             energy_log_period_s=float(raw.get("energy_log_period_s", 5.0)),
             solver=bool(raw.get("solver", True)),
+            feedback_window_s=float(raw.get("feedback_window_s", 10)),
+            feedback_min_samples=int(raw.get("feedback_min_samples", 5)),
+            feedback_near_slo=float(raw.get("feedback_near_slo", 0.9)),
+            confirm_s=float(raw.get("confirm_s", 2)),
+            expansion_grace_s=float(raw.get("expansion_grace_s", 3)),
         )
 
 
@@ -120,6 +140,13 @@ class TierController:
         self._full_effort = False
         self._control_lock = asyncio.Lock()
         self._switch_s = 0.0
+        self.mode = "energy"
+        self._warning_seen = 0
+        self._warning_at = float("-inf")
+        self._confirm_since: float | None = None
+        self._severe_since: float | None = None
+        self._expanded_at: float | None = None
+        self.feedback: dict[str, Any] = {}
 
     # ---- actuation ---------------------------------------------------------------
 
@@ -286,35 +313,14 @@ class TierController:
     async def _tick(self) -> None:
         now = self._clock()
         if self.router.settings.overload == "best_effort":
-            new_pressure = self.router.pressure != self._rejections_seen
-            self._rejections_seen = self.router.pressure
-            pressure = new_pressure or self.router.state()["queued"]
-            if pressure:
-                self._pressure_at = now
-                await self._enter_full_effort("slo_risk_or_capacity")
-            if self._full_effort:
-                if not pressure:
-                    await self._enter_full_effort("recovery")
-                await self._log_energy(now)
-                await self._retry_locks(now)
-                if any(g.state is GroupState.EXPLORING for g in self.groups):
-                    return  # retain full effort until experiment reclaim succeeds
-                if now - self._pressure_at < self.settings.t_down_s:
-                    return  # energy plans cannot override pressure recovery
-                solver = self.solver()
-                rate, _, mix = self.demand(now)
-                if solver is not None and mix and not solver.evaluate(
-                    rate, mix, len(self.groups), self.tiers.clocks(Tier.H)
-                ).feasible:
-                    return
-                if self.tiers.table is None and any(g.n_inflight for g in self.groups):
-                    return  # resume cold calibration only once production drains
-                self._full_effort = self.router.full_effort = False
-                self._target = self._target_since = None
-                self.log.write({"event": "control_mode", "mode": "energy"})
-                for group in self.groups:
-                    if group.state is GroupState.ACTIVE and self.tiers.table is not None:
-                        await self.set_tier(group, Tier.H, "recovered")
+            await self._feedback_control(now)
+            await self._log_energy(now)
+            await self._retry_locks(now)
+            if self.tiers.table is not None:
+                if self.mode in ("energy", "warning", "confirming"):
+                    await self._plan(now)  # observe targets even while latency is confirming
+                await self._finish_draining()  # lifecycle cleanup never waits for energy mode
+            return
         await self._log_energy(now)
         await self._retry_locks(now)  # also on a cold start: a group locked to MAX
         table = self.tiers.table
@@ -339,7 +345,119 @@ class TierController:
         await self._plan(now)
         await self._finish_draining()
 
+    def _mode(self, mode: str, reason: str) -> None:
+        if self.mode != mode:
+            previous = self.mode
+            self.mode = mode
+            if mode in ("expanding", "full_effort") or previous in ("expanding", "full_effort"):
+                self._target = self._target_since = None  # resources changed, target must re-settle
+            self.log.write({"event": "control_mode", "mode": mode, "reason": reason})
+
+    async def _feedback_control(self, now: float) -> None:
+        s = self.settings
+        warning = self.router.risk_signals != self._warning_seen
+        self._warning_seen = self.router.risk_signals
+        if warning:
+            self._warning_at = now
+            if self.mode == "energy":
+                self._mode("warning", "prediction")
+        since = self._expanded_at if self.mode == "expanding" else None
+        f = self.feedback = self.router.production_feedback(
+            s.feedback_window_s, s.feedback_min_samples, s.feedback_near_slo,
+            since=float("-inf") if since is None else since,
+        )
+        if f["pressure"]:
+            self._pressure_at = now
+            if self._confirm_since is None:
+                self._confirm_since = now
+            if self.mode in ("energy", "warning"):
+                self._mode("confirming", "production_latency")
+        else:
+            self._confirm_since = None
+        if f["severe"]:
+            if self._severe_since is None:
+                self._severe_since = now
+        else:
+            self._severe_since = None
+        confirmed = self._confirm_since is not None and now - self._confirm_since >= s.confirm_s
+        emergency = self._severe_since is not None and now - self._severe_since >= s.confirm_s
+        if self._full_effort:
+            await self._enter_full_effort("reclaim_retry")
+            if f["pressure"] or now - self._pressure_at < s.t_down_s:
+                return
+            if any(g.state is GroupState.EXPLORING for g in self.groups):
+                return
+            if self.tiers.table is None and any(g.n_inflight for g in self.groups):
+                return
+            self._full_effort = self.router.full_effort = False
+            self._expanded_at = None
+            for group in self.groups:
+                if group.state is GroupState.ACTIVE and self.tiers.table is not None:
+                    await self.set_tier(group, Tier.H, "recovered")
+            self._mode("energy", "production_recovered")
+            return
+        if emergency:
+            await self._enter_full_effort("severe_production_backlog")
+            return
+        if self.mode == "expanding":
+            assert self._expanded_at is not None
+            if now - self._expanded_at < s.expansion_grace_s:
+                return
+            if confirmed:
+                await self._enter_full_effort("expansion_insufficient")
+                return
+        elif confirmed:
+            if not any(
+                g.state not in (GroupState.ACTIVE, GroupState.EXPLORING) for g in self.groups
+            ):
+                # Every group already serves: expansion cannot add capacity, waiting
+                # out its grace only delays MAX.
+                await self._enter_full_effort("nothing_to_expand")
+                return
+            self._mode("expanding", "production_confirmed")
+            await self._expand_capacity(now)
+            self._expanded_at = self._clock()  # grace starts after locks finish
+            self._confirm_since = None
+            return
+        quiet_after = (max(self._pressure_at, self._warning_at)
+                       if self.mode in ("warning", "confirming") else self._pressure_at)
+        if not f["pressure"] and now - quiet_after >= s.t_down_s:
+            self._expanded_at = None
+            self._mode("energy", "production_recovered")
+
+    async def _expand_capacity(self, now: float) -> None:
+        """Wake enough groups at the measured working point; static uses C_H."""
+        active = [g for g in self.groups if g.routable]
+        rate, _, mix = self.demand(now)
+        solver = self.solver()
+        capacity = 0.0
+        if solver is not None and mix:
+            capacity = solver.capacity(mix, self.tiers.clocks(Tier.H))
+        elif self.tiers.table is not None and mix:
+            mean = sum(p for p, _ in mix) / len(mix)
+            capacity = self.tiers.table.capacity_h / (mean + self.tiers.alpha_tokens)
+        available = sorted(
+            (g for g in self.groups if g.state is not GroupState.EXPLORING),
+            key=lambda g: g.canary,
+        )
+        needed = math.ceil(rate / capacity) if capacity > 0 else len(active) + 1
+        needed = min(len(available), max(len(active) + 1, needed))
+        self.log.write({"event": "capacity_expand", "rate_rps": rate,
+                        "capacity_rps": capacity, "target_groups": needed})
+        for group in available:
+            if len(active) >= needed:
+                break
+            if group not in active:
+                group.state = GroupState.ACTIVE
+                await self.set_tier(
+                    group, Tier.H if self.tiers.table is not None else Tier.MAX,
+                    "production_capacity",
+                )
+                if group.routable:
+                    active.append(group)
+
     async def _enter_full_effort(self, reason: str) -> None:
+        self._mode("full_effort", reason)
         if not self._full_effort:
             self._full_effort = self.router.full_effort = True
             self._target = self._target_since = None
@@ -434,10 +552,16 @@ class TierController:
             (current.power_w - target.power_w) * s.t_down_s
             > 2 * self._switch_s * max(current.power_w, target.power_w)
         )
-        if not target.feasible and self.router.settings.overload == "best_effort":
-            self._pressure_at = now
-            await self._enter_full_effort("model_capacity")
-            return
+        if self.router.settings.overload == "best_effort" and (
+            not target.feasible or up or target.n > len(routable)
+            or target.point.prefill_mhz > point.prefill_mhz
+            or target.point.decode_mhz > point.decode_mhz
+        ):
+            if self.mode == "energy":
+                self.router.signal_pressure("model_capacity_warning")
+                self._warning_at = now
+                self._mode("warning", "model_capacity")
+            return  # model-only pressure never expands or enters MAX
         if key == (len(routable), point):
             return
         if not (up or (held and calm and gain)):
@@ -533,7 +657,8 @@ class TierController:
     def state(self) -> dict[str, Any]:
         table = self.tiers.table
         return {
-            "mode": "full_effort" if self._full_effort else "energy",
+            "mode": self.mode,
+            "production_feedback": dict(self.feedback),
             "tiers": None if table is None else table.to_json(),
             "max_point": self.tiers.max_point.key(),
             "loads": self.loads(self._clock()),

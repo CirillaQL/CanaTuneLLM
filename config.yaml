@@ -108,8 +108,8 @@ router:
   # in flight, requests decoding) and admit when the predicted-slack bucket's risk
   # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy).
   admission: slack
-  # SLO risk immediately signals the Controller to wake all groups, reclaim Canary
-  # and lock MAX. Then dispatch FIFO as capacity becomes available, even if late.
+  # Prediction warns; actual production latency confirms pressure. Expand using
+  # measured capacity, then reclaim Canary/lock MAX only if pressure persists.
   # Physical D/KV limits remain enforced; hold_max_ms is the service wait timeout.
   # Legacy experiment policies: reject or serve (rescue/backfill).
   overload: best_effort
@@ -134,6 +134,11 @@ controller:
   stagger_s: 2.0              # groups move to a new tier one at a time
   energy_log_period_s: 5
   solver: true                # false: every group at the Canary's H (static comparison)
+  feedback_window_s: 10       # recent actual TTFT/TPOT, one sample per request
+  feedback_min_samples: 5    # completed/streaming samples before latency confirmation
+  feedback_near_slo: 0.9      # approaching SLO counts as production pressure
+  confirm_s: 2                # pressure must persist; severe unfinished waits also use this
+  expansion_grace_s: 3        # observe production after expansion before considering MAX
 
 # Online risk table R(clock point, N_await, L_in, D busy) (design v2 section 4.1).
 # Starts empty on a new cluster; production runs at MAX and admits everything

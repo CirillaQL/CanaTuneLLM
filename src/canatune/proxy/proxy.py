@@ -451,8 +451,17 @@ def create_proxy_router(
                         status = "client_disconnected"
                         try:
                             async for chunk in decode_response.aiter_raw():
-                                if timer.feed(chunk) and ticket is not None:
+                                new_tokens = timer.feed(chunk)
+                                if new_tokens and ticket is not None:
                                     runtime.router.first_token(ticket)
+                                    times = timer.token_times
+                                    # Recent spacing responds to changed clocks/load;
+                                    # a whole-request average retains pre-expansion delays.
+                                    recent_tpot = (
+                                        (times[-1] - times[-new_tokens - 1]) * 1000 / new_tokens
+                                        if len(times) > new_tokens else None
+                                    )
+                                    runtime.router.token_progress(ticket, recent_tpot)
                                 yield chunk
                             status = "ok"
                         except httpx.HTTPError:

@@ -131,8 +131,8 @@ class CanaryScheduler:
         return None
 
     def may_start(self) -> tuple[bool, str]:
-        if self.controller.router.full_effort:
-            return False, "full_effort"
+        if self.controller.mode != "energy":
+            return False, self.controller.mode
         if self.canary is not None and self.canary.state is GroupState.EXPLORING:
             # Cold start deliberately claims the Canary before its first run.
             if self.task is not None:

@@ -4,7 +4,7 @@ Cold start (no tier table published): every request is admitted and spread to
 the least-loaded active group; all production groups run at MAX meanwhile.
 
 With a published table, for each routable group the Router checks
-* hard limits: D concurrency below B*, D KV usage below the Canary's limit, and
+* hard guards: fresh D telemetry, D KV usage below the Canary's limit, and
   (admission `slack`) the KV bytes in flight to its D below a fraction of the
   connector's receive buffer (the gate the Canary measured; overflowing that
   buffer stalls P and can crash D),
@@ -13,9 +13,13 @@ With a published table, for each routable group the Router checks
   violation risk of that predicted slack; `cells` (v1) looks up the risk table
   cell (clock point, queue, prompt bucket, D busy),
 and admits to the most loaded feasible group (concentration keeps batches large).
-With `best_effort` (default), an unsafe request signals pressure immediately.
-The Controller wakes all groups, reclaims Canary and locks MAX. Waiting requests
-then dispatch FIFO when a hard-limit-safe group becomes available, even if late.
+B* is a clean-window SLO bound, not a hardware concurrency limit: best-effort
+uses it only to warn, counting D work rather than requests still pre-filling.
+Legacy reject/serve policies retain their original calibrated admission ceiling.
+With `best_effort` (default), prediction warns but does not force a clock change.
+Actual production feedback confirms pressure, measured capacity guides expansion,
+and only persistent/severe pressure reclaims Canary and locks MAX. Requests
+dispatch FIFO whenever physical capacity is free, even if predicted unsafe or late.
 Only the service wait timeout (`hold_max_ms`) rejects them. Physical KV and
 concurrency limits remain enforced. Legacy `reject` and `serve` policies remain
 available for comparisons; `serve` uses rescue and deadline/backfill priority.
@@ -171,6 +175,7 @@ class Ticket:
     clock_epoch: int
     snapshot: dict[str, Any] = field(default_factory=dict)
     first_token_at: float | None = None
+    last_token_at: float | None = None
     finished: bool = False
     stage: str = "prefill"  # prefill -> transfer (P returned) -> decode (first token)
     s_own_ms: float = 0.0
@@ -234,6 +239,10 @@ class CanaTuneRouter:
         self.risk_signals = 0
         self._signalled: set[int] = set()
         self._queue: deque[int] = deque()
+        self._waiting_since: dict[int, float] = {}
+        self._live: dict[int, Ticket] = {}
+        # One sample per request: live stream updates replace rather than multiply it.
+        self._production: dict[int, tuple[float, float, float, float]] = {}
 
     def signal_pressure(self, reason: str) -> None:
         """Wake control immediately; this signal never changes GPU clocks here."""
@@ -309,11 +318,15 @@ class CanaTuneRouter:
         return x, self.predictor.predict(x)
 
     def _kv_blocked(self, group: Group, tokens: int = 0) -> bool:
+        """KV in flight would pass the gate. A request alone on an empty link is
+        never blocked: the gate is a measured congestion knee, not a size limit,
+        and a prompt larger than it would otherwise wait until the timeout."""
         s = self.settings
-        return (
-            group.inflight_bytes + tokens * s.kv_bytes_per_token
-            > self.kv_fraction * s.kv_buffer_bytes
-            or group.inflight_bytes >= self.kv_fraction * s.kv_buffer_bytes
+        gate = self.kv_fraction * s.kv_buffer_bytes
+        if group.inflight_bytes >= gate:
+            return True
+        return group.inflight_bytes > 0 and (
+            group.inflight_bytes + tokens * s.kv_bytes_per_token > gate
         )
 
     # ---- state ---------------------------------------------------------------------
@@ -332,8 +345,10 @@ class CanaTuneRouter:
             kv = snapshot.kv_usage
         busy = max(running, decoding) >= self.settings.d_busy_min_running
         table = self.tiers.table
-        if table is not None and table.decode_max_running is not None:
-            # Every admitted request of this group ends up decoding on its D.
+        if (table is not None and table.decode_max_running is not None
+                and self.settings.overload != "best_effort"):
+            # Legacy policies retain the calibrated admission ceiling. In best
+            # effort B* is an SLO warning, not the hardware's concurrency limit.
             if max(running + waiting, group.n_inflight) + 1 > table.decode_max_running:
                 return busy, "decode_concurrency_wall"
         if table is not None and table.decode_kv_limit is not None and kv is not None:
@@ -369,6 +384,18 @@ class CanaTuneRouter:
             if self._kv_blocked(group, tokens) and self.settings.admission == "slack":
                 continue
             self._within_limits.append((group, cell, d_busy))
+            tier_table = self.tiers.table
+            if (self.settings.overload == "best_effort" and tier_table is not None
+                    and tier_table.decode_max_running is not None):
+                # P requests are not running D sequences. Telemetry covers D's
+                # own queue; stage reservations cover unobserved running work.
+                snapshot = (self.telemetry.fresh(group.decode, self.settings.snapshot_max_age_s)
+                            if self.telemetry is not None else None)
+                d_load = max(group.n_decoding, (snapshot.running or 0) + (snapshot.waiting or 0)
+                             if snapshot is not None else 0)
+                if d_load + 1 > tier_table.decode_max_running:
+                    self._slack_by_group[group.name] = (x, predicted, None)
+                    continue  # warn, but remains eligible for best-effort dispatch
             model = self.tiers.model_json()
             if model and self.settings.overload == "best_effort":
                 decode = model.get("decode") or {}
@@ -501,6 +528,8 @@ class CanaTuneRouter:
         group.n_inflight += 1
         group.record_admission(now, tokens, self.settings.load_window_s)
         self.admitted += 1
+        if self.settings.overload == "best_effort":
+            self._live[ticket.id] = ticket
         return ticket
 
     @property
@@ -544,6 +573,7 @@ class CanaTuneRouter:
                 return "reject"
             if waiter not in self._queue:
                 self._queue.append(waiter)
+                self._waiting_since[waiter] = self._clock() - waited_ms / 1000
             feasible = self.candidates(tokens, waited_ms)
             if not feasible and waiter not in self._signalled:
                 self._signalled.add(waiter)
@@ -551,7 +581,7 @@ class CanaTuneRouter:
             # FIFO prevents late requests from starving behind fresh arrivals.
             if self._queue[0] == waiter:
                 ticket = self.try_admit(
-                    tokens, exact, waited_ms, best_effort=self.full_effort
+                    tokens, exact, waited_ms, best_effort=True
                 )
                 if ticket is not None:
                     self._release(waiter)
@@ -596,6 +626,7 @@ class CanaTuneRouter:
     def _release(self, waiter: int) -> None:
         self._fresh.discard(waiter)
         self._signalled.discard(waiter)
+        self._waiting_since.pop(waiter, None)
         try:
             self._queue.remove(waiter)
         except ValueError:
@@ -652,11 +683,80 @@ class CanaTuneRouter:
         if ticket.first_token_at is not None or ticket.finished:
             return
         ticket.first_token_at = self._clock()
+        ticket.last_token_at = ticket.first_token_at
         ticket.group.n_await -= 1
         ticket.group.t_await -= ticket.prompt_tokens
         self._leave_stage(ticket)
         ticket.stage = "decode"
         ticket.group.n_decoding += 1
+
+    def _actionable_ttft(self, tokens: int) -> bool:
+        """Do not scale the cluster for prompts already impossible at idle/MAX."""
+        self._apply_table()
+        idle = interpolate(self._idle_ttft, tokens)
+        return idle is None or idle < self.settings.ttft_slo_ms
+
+    def observe_latency(
+        self, ticket: Ticket, ttft_ms: float | None, tpot_ms: float | None,
+    ) -> None:
+        if self.settings.overload != "best_effort":
+            return
+        now = self._clock()
+        ttft_time, ttft_ratio, tpot_time, tpot_ratio = self._production.get(
+            ticket.id, (float("-inf"), 0.0, float("-inf"), 0.0),
+        )
+        if ttft_ms is not None:
+            # TTFT belongs to first-token time, not every subsequent token/finish.
+            ttft_time = ticket.first_token_at if ticket.first_token_at is not None else now
+            ttft_ratio = (ttft_ms / self.settings.ttft_slo_ms
+                          if self._actionable_ttft(ticket.prompt_tokens) else 0.0)
+        if tpot_ms is not None:
+            tpot_time, tpot_ratio = now, tpot_ms / self.settings.tpot_slo_ms
+        self._production[ticket.id] = (ttft_time, ttft_ratio, tpot_time, tpot_ratio)
+        if max(ttft_ratio, tpot_ratio) >= 0.9:
+            self.pressure_event.set()  # feedback wakes control without becoming a prediction
+
+    def token_progress(self, ticket: Ticket, tpot_ms: float | None) -> None:
+        ticket.last_token_at = self._clock()
+        ttft = ((ticket.first_token_at - ticket.admitted_at) * 1000 + ticket.wait_ms
+                if ticket.first_token_at is not None else None)
+        self.observe_latency(ticket, ttft, tpot_ms)
+
+    def production_feedback(
+        self, window_s: float, min_samples: int, near: float, *, since: float = float("-inf"),
+    ) -> dict[str, Any]:
+        """Recent actual latency plus unfinished-request/physical-capacity waits."""
+        now = self._clock()
+        cutoff = max(now - window_s, since)
+        self._production = {
+            k: v for k, v in self._production.items() if max(v[0], v[2]) >= now - window_s
+        }
+        ratios = [
+            max(r if t >= cutoff else 0, dr if dt >= cutoff else 0)
+            for t, r, dt, dr in self._production.values() if max(t, dt) >= cutoff
+        ]
+        live_ratio = 0.0
+        for ticket in self._live.values():
+            if ticket.first_token_at is None:
+                if self._actionable_ttft(ticket.prompt_tokens):
+                    age = (now - ticket.admitted_at) * 1000 + ticket.wait_ms
+                    live_ratio = max(live_ratio, age / self.settings.ttft_slo_ms)
+            elif ticket.last_token_at is not None:
+                live_ratio = max(
+                    live_ratio, (now - ticket.last_token_at) * 1000 / self.settings.tpot_slo_ms,
+                )
+        wait_ratio = max(
+            ((now - t) * 1000 / self.settings.ttft_slo_ms
+             for t in self._waiting_since.values()), default=0.0,
+        )
+        fraction = sum(r >= near for r in ratios) / len(ratios) if ratios else 0.0
+        return {
+            "samples": len(ratios), "near_fraction": fraction,
+            "live_ratio": live_ratio, "wait_ratio": wait_ratio,
+            "pressure": (len(ratios) >= min_samples and fraction > self.settings.theta)
+            or max(live_ratio, wait_ratio) >= near,
+            "severe": max(live_ratio, wait_ratio) >= 2,
+        }
 
     def finish(
         self,
@@ -677,6 +777,14 @@ class CanaTuneRouter:
         ticket.stage = "done"
         ticket.group.n_inflight -= 1
         ticket.finished = True
+        self._live.pop(ticket.id, None)
+        if status == "ok":
+            recent = self._production.get(ticket.id)
+            # Keep recent stream spacing; completion's cumulative TPOT can be old.
+            feedback_tpot = None if recent and recent[2] != float("-inf") else tpot_ms
+            self.observe_latency(ticket, ttft_ms, feedback_tpot)
+        else:
+            self._production.pop(ticket.id, None)
 
         violated = is_violation(
             ttft_ms,
@@ -684,8 +792,6 @@ class CanaTuneRouter:
             ttft_slo_ms=self.settings.ttft_slo_ms,
             tpot_slo_ms=self.settings.tpot_slo_ms,
         )
-        if violated and self.settings.overload == "best_effort":
-            self.signal_pressure("observed_slo_violation")
         # Only clean samples update the table: served OK, TTFT known, exact prompt
         # length, and no clock change on this group while the request was in flight.
         skip = None

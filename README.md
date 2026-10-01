@@ -8,8 +8,9 @@ latency SLO** (TTFT < 500 ms, TPOT ≤ 200 ms) by
 2. **parking idle groups** at a locked low clock instead of leaving them unlocked,
 3. running active groups at **clock tiers the Canary measured on this cluster**
    (the loaded energy valley of P; the KV-wall-limited D), and
-4. using **SLO risk to trigger full effort**: wake all parked groups, reclaim
-   Canary and lock MAX; serve late requests as capacity allows. HTTP 503 is
+4. using **prediction warnings and Production latency feedback**: confirm pressure,
+   expand using measured capacity, then reclaim Canary and lock MAX only when
+   pressure persists or actual unfinished work is severely stalled. HTTP 503 is
    reserved for the service wait timeout (or the legacy rejection policy).
 
 No clock value, threshold or capacity is configured. A Canary group measures
@@ -104,20 +105,25 @@ Per group it tracks, from the proxy's stage events, the pending P work (sum of
 S(L) at the group's clock), the KV bytes in flight and the requests decoding.
 
 ```text
-hard limits   D concurrency (B*), D KV usage, KV in flight <= gate x kv_buffer_bytes
+hard guards   fresh D telemetry, D KV usage, KV in flight <= gate x kv_buffer_bytes
+SLO warning   D concurrency exceeds measured B* (D running/queued, excludes P);
+              best_effort still dispatches, including at MAX. Legacy policies
+              retain the B* admission ceiling.
 risk          predicted TTFT (Canary's fit, refitted online) -> slack = SLO - waited
               - predicted -> violation risk of that slack bucket (Canary's seed +
               production's counts; a sparse bucket is bounded by the nearest
               observed bucket with less slack) <= theta
 admit         to the most loaded feasible group (concentration keeps batches large)
-overload      best_effort (default): signal SLO/TPOT risk immediately; wake all
-              groups and lock MAX, safely reclaim Canary; dispatch FIFO even late
+overload      best_effort (default): prediction warns; Production confirms;
+              measured capacity guides expansion; persistent/severe pressure
+              triggers MAX and safely reclaims Canary. Dispatch FIFO even late
               while enforcing physical D/KV limits. Queue until capacity is free;
               hold_max_ms is the service wait timeout, then HTTP 503.
               reject / serve retain legacy rejection and rescue/backfill behavior.
 ```
 
-Predicted and observed SLO violations and capacity waits are pressure signals.
+Prediction signals are warnings. Actual latency and physical-capacity waits
+confirm pressure before resources increase.
 
 ### Solver and Controller (`domain/models.py`, `controller/tier_controller.py`)
 
@@ -141,13 +147,25 @@ power    active groups at their clocks + parked groups at the park clocks
 ```
 
 The plan is the lowest-power feasible configuration for the peak rate of the last
-`t_down_s`. It applies at once when the current configuration cannot carry the
-current rate (up); otherwise only once the same target held for `t_down_s`, with
-no pressure in that time, and when it saves more than the Canary's noise band
-(`canary.locator.eps`) and amortizes the observed clock switching time. Extra groups drain (the Canary first) and park; missing
-ones wake. Pressure interrupts energy planning and enters full effort: all groups
-at MAX, including PARK and a safely reclaimed Canary. Return to energy mode
-requires `t_down_s` without pressure and a feasible working configuration. While clocks change the
+`t_down_s`. In best-effort mode, increasing resources requires Production feedback
+confirmation. Cheaper plans apply only once the same target held for `t_down_s`,
+with no pressure in that time, and when savings exceed the Canary's noise band
+(`canary.locator.eps`) and amortize the observed clock switching time. Extra groups
+drain (the Canary first) and park; missing ones wake. Model-only pressure enters
+`warning` and cannot expand or raise clocks. Warning/confirming modes still evaluate
+solver targets and finish draining. Warnings do not reset target hold or actual
+production calm time; only resource changes reset the target, and only actual
+Production pressure delays an otherwise feasible cheaper plan.
+Actual near-SLO TTFT/TPOT from at least `feedback_min_samples` recent requests,
+or unfinished-request/physical-capacity waits, must persist for `confirm_s`.
+Then `expanding` wakes groups at H using the measured per-group capacity (static:
+C_H / (mean prompt + alpha); solver: capacity for the current length mix).
+After `expansion_grace_s`, persistent fresh feedback triggers `full_effort`;
+severe unfinished waits (at least twice the SLO) also require `confirm_s` before
+emergency MAX/reclaim. TTFT samples keep first-token timestamps, so pre-expansion
+TTFT cannot masquerade as fresh evidence. Prompts impossible at idle/MAX do not
+contribute TTFT pressure; their TPOT still counts. Return to energy mode requires
+`t_down_s` without actual pressure. These feedback thresholds are configurable. While clocks change the
 Router assumes the slower point and in-flight samples are not recorded.
 
 ### Canary scheduler (`controller/canary.py`)
@@ -173,7 +191,7 @@ in turn, no admission, no clock control) or `cantune`.
 | GPU agent per node: supported clocks ≥ `min_mhz`, serialized locks, NVML read-back, energy/clock/limit readings, reset on exit | `infrastructure/gpu_agent.py` | done |
 | Router: state-based concentration; SLO-triggered best effort; legacy serve/reject | `controller/router.py` | done |
 | Cluster model and solver from the Canary's measurements | `domain/models.py`, `domain/calibration.py` | done; simulated, not yet on GPUs |
-| Controller: MAX cold start, solver plan with switching rules, pressure (wake / abort / MAX), drain and park | `controller/tier_controller.py` | done |
+| Controller: MAX cold start, solver energy plans, Production-confirmed expansion/MAX, drain and park | `controller/tier_controller.py` | done |
 | Tier locator | `controller/locator.py` | done; validated on a replay surrogate (tests), not yet on GPUs |
 | Probe backend | `controller/probe.py` | done; tested against mocked vLLM/agents |
 | Canary scheduler | `controller/canary.py` | done |

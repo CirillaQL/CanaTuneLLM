@@ -512,7 +512,9 @@ def test_full_effort_reclaims_canary_only_after_probe_drain_and_locks_max():
 
         scheduler.locator.backend.quiesce = quiesce
         await controller.start()
-        router.signal_pressure("test")
+        controller.settings = dataclasses.replace(controller.settings, confirm_s=0)
+        ticket = router.try_admit(PROMPT, True)
+        ticket.admitted_at -= 3
         tick = asyncio.create_task(controller.tick())
         await entered.wait()
         assert groups[0].state is GroupState.EXPLORING
@@ -541,7 +543,9 @@ def test_failed_canary_drain_is_retried_without_releasing_group():
 
     async def run():
         await controller.start()
-        router.signal_pressure("test")
+        controller.settings = dataclasses.replace(controller.settings, confirm_s=0)
+        ticket = router.try_admit(PROMPT, True)
+        ticket.admitted_at -= 3
         await controller.tick()
         assert router.full_effort and groups[0].state is GroupState.EXPLORING
         await controller.tick()
