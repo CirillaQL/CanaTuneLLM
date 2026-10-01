@@ -3,16 +3,15 @@
 Every Canary probe records the state it was sent into: the prompt lengths still at
 P, the KV tokens between P's return and the first token, the requests decoding;
 plus its TTFT and SLO outcome. The tier locator's windows (ramp to overload,
-clock search, fill) cover idle to overloaded, so they hold what the offline
-replays of r6b / r7 used:
+clock search, fill) cover idle to overloaded:
 
   fit_plateau_slope   S(L) per P clock: plateau (bandwidth-bound) + slope
-  predictor           ridge fit of the TTFT model towards the spec prior
+  predictor           least-squares fit of the TTFT model (TTFT <= 2 x SLO)
   slack seed          violations by predicted-slack bucket, two-fold (each half
                       predicted by the fit on the other half), seeding the risk table
   kv gate             the share of D's receive buffer in flight above which
-                      requests violate more than theta (r7's cliff, found again on
-                      whatever buffer and link this cluster has)
+                      requests violate more than theta (on whatever buffer and
+                      link this cluster has); the whole buffer if none is reached
 """
 
 import math
@@ -20,7 +19,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from canatune.domain.admission import CostBook, SlackRisk, TtftPredictor, wilson_ucb
+from canatune.domain.admission import (
+    CostBook,
+    SlackRisk,
+    TtftPredictor,
+    slack_edges,
+    wilson_ucb,
+)
 
 
 @dataclass(frozen=True)
@@ -100,15 +105,14 @@ def kv_gate_fraction(
     kv_bytes_per_token: float,
     buffer_bytes: float,
     theta: float,
-    prior: float,
     min_samples: int = 20,
     bins: int = 10,
 ) -> tuple[float, str, dict[str, list[int]]]:
     """-> (gate, source, bins). Share of the receive buffer in flight up to which
     violations stay within theta: the lower edge of the first well-sampled bin
-    whose violation rate is clearly above theta (its Wilson lower bound); if none
-    was reached, the prior, or the top of the highest clean bin when the windows
-    went beyond the prior."""
+    whose violation rate is clearly above theta (its Wilson lower bound, source
+    "measured"); if the windows never reached such a bin, the buffer itself (1.0,
+    source "buffer": the connector's own limit from the config)."""
     counts: dict[int, list[int]] = {}
     for s in samples:
         if s.violated is None:
@@ -118,7 +122,6 @@ def kv_gate_fraction(
         cell = counts.setdefault(b, [0, 0])
         cell[0] += 1
         cell[1] += int(s.violated)
-    clean_top = 0.0
     for b in sorted(counts):
         n, k = counts[b]
         if n < min_samples:
@@ -127,22 +130,19 @@ def kv_gate_fraction(
         if lower > theta:
             table = {str(b): c for b, c in sorted(counts.items())}
             return max(1.0 / bins, b / bins), "measured", table
-        if k / n <= theta:
-            clean_top = (b + 1) / bins
     table = {str(b): c for b, c in sorted(counts.items())}
-    return max(prior, clean_top), "clean_above_prior" if clean_top > prior else "prior", table
+    return 1.0, "buffer", table
 
 
 def calibrate_admission(
     samples: Sequence[ProbeSample],
     costs: CostBook,
     *,
-    prior: Sequence[float],
+    prior: Sequence[float] | None,
     ttft_slo_ms: float,
     theta: float,
     kv_bytes_per_token: float,
     buffer_bytes: float,
-    gate_prior: float,
     min_samples: int = 20,
 ) -> dict[str, Any] | None:
     """-> evidence["admission"]: predictor coefficients, slack-bucket counts (the
@@ -157,13 +157,13 @@ def calibrate_admission(
     near = [(x, y) for x, y in rows if y <= 2 * ttft_slo_ms]
     if len(near) < 2 * min_samples:
         return None
-    base = TtftPredictor(prior)
+    base = TtftPredictor(prior, clip_ms=2 * ttft_slo_ms)
     coef = base.fit(near)
     # Two-fold slack: each half predicted by the fit on the other half, so the seed
     # reflects prediction error on unseen requests, not the in-sample residual.
     halves = (rows[0::2], rows[1::2])
     outcomes = (clean[0::2], clean[1::2])
-    slack = SlackRisk(min_samples=min_samples)
+    slack = SlackRisk(slack_edges(ttft_slo_ms), min_samples=min_samples)
     for i in (0, 1):
         fold = base.fit([(x, y) for x, y in halves[1 - i] if y <= 2 * ttft_slo_ms])
         for (x, _), s in zip(halves[i], outcomes[i]):
@@ -174,7 +174,6 @@ def calibrate_admission(
         kv_bytes_per_token=kv_bytes_per_token,
         buffer_bytes=buffer_bytes,
         theta=theta,
-        prior=gate_prior,
         min_samples=min_samples,
     )
     residuals = [y - sum(c * v for c, v in zip(coef, x)) for x, y in near]
@@ -183,7 +182,7 @@ def calibrate_admission(
         "fit_samples": len(near),
         "violations": sum(bool(s.violated) for s in clean),
         "predictor_coef": [round(c, 4) for c in coef],
-        "predictor_prior": [round(c, 4) for c in prior],
+        "predictor_prior": None if prior is None else [round(c, 4) for c in prior],
         "residual_ms_rms": round(math.sqrt(sum(r * r for r in residuals) / len(residuals)), 1),
         "slack_counts": slack.to_json()["counts"],
         "kv_gate_fraction": gate,

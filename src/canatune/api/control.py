@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 class CanaryRequest(BaseModel):
-    action: str  # "full", "relocate", "recheck" or "abort"
+    action: str  # "full", "relocate", "recheck", "verify" or "abort"
 
 
 def create_control_router(runtime: "Runtime") -> APIRouter:
@@ -48,9 +48,9 @@ def create_control_router(runtime: "Runtime") -> APIRouter:
         if request.action == "abort":
             runtime.canary.abort("api")
             return {"ok": True}
-        if request.action in ("full", "relocate", "recheck"):
+        if request.action in ("full", "relocate", "recheck", "verify"):
             ok, reason = runtime.canary.request(request.action, "api")
             return {"ok": ok, "reason": reason}
-        return {"ok": False, "reason": "action must be full, relocate, recheck or abort"}
+        return {"ok": False, "reason": "action must be full, relocate, recheck, verify or abort"}
 
     return router

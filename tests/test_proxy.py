@@ -257,7 +257,14 @@ def test_cantune_slack_admission_tracks_stages_through_the_proxy() -> None:
         client, runtime = make_cantune(handler, admission="slack")
         runtime_ref["rt"] = runtime
         table = TierTable(ClockPoint(900, 450), ClockPoint(1815, 1050), 3000.0, 460.0)
-        table.evidence = {"alpha_fit": {"prefill_ms_by_length": {"128": 40, "2048": 150}}}
+        table.evidence = {
+            "prefill_ms_by_clock": {"1815": {"128": 40, "2048": 150}},
+            "admission": {  # as the Canary's calibration publishes it
+                "predictor_coef": [150.0, 1.0, 1.0, 800.0, 2.0],
+                "slack_counts": {str(b): [50, 0] for b in range(9, 14)},
+                "kv_gate_fraction": 0.5,
+            },
+        }
         runtime.controller.tiers.table = table
         await runtime.start()
         runtime.stop.set()

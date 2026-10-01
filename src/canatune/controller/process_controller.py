@@ -53,7 +53,7 @@ class ProcessController:
         self._stop_event = threading.Event()
         self._stopped = False
         # Called while the agents still run: reset their clocks over HTTP (the agents'
-        # own reset on exit did not happen after srun's SIGTERM in smoke 2).
+        # own reset on exit may not run when srun ends them with SIGTERM).
         self.before_agents_stop: Callable[[], None] | None = None
 
     def _handle_signal(self, signum: int, _frame: object) -> None:

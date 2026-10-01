@@ -2,6 +2,7 @@
 
 import asyncio
 import dataclasses
+import json
 
 import pytest
 
@@ -37,10 +38,40 @@ class FakeClock:
         return self.now
 
 
-def published(**kwargs) -> TierTable:
+# What a Canary calibration publishes (fixtures standing in for its measurements).
+CALIBRATION = {
+    "predictor_coef": [150.0, 1.0, 1.0, 800.0, 2.0],
+    "slack_counts": {str(b): [50, 0] for b in range(9, 14)},  # >= 400 ms slack: safe
+    "kv_gate_fraction": 0.5,
+}
+MODEL = {
+    "prefill": {str(f): {"128": 40.0, "2048": 150.0 * 2520 / f} for f in (1815, 2520)},
+    "residence": {"128": 100.0, "2048": 200.0},
+    "decode": {"1050": [50.0, 1.0], "1500": [45.0, 0.9]},
+    "power_prefill": {"1815": [60.0, 200.0], "2520": [70.0, 320.0]},
+    "power_decode": {"1050": [20.0, 30.0], "1500": [22.0, 50.0]},
+    "park_power_w": 70.0,
+    "rho_prefill": 0.5,
+    "ttft_slo_ms": 1000.0,
+    "tpot_slo_ms": 200.0,
+    "kv_bytes_per_token": 131072,
+    "kv_gate_bytes": None,
+    "kv_capacity_tokens": 30000,
+    "b_star": {},
+    "prompt_limit": None,
+}
+
+
+def published(model: bool = False, calibrated: bool = True, **kwargs) -> TierTable:
     values = {"park": PARK, "h": H, "capacity_h": 3000.0, "alpha_tokens": 460.0}
     values.update(kwargs)
-    return TierTable(**values)
+    table = TierTable(**values)
+    if calibrated:
+        table.evidence["prefill_ms_by_clock"] = {"1815": {"128": 40.0, "2048": 200.0}}
+        table.evidence["admission"] = dict(CALIBRATION)
+    if model:
+        table.evidence["model"] = json.loads(json.dumps(MODEL))
+    return table
 
 
 def setup(table=None, telemetry=None, store=None, admission="cells", overload="reject"):
@@ -127,10 +158,14 @@ def test_publish_moves_groups_to_h_and_switches_admission(tmp_path) -> None:
 def test_router_concentrates_on_most_loaded_feasible_group() -> None:
     _, risk, groups, _, router, _, _ = setup(table=published())
     activate(groups)
-    risk.load_seed(H, [[0.0] * 5, [0.12] * 5] + [[1.0] * 5] * 4)
+    for d_busy in (False, True):
+        for i in range(100):  # one queued request ahead: 12 % violated > theta
+            risk.record(risk.cell(H, 1, 128, d_busy), i < 12)
+        for _ in range(30):  # idle P: clean, bounds every lighter cell
+            risk.record(risk.cell(H, 0, 2048, d_busy), False)
     first = router.try_admit(128, True)
     second = router.try_admit(128, True)
-    # G1 wins the tie (production before Canary); with N_await=1 the seeded risk
+    # G1 wins the tie (production before Canary); with N_await=1 the observed risk
     # is 12 % > 10 %, so the second request goes to the next group.
     assert first.group.name == "G1"
     assert second.group.name == "G2"
@@ -209,19 +244,22 @@ def test_finish_records_only_clean_samples_and_lengths() -> None:
     router.finish(t3, status="ok", ttft_ms=100, tpot_ms=60, output_tokens=8)
     t4 = router.try_admit(128, True)
     router.finish(t4, status="decode_error", ttft_ms=None, tpot_ms=None, output_tokens=0)
-    skips = [r["table_skip"] for r in router.log.recent]
+    skips = [r["table_skip"] for r in router.log.recent if r.get("event") == "request"]
     assert skips == [None, "clock_changed", "prompt_length_estimated", "request_failed"]
     assert all(g.n_await == 0 and g.n_inflight == 0 and g.t_await == 0 for g in groups)
     assert list(router.outcomes) == [False]
     assert router.lengths.pairs()[-1] == (128, 8)
 
 
-def test_consolidation_parks_at_park_clocks_and_pressure_wakes() -> None:
+def test_plan_drains_the_canary_first_then_parks_down_to_the_minimum() -> None:
     clock, _, groups, _, router, controller, actuator = setup()
     asyncio.run(controller.start())
     groups[0].state = GroupState.ACTIVE  # Canary back in service
-    asyncio.run(controller.publish(published(), "test"))
-    for _ in range(4):  # idle for longer than t_down: park one group per window
+    asyncio.run(controller.publish(published(model=True), "test"))
+    asyncio.run(controller.tick())  # no demand: the solver wants one group
+    assert controller.plan.n == 1
+    assert all(g.state is GroupState.ACTIVE for g in groups)  # not before t_down
+    for _ in range(4):  # one group drained per step
         clock.now += 31
         asyncio.run(controller.tick())
         asyncio.run(controller.tick())
@@ -230,103 +268,86 @@ def test_consolidation_parks_at_park_clocks_and_pressure_wakes() -> None:
     assert groups[0].state is GroupState.PARK  # Canary parked first
     assert (GpuRef("http://agent", 0), 900) in actuator.calls
     assert (GpuRef("http://agent", 1), 450) in actuator.calls
-    router.rejections += 1
+    router.rejections += 1  # pressure wakes a group at once
     asyncio.run(controller.tick())
     assert len([g for g in groups if g.state is GroupState.ACTIVE]) == 2
 
 
-def test_consolidation_drains_the_busier_canary_before_production() -> None:
-    clock, _, groups, _, router, controller, _ = setup()
-    asyncio.run(controller.start())
-    groups[0].state = GroupState.ACTIVE
-    asyncio.run(controller.publish(published(), "test"))
-    for _ in range(4):
-        clock.now += 31
-        groups[0].record_admission(clock.now, 512, 10.0)  # the Canary carries the traffic
-        asyncio.run(controller.tick())
-        asyncio.run(controller.tick())
-    # otherwise the Canary ends up the only active group and can never explore
-    assert groups[0].state is not GroupState.ACTIVE
-    assert any(g.state is GroupState.ACTIVE and not g.canary for g in groups)
-
-
-def test_no_parking_right_after_rejections() -> None:
-    clock, _, groups, _, router, controller, _ = setup(table=published())
+def test_no_scale_down_within_t_down_of_pressure() -> None:
+    clock, _, groups, _, router, controller, _ = setup(table=published(model=True))
     activate(groups)
     controller.on_pressure = lambda reason: True
-    router.rejections += 5  # every request rejected: the admitted load reads 0
+    router.rejections += 5
     asyncio.run(controller.tick())
-    for _ in range(3):
-        clock.now += 10
+    for _ in range(3):  # 27 s < t_down
+        clock.now += 9
         asyncio.run(controller.tick())
     assert all(g.state is GroupState.ACTIVE for g in groups)
-    clock.now += 31  # calm for t_down: consolidation may start its own t_down window
-    asyncio.run(controller.tick())
     clock.now += 31
     asyncio.run(controller.tick())
     asyncio.run(controller.tick())
-    assert sum(g.state is GroupState.PARK for g in groups) == 1
+    assert groups[0].state is not GroupState.ACTIVE  # then the Canary goes first
+
+
+def test_plan_scales_up_at_once_and_down_only_after_the_dwell() -> None:
+    clock, _, groups, tiers, router, controller, _ = setup(table=published(model=True))
+    activate(groups[1:2])
+    for g in groups[2:] + groups[:1]:
+        g.state, g.tier, g.effective = GroupState.PARK, Tier.PARK, None
+    for k in range(400):  # 40 req/s over the 10 s load window
+        router.arrivals.append(clock.now - 10 + k * 0.025)
+    asyncio.run(controller.tick())
+    active = [g for g in groups if g.state is GroupState.ACTIVE]
+    assert controller.plan.n > 1 and len(active) == controller.plan.n  # up: at once
+    working = tiers.working
+    router.arrivals.clear()  # demand gone
+    clock.now += 1
+    asyncio.run(controller.tick())
+    assert len([g for g in groups if g.state is GroupState.ACTIVE]) == len(active)
+    assert tiers.working == working  # down waits for t_down
+    clock.now += 31  # the peak left the dwell window: a cheaper target appears ...
+    asyncio.run(controller.tick())
+    assert tiers.working == working
+    clock.now += 31  # ... and must hold for t_down before the switch
+    asyncio.run(controller.tick())
+    assert tiers.working != working or any(g.state is GroupState.DRAINING for g in groups)
 
 
 def test_pressure_with_nothing_parked_aborts_canary() -> None:
-    clock, _, groups, _, _, controller, _ = setup(table=published(capacity_h=100.0))
+    clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups[1:])
     groups[0].state = GroupState.EXPLORING
     reasons = []
     controller.on_pressure = reasons.append
-    for g in groups[1:]:
-        for _ in range(10):
-            g.record_admission(clock.now, 512, 10)  # ~ 972 eq tokens/s >> 0.85 * 100
+    router.rejections += 1
     asyncio.run(controller.tick())
-    assert reasons == ["load_above_wake"]
+    assert reasons == ["pressure"]
 
 
 def test_pressure_without_experiment_boosts_to_max_then_returns_to_h() -> None:
-    clock, _, groups, _, _, controller, _ = setup(table=published(capacity_h=100.0))
+    clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups)
     controller.on_pressure = lambda reason: False  # no experiment to abort
-    for g in groups:
-        for _ in range(10):
-            g.record_admission(clock.now, 512, 10)
+    router.rejections += 1
     asyncio.run(controller.tick())
     assert [g.tier for g in groups].count(Tier.MAX) == 1  # one group per tick
     for _ in groups:
+        router.rejections += 1
         asyncio.run(controller.tick())
     assert all(g.tier is Tier.MAX and g.effective == MAX for g in groups)
-    clock.now += 60  # load gone
-    for _ in range(2 * len(groups) + 2):
+    for _ in range(2 * len(groups) + 2):  # calm
         asyncio.run(controller.tick())
         clock.now += 31
     assert all(g.tier is Tier.H for g in groups if g.state is GroupState.ACTIVE)
 
 
 def test_pressure_aborting_the_canary_does_not_boost() -> None:
-    clock, _, groups, _, _, controller, _ = setup(table=published(capacity_h=100.0))
+    clock, _, groups, _, router, controller, _ = setup(table=published())
     activate(groups)
     controller.on_pressure = lambda reason: True  # the Canary comes back instead
-    for g in groups:
-        for _ in range(10):
-            g.record_admission(clock.now, 512, 10)
+    router.rejections += 1
     asyncio.run(controller.tick())
     assert all(g.tier is Tier.H for g in groups)
-
-
-def test_l_h_switching_with_hysteresis() -> None:
-    clock, risk, groups, _, _, controller, _ = setup(
-        table=published(l=L, tau_up=2000.0, tau_down=1000.0)
-    )
-    group = groups[1]
-    controller.groups = [group]
-    activate([group])
-    asyncio.run(controller.tick())
-    assert group.tier is Tier.H
-    clock.now += 31
-    asyncio.run(controller.tick())
-    assert group.tier is Tier.L and group.effective == L
-    for _ in range(40):  # 40 x (512 + 460) / 10 s = 3888 eq tokens/s > tau_up
-        group.record_admission(clock.now, 512, 10)
-    asyncio.run(controller.tick())
-    assert group.tier is Tier.H
 
 
 def test_router_uses_slower_point_while_clock_changes() -> None:
@@ -390,23 +411,20 @@ def test_stage_accounting_follows_a_request_through_p_transfer_and_decode() -> N
     assert t2.group.inflight_bytes == 0
 
 
-def test_cold_slack_admits_with_margin_then_learns() -> None:
+def test_canary_seeded_slack_admits_then_a_violating_bucket_closes() -> None:
     _, _, groups, _, router, _, _ = setup(table=published(), admission="slack")
     activate(groups)
-    t = router.try_admit(128, True)  # prior model: ~160 ms predicted, slack ~840 ms
-    assert t is not None and t.estimate.source == "slack_cold"
-    router.first_token(t)
-    router.finish(t, status="ok", ttft_ms=1500, tpot_ms=60, output_tokens=8)
-    # requests in that slack bucket keep violating: once it has min_samples, it closes
+    t = router.try_admit(128, True)
+    assert t is not None and t.estimate.source == "slack_observed"
     refused_after = None
-    for i in range(40):
+    for i in range(60):  # requests in that slack bucket keep violating
         tk = router.try_admit(128, True)
         if tk is None:
             refused_after = i
             break
         router.first_token(tk)
         router.finish(tk, status="ok", ttft_ms=1500, tpot_ms=60, output_tokens=8)
-    assert refused_after is not None and refused_after <= 25
+    assert refused_after is not None and refused_after <= 30
 
 
 def test_kv_in_flight_gate_blocks_the_group_until_its_d_takes_the_kv() -> None:
@@ -423,7 +441,7 @@ def test_kv_in_flight_gate_blocks_the_group_until_its_d_takes_the_kv() -> None:
 def test_predictor_refits_towards_observed_ttft() -> None:
     from canatune.domain.admission import TtftPredictor
 
-    p = TtftPredictor(refit_every=10, ridge=0.01)
+    p = TtftPredictor((100.0, 1.0, 0.6, 800.0, 1.0), refit_every=10, ridge=0.01)
     for pending in range(0, 500, 5):
         x = p.features(50, pending, 0, 0)
         p.record(x, 200 + 2.0 * pending)  # true pending weight 2.0 (prior 0.6)
@@ -431,18 +449,19 @@ def test_predictor_refits_towards_observed_ttft() -> None:
     assert p.predict(p.features(50, 300, 0, 0)) == pytest.approx(800, rel=0.1)
 
 
-def test_slack_risk_pools_sparse_buckets_with_riskier_ones(tmp_path) -> None:
+def test_slack_risk_bounds_sparse_buckets_by_less_slack(tmp_path) -> None:
     from canatune.domain.admission import SlackRisk
 
-    s = SlackRisk(min_samples=20, cold_margin_ms=200, path=tmp_path / "s.json")
+    s = SlackRisk(min_samples=20, path=tmp_path / "s.json")
     for _ in range(30):
         s.record(50, True)  # little slack: violated
+    for _ in range(30):
+        s.record(650, False)  # plenty of slack: clean
     for _ in range(5):
-        s.record(150, False)  # sparse, little slack: pooled with the risky buckets below
-    assert s.estimate(150).source == "pooled" and s.estimate(150).risk > 0.1
-    # sparse with enough slack: admitted to learn (never pooled shut)
-    assert s.estimate(450).source == "cold" and s.estimate(450).risk == 0.0
-    assert s.estimate(-1000).risk == 1.0
+        s.record(150, False)  # sparse: bounded by the risky bucket below it
+    assert s.estimate(150).source == "bounded" and s.estimate(150).risk > 0.1
+    assert s.estimate(750).source == "bounded" and s.estimate(750).risk < 0.1
+    assert s.estimate(-1000).source == "unknown" and s.estimate(-1000).risk == 1.0
     s.save()
     t = SlackRisk(min_samples=20, path=tmp_path / "s.json")
     t.load()

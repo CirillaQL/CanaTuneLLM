@@ -195,7 +195,15 @@ def event_checks(record_dir: Path, run: dict, meta: dict) -> dict:
 
     timeline = []
     for e in events:
-        if e.get("event") not in ("tier", "drain", "canary_abort", "canary_claim", "publish"):
+        if e.get("event") not in (
+            "tier",
+            "drain",
+            "plan",
+            "canary_abort",
+            "canary_claim",
+            "canary_verify",
+            "publish",
+        ):
             continue
         t = e["wall_time"] - start
         if t < 0 or t > meta["duration_s"] + 300:
@@ -205,18 +213,25 @@ def event_checks(record_dir: Path, run: dict, meta: dict) -> dict:
                 "t_s": round(t, 1),
                 "phase": phase_of(t),
                 "event": e["event"],
-                **{k: e[k] for k in ("group", "tier", "clock", "ok", "reason", "kind") if k in e},
+                **{
+                    k: e[k]
+                    for k in ("group", "tier", "clock", "ok", "reason", "kind", "to", "binding")
+                    if k in e
+                },
             }
         )
     tiers = [e for e in timeline if e["event"] == "tier"]
     reasons = [e.get("reason") or "" for e in tiers]
     checks = {
         "parked": any(e.get("tier") == "park" and e["reason"] == "drained" for e in tiers),
-        "woken": any(r in ("rejections", "load_above_wake") for r in reasons),
+        "woken": any(r in ("pressure", "plan") for r in reasons),
+        "planned": "plan" in reasons,
         "boosted": any(r.startswith("boost") for r in reasons),
         "unboosted": "unboost" in reasons,
         "canary_claimed": any(e["event"] == "canary_claim" for e in timeline),
         "canary_aborted": any(e["event"] == "canary_abort" for e in timeline),
+        "plans": sum(1 for e in timeline if e["event"] == "plan"),
+        "verifications": sum(1 for e in timeline if e["event"] == "canary_verify"),
         "clock_failures": sum(1 for e in tiers if e.get("ok") is False),
         "clock_errors": sum(1 for e in events if e.get("event") == "clock_error"),
     }

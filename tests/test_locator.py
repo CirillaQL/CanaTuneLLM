@@ -27,6 +27,7 @@ from canatune.controller.locator import (
 )
 from canatune.controller.router import CanaTuneRouter, RouterSettings
 from canatune.controller.tier_controller import ControllerSettings, TierController
+from canatune.domain.calibration import ProbeSample
 from canatune.domain.groups import ClockPoint, GroupState, Tier, TierState
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable
@@ -34,7 +35,7 @@ from canatune.infrastructure.clocks import GpuRef, NullClockActuator
 from canatune.service import build_groups, identity
 
 PROMPT = 1024
-ALPHA = 28.1 / 0.0615  # K2 single requests: prefill = 28 ms + 0.0615 ms/token
+ALPHA = 28.1 / 0.0615  # surrogate single requests: prefill = 28 ms + 0.0615 ms/token
 
 
 def interp(x, xs, ys):
@@ -116,6 +117,7 @@ class SurrogateBackend:
         n = max(1, int(rps * seconds))
         k = sum(self.rng.random() < viol for _ in range(n))
         aborted = k / n > abort_above
+        j = energy * (1 + self.rng.gauss(0, self.noise))
         return WindowResult(
             clock=clock,
             kind="open",
@@ -124,10 +126,14 @@ class SurrogateBackend:
             requests=n,
             violations=k,
             ttft_p95_ms=ttft * (1 + self.rng.gauss(0, 0.03)),
-            prefill_j_per_request=energy * (1 + self.rng.gauss(0, self.noise)),
+            prefill_j_per_request=j,
             prefill_mhz_median=float(self.eff(f)),
             prefill_limited_fraction=self.limited(f),
             aborted=aborted,
+            samples=[
+                ProbeSample(f, clock.decode_mhz, PROMPT, (), 0, 0, ttft, i < k) for i in range(n)
+            ],
+            prefill_avg_w=j * n / seconds,
         )
 
     async def closed_window(self, clock, concurrency, seconds, rep=0):
@@ -147,6 +153,10 @@ class SurrogateBackend:
             decode_j_per_token=power / tps * (1 + self.rng.gauss(0, self.noise)),
             decode_preemptions=5.0 if wall else 0.0,
             decode_waiting_max=3.0 if wall else 0.0,
+            decode_avg_w=power,
+            decode_busy_fraction=1.0,
+            decode_running_mean=float(concurrency),
+            tpot_p50_ms=tpot,
         )
 
 
@@ -181,7 +191,8 @@ def test_locate_on_surrogate_matches_manual_experiments() -> None:
     # park: lowest idle power -> lowest clocks
     assert table.park == ClockPoint(600, 300)
     assert table.capacity_h > 0.5 * ev["capacity_c0"]
-    assert locator.run.windows <= 48  # D clock choice measures each clock twice
+    # D clock choice: each clock twice plus a half-load window (D iteration model)
+    assert locator.run.windows <= 60
 
 
 def test_aborted_run_resumes_from_cached_windows() -> None:
@@ -208,12 +219,21 @@ def test_prompts_too_long_even_when_idle_are_excluded_from_probes() -> None:
     assert table.evidence["idle_ttft_ms"][2048] > 500 >= table.evidence["idle_ttft_ms"][1024]
 
 
-def test_two_tiers_when_low_load_band_excludes_h() -> None:
-    backend = SurrogateBackend(seed=3)
-    backend.pi = lambda f: 40 + 120 * (f / 2520) ** 3  # idle power grows steeply
-    table = asyncio.run(TierLocator(backend, settings()).locate(PROMPT, [128, 1024, 2048]))
-    assert table.l is not None and table.l.prefill_mhz < table.h.prefill_mhz
-    assert table.tau_down < table.tau_up
+def test_locate_publishes_a_cluster_model_the_solver_can_use() -> None:
+    from canatune.domain.models import ClusterModel, Solver
+
+    table = asyncio.run(
+        TierLocator(SurrogateBackend(seed=3), settings()).locate(PROMPT, [128, 1024, 2048])
+    )
+    model = ClusterModel.from_json(table.evidence["model"])
+    assert len(model.prefill) >= 3 and model.rho_prefill > 0
+    assert len(model.decode) >= 2 and all(d >= 0 for _, d in model.decode.values())
+    assert model.power_prefill and model.power_decode and model.park_power_w > 0
+    solver = Solver(model, groups=3)
+    low = solver.solve(0.5, [(PROMPT, 64)])
+    high = solver.solve(3 * table.evidence["capacity_rps"], [(PROMPT, 64)])
+    assert low.feasible and low.n == 1
+    assert high.n > low.n  # more load needs more groups
 
 
 def build(backend, table=None):
@@ -308,8 +328,8 @@ def test_failed_alpha_is_measured_again_on_retry() -> None:
     with pytest.raises(LocatorError):
         asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
     table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024]))
-    # the retry measures alpha again (call 2); then S(L) at H unless H is the top clock
-    assert len(calls) in (2, 3) and table.alpha_tokens > 0
+    # the retry measures alpha again; then S(L) at every coarse clock
+    assert len(calls) >= 2 and table.alpha_tokens > 0
 
 
 def test_decode_runs_with_p_at_the_ceiling_and_needs_25pct_for_a_step() -> None:

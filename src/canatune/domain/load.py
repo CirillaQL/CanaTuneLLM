@@ -26,8 +26,7 @@ class LengthSummary:
 
     def shifted(self, other: "LengthSummary", threshold: float) -> bool:
         """Relative change of any mean or p90 above `threshold`. Not the median: on a
-        few discrete lengths it jumps between neighbours (smoke 2: 1024 -> 512 on the
-        same uniform mix of four lengths triggered a relocation)."""
+        few discrete lengths it jumps between neighbours without the mix changing."""
         pairs = (
             (self.prompt_mean, other.prompt_mean),
             (self.prompt_p90, other.prompt_p90),

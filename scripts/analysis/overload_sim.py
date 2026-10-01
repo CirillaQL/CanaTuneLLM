@@ -37,18 +37,24 @@ import heapq
 import itertools
 import json
 import statistics
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from canatune import loadgen
 from canatune.config import load_config
+from canatune.controller.locator import (
+    AdmissionInputs,
+    Hardware,
+    LocatorSettings,
+    TierLocator,
+    WindowResult,
+)
 from canatune.controller.router import CanaTuneRouter, RouterSettings, Ticket
 from canatune.controller.tier_controller import ControllerSettings, TierController
 from canatune.domain.calibration import ProbeSample
 from canatune.domain.groups import ClockPoint, Group, GroupState, Tier, TierState, TierTable
-from canatune.domain.priors import Priors
+from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable
 from canatune.infrastructure.clocks import NullClockActuator
 
@@ -105,15 +111,9 @@ class Physics:
         return self.d_idle_w * (0.75 + 0.25 * x) + util * self.d_dyn_w * x**2.0
 
 
-REFERENCE = Physics()
+REFERENCE = Physics()  # an example environment (what the simulated hardware is)
 MAX = REFERENCE.max_point
-H = ClockPoint(1545, 1170)
-PARK = ClockPoint(1080, 735)
-B_STAR = 40  # Canary's clean D concurrency for the default mix (published B*)
-ALPHA_TOKENS = 650.0
-LENGTHS = [(128, 64), (512, 64), (1024, 64)]  # canary.default_lengths
-# Canary single-request length table at H (r6b/r7 medians at 1545 MHz)
-LUT_H = {16: 45, 128: 52, 256: 58, 512: 75, 1024: 98, 2048: 177, 3072: 264}
+LENGTHS = [(128, 64), (512, 64), (1024, 64)]  # the request length mix
 
 
 @dataclass
@@ -153,6 +153,7 @@ class Pair:
     decoding: int = 0
     p_busy_s: float = 0.0
     d_busy_s: float = 0.0
+    d_running_integral: float = 0.0  # running sequences x seconds (mean while busy)
     d_waiting_max: int = 0
     d_running_max: int = 0
     d_kv_max: float = 0.0
@@ -169,7 +170,6 @@ class Sim:
         *,
         phys: Physics = REFERENCE,
         table: TierTable | None = None,
-        priors: Priors | None = None,
     ):
         self.phys = phys
         self.router_overrides = router_overrides or {}
@@ -186,11 +186,13 @@ class Sim:
         self.on_done = None  # closed loop: callback(req)
         self._last_busy = {p.name: (0.0, 0.0) for p in self.pairs}
         if policy != "baseline":
-            self._cantune(capacity_rps, table, priors)
+            if table is None:
+                raise ValueError("CanaTune policies need the Canary's table (run_canary)")
+            self._cantune(table)
 
     # ---- CanaTune --------------------------------------------------------------------
 
-    def _cantune(self, capacity_rps: float, table: TierTable | None, priors) -> None:
+    def _cantune(self, table: TierTable) -> None:
         config = load_config()
         config["router"]["admission"] = "slack"
         config["router"]["overload"] = "reject" if self.policy == "reject" else "serve"
@@ -200,22 +202,12 @@ class Sim:
         config["kv_transfer"]["kv_bytes_per_token"] = self.phys.kv_bytes_per_token
         config["router"].update(self.router_overrides)
         groups = [Group(p.name, f"P{i}", f"D{i}") for i, p in enumerate(self.pairs)]
-        if table is None:  # hand-set REFERENCE table (the overload study)
-            mean_prompt = sum(p for p, _ in LENGTHS) / len(LENGTHS)
-            table = TierTable(
-                park=PARK,
-                h=H,
-                capacity_h=capacity_rps * (mean_prompt + ALPHA_TOKENS),
-                alpha_tokens=ALPHA_TOKENS,
-                decode_max_running=B_STAR,
-                published_at=1.0,
-                evidence={"alpha_fit": {"prefill_ms_by_length": LUT_H}},
-            )
         tiers = TierState(max_point=self.phys.max_point, table=table)
         risk = RiskTable.from_config(config["risk"], {"sim": True})
         clock = lambda: self.now  # noqa: E731
+        lengths = LengthStats(LENGTHS, min_samples=50)
         self.router = CanaTuneRouter(
-            groups, risk, RouterSettings.from_config(config), tiers, clock=clock, priors=priors
+            groups, risk, RouterSettings.from_config(config), tiers, clock=clock, lengths=lengths
         )
         self.controller = TierController(
             groups,
@@ -388,6 +380,7 @@ class Sim:
             self.send(pair)  # buffer space for P's pending sends
         dur = self.phys.d_iter_ms(pair.clock.decode_mhz, len(pair.d_running)) / 1000.0
         pair.d_busy_s += dur
+        pair.d_running_integral += dur * len(pair.d_running)
         self.at(self.now + dur, self.d_end, pair, joined)
 
     def d_end(self, pair: Pair, joined: list) -> None:
@@ -489,7 +482,168 @@ def summarize(sim: Sim, phases: list[dict]) -> dict:
     return out
 
 
+class SimBackend:
+    """`ProbeBackend` over one simulated pair: the real tier locator measures the
+    simulated hardware through it exactly as through the Canary probe (windows,
+    per-request state samples, average power, D running sequences)."""
+
+    service_source = "metrics"
+
+    def __init__(self, phys: Physics, lengths=LENGTHS, seed: int = 7) -> None:
+        import random
+
+        self.phys = phys
+        self.lengths = list(lengths)
+        self.rng = random.Random(seed)
+        self.limit: int | None = None
+        self.windows = 0
+        self.sim_seconds = 0.0
+
+    def _pairs(self) -> list[tuple[int, int]]:
+        pairs = [p for p in self.lengths if self.limit is None or p[0] <= self.limit]
+        return pairs or self.lengths[:1]
+
+    async def hardware(self) -> Hardware:
+        return Hardware(self.phys.p_clocks, self.phys.d_clocks)
+
+    async def idle_power(self, clock: ClockPoint, seconds: float) -> tuple[float, float]:
+        noise = 1 + self.rng.gauss(0, 0.005)
+        return (
+            self.phys.p_power(clock.prefill_mhz, 0.0) * noise,
+            self.phys.d_power(clock.decode_mhz, 0.0) * noise,
+        )
+
+    async def service_times(self, clock, prompts):
+        out = []
+        for n in prompts:
+            pre = self.phys.prefill_ms(clock.prefill_mhz, n) * (1 + self.rng.gauss(0, 0.01))
+            ttft = (
+                self.phys.overhead_ms
+                + pre
+                + n * self.phys.kv_bytes_per_token / self.phys.link_bytes_s * 1000
+                + self.phys.d_iter_ms(clock.decode_mhz, 1)
+                + self.phys.d_first_extra_ms
+            )
+            out.append((n, pre, ttft))
+        return out
+
+    def set_prompt_limit(self, max_prompt: int | None) -> float:
+        self.limit = max_prompt
+        pairs = self._pairs()
+        return sum(p for p, _ in pairs) / len(pairs)
+
+    def _result(self, s: "Sim", clock: ClockPoint, kind: str, load: float) -> WindowResult:
+        pair = s.pairs[0]
+        reqs = [r for r in s.requests if r.status == "ok"]
+        end = max((r.done for r in reqs), default=1.0)
+        start = min((r.at for r in s.requests), default=0.0)
+        duration = max(end - start, 1e-3)
+        f_p, f_d = clock.prefill_mhz, clock.decode_mhz
+        p_j = self.phys.p_power(f_p, 0) * duration + pair.p_busy_s * (
+            self.phys.p_power(f_p, 1) - self.phys.p_power(f_p, 0)
+        )
+        d_j = self.phys.d_power(f_d, 0) * duration + pair.d_busy_s * (
+            self.phys.d_power(f_d, 1) - self.phys.d_power(f_d, 0)
+        )
+        tokens = sum(r.output for r in reqs)
+        tpots = sorted(t for t in (s.tpot(r) for r in reqs) if t is not None)
+        self.windows += 1
+        self.sim_seconds += duration
+        busy = min(1.0, pair.d_busy_s / duration)
+        running = pair.d_running_integral / duration if duration else 0.0
+        return WindowResult(
+            clock=clock,
+            kind=kind,
+            load=load,
+            duration_s=duration,
+            requests=len(reqs),
+            violations=sum(violated(r) for r in reqs),
+            ttft_p95_ms=pct([(r.first - r.at) * 1000 for r in reqs], 0.95),
+            tpot_p95_ms=pct(tpots, 0.95),
+            prefill_j_per_request=p_j / len(reqs) if reqs else None,
+            decode_j_per_token=d_j / tokens if tokens else None,
+            prefill_mhz_median=float(min(f_p, self.phys.p_f_eff)),
+            prefill_limited_fraction=1.0 if f_p > self.phys.p_f_eff else 0.0,
+            decode_waiting_max=float(pair.d_waiting_max),
+            decode_kv_max=pair.d_kv_max,
+            decode_running_max=float(pair.d_running_max),
+            samples=[s.probe_sample(r) for r in reqs],
+            prefill_avg_w=p_j / duration,
+            decode_avg_w=d_j / duration,
+            decode_busy_fraction=busy,
+            decode_running_mean=running / busy if busy > 0 else None,
+            tpot_p50_ms=tpots[len(tpots) // 2] if tpots else None,
+        )
+
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
+        import random
+
+        trace = random.Random(int(eq_tps * 10) + 17)
+        pairs = self._pairs()
+        mean = sum(p for p, _ in pairs) / len(pairs)
+        count = max(1, round(eq_tps / (mean + alpha) * seconds))
+        arrivals = [
+            loadgen.Arrival(i, t, "w", *pairs[trace.randrange(len(pairs))])
+            for i, t in enumerate(sorted(trace.uniform(0, seconds) for _ in range(count)))
+        ]
+        s = Sim(1, "baseline", clock, phys=self.phys)
+        s.run(arrivals, seconds)
+        return self._result(s, clock, "open", eq_tps)
+
+    async def closed_window(self, clock, concurrency, seconds, rep=0):
+        import random
+
+        trace = random.Random(concurrency * 101 + rep)
+        pairs = self._pairs()
+        s = Sim(1, "baseline", clock, phys=self.phys)
+        ids = iter(range(10**9))
+        stagger = min(15.0, seconds / 3)
+
+        def send(worker: int, at: float) -> None:
+            if at >= seconds:
+                return
+            prompt = pairs[trace.randrange(len(pairs))][0]
+            s.at(at, s.arrive, Req(next(ids), at, "w", prompt, 256, worker=worker))
+
+        s.on_done = lambda r: send(r.worker, s.now)
+        for w in range(concurrency):
+            send(w, stagger * w / max(concurrency, 1))
+        s.loop(seconds)
+        return self._result(s, clock, "closed", concurrency)
+
+    async def kv_capacity(self) -> int:
+        return self.phys.d_kv_tokens
+
+
+def run_canary(phys: Physics = REFERENCE, lengths=LENGTHS) -> tuple[TierTable, SimBackend]:
+    """The real tier locator on the simulated pair; deployment inputs only: the KV
+    geometry and kv_buffer_size (what config.yaml and the model's config.json give)."""
+    backend = SimBackend(phys, lengths)
+    locator = TierLocator(
+        backend,
+        LocatorSettings.from_config(load_config()),
+        admission=AdmissionInputs(
+            kv_bytes_per_token=phys.kv_bytes_per_token, kv_buffer_bytes=phys.kv_buffer_bytes
+        ),
+    )
+    prompts = sorted({p for p, _ in lengths})
+    table = asyncio.run(locator.locate(sum(prompts) / len(prompts), prompts))
+    return table, backend
+
+
+def trace(table: TierTable, profile: str, seed: int, lengths=LENGTHS):
+    """The load profile in units of the Canary's measured per-group capacity."""
+    return loadgen.build_trace(
+        loadgen.parse_profile(profile),
+        lengths,
+        capacity_h=table.capacity_h,
+        alpha=table.alpha_tokens,
+        seed=seed,
+    )
+
+
 def calibrate(clock: ClockPoint, rates, seconds: float, seed: int) -> list[dict]:
+    """Single-pair rate sweep of the simulated environment (what the hardware is)."""
     rows = []
     for rate in rates:
         phases = loadgen.parse_profile(f"run:{seconds}:{rate}")
@@ -507,133 +661,69 @@ def calibrate(clock: ClockPoint, rates, seconds: float, seed: int) -> list[dict]
                 "ttft_p50": pct(ttft, 0.5),
                 "ttft_p95": pct(ttft, 0.95),
                 "send_retries": sim.pairs[0].send_retries,
-                "running_mean": round(statistics.mean(r["G0"]["running"] for r in sim.timeline)),
             }
         )
     return rows
 
 
-def multi_seed(args) -> int:
-    overrides = {k: json.loads(v) for k, v in (item.split("=", 1) for item in args.set)}
-    mean_prompt = sum(p for p, _ in LENGTHS) / len(LENGTHS)
-    keys = ("goodput", "served", "rejected", "served_late", "max_group_s", "active_group_s")
-    rows: dict = {}
-    for seed in range(args.seed, args.seed + args.seeds):
-        meta, arrivals = loadgen.build_trace(
-            loadgen.parse_profile(args.profile),
-            LENGTHS,
-            capacity_h=args.capacity_rps * (mean_prompt + ALPHA_TOKENS),
-            alpha=ALPHA_TOKENS,
-            seed=seed,
-        )
-        for policy in args.policies.split(","):
-            sim = Sim(2, policy, MAX if policy == "baseline" else H, args.capacity_rps, overrides)
-            sim.run(arrivals, meta["duration_s"])
-            res = summarize(sim, meta["phases"])
-            for phase in [p["name"] for p in meta["phases"]] + ["total"]:
-                row = dict(res[phase])
-                row["served"] = row["served"] / max(row["offered"], 1)
-                rows.setdefault((phase, policy), []).append([row[k] for k in keys])
-    print(f"C_H {args.capacity_rps} rps, mean of {args.seeds} seeds (served = share of offered)")
-    print(f"{'phase':>9} {'policy':>15} " + " ".join(f"{k:>14s}" for k in keys))
-    for (phase, policy), values in rows.items():
-        means = [statistics.mean(v[i] for v in values) for i in range(len(keys))]
-        print(f"{phase:>9} {policy:>15} " + " ".join(f"{m:>14.3f}" for m in means))
-    return 0
+def run_policy(policy: str, table: TierTable, arrivals, meta, overrides, groups: int = 2):
+    clocks = MAX if policy == "baseline" else table.h
+    sim = Sim(groups, policy, clocks, router_overrides=overrides, table=table)
+    sim.run(arrivals, meta["duration_s"])
+    res = summarize(sim, meta["phases"])
+    res["energy_kj"] = sim.energy_j / 1000
+    return sim, res
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--calibrate", action="store_true", help="single-pair rate sweep")
     ap.add_argument("--profile", default=loadgen.DEFAULT_PROFILE)
-    ap.add_argument("--capacity-rps", type=float, default=4.0, help="C_H of one group (req/s)")
+    ap.add_argument("--load-scale", type=float, default=1.0, help="x the profile's loads")
     ap.add_argument("--seed", type=int, default=20261001)
+    ap.add_argument("--seeds", type=int, default=1)
     ap.add_argument("--policies", default="baseline,reject,serve_dispatch,serve")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--set", action="append", default=[], help="router key=value (JSON value)")
-    ap.add_argument("--seeds", type=int, default=1, help="> 1: mean over seeds, short table")
     args = ap.parse_args()
     if args.calibrate:
-        for clock in (H, MAX):
+        for clock in (ClockPoint(REFERENCE.p_clocks[2], REFERENCE.d_clocks[2]), MAX):
             print(f"single pair at {clock.key()}:")
             for row in calibrate(clock, [1, 2, 3, 3.5, 4, 4.5, 5, 6], 120, args.seed):
                 print("  ", row)
         return 0
-    if args.seeds > 1:
-        return multi_seed(args)
-    mean_prompt = sum(p for p, _ in LENGTHS) / len(LENGTHS)
-    meta, arrivals = loadgen.build_trace(
-        loadgen.parse_profile(args.profile),
-        LENGTHS,
-        capacity_h=args.capacity_rps * (mean_prompt + ALPHA_TOKENS),
-        alpha=ALPHA_TOKENS,
-        seed=args.seed,
-    )
+    table, backend = run_canary()
     print(
-        f"trace: {len(arrivals)} requests over {meta['duration_s']:.0f} s,"
-        f" C_H {args.capacity_rps} rps"
+        f"Canary: {backend.windows} windows; H {table.h.key()},"
+        f" C_H {table.evidence.get('capacity_rps', 0):.2f} req/s"
     )
-    results = {}
-    for policy in args.policies.split(","):
-        started = time.monotonic()
-        overrides = {k: json.loads(v) for k, v in (item.split("=", 1) for item in args.set)}
-        sim = Sim(2, policy, MAX if policy == "baseline" else H, args.capacity_rps, overrides)
-        sim.run(arrivals, meta["duration_s"])
-        results[policy] = summarize(sim, meta["phases"])
-        print(f"{policy}: simulated in {time.monotonic() - started:.0f} s")
-        if args.out is not None:
-            args.out.mkdir(parents=True, exist_ok=True)
-            with (args.out / f"{policy}_requests.jsonl").open("w") as f:
-                for r in sim.requests:
-                    f.write(
-                        json.dumps(
-                            {
-                                "id": r.id,
-                                "at": round(r.at, 3),
-                                "phase": r.phase,
-                                "prompt": r.prompt,
-                                "status": r.status,
-                                "group": None if r.pair is None else r.pair.name,
-                                "ttft_ms": None
-                                if r.first is None
-                                else round((r.first - r.at) * 1000),
-                                "violated": violated(r),
-                                "overflow": None if r.ticket is None else r.ticket.overflow,
-                                "predicted_ms": None if r.ticket is None else r.ticket.predicted_ms,
-                            }
-                        )
-                        + "\n"
-                    )
-            (args.out / f"{policy}_timeline.json").write_text(json.dumps(sim.timeline))
-    if args.out is not None:
-        (args.out / "summary.json").write_text(
-            json.dumps({"meta": meta, "results": results}, indent=1)
-        )
-    phases = [p["name"] for p in meta["phases"]] + ["total"]
-    keys = (
-        "offered",
-        "served",
-        "rejected",
-        "served_late",
-        "goodput",
-        "ttft_p95",
-        "overflow",
-        "overflow_good",
-        "late_ttft_p50",
-        "active_group_s",
-        "max_group_s",
+    profile = ",".join(
+        ":".join([f[0], f[1], str(float(f[2]) * args.load_scale)] + f[3:])
+        for f in (item.split(":") for item in args.profile.split(","))
     )
-    for name in phases:
-        print(f"\n[{name}]")
-        print("  " + " ".join(f"{k:>14s}" for k in ("policy",) + keys))
-        for policy, res in results.items():
-            row = res[name]
-            print("  " + " ".join(f"{str(v):>14s}" for v in [policy] + [row[k] for k in keys]))
-    for policy, res in results.items():
-        print(
-            f"{policy}: send retries {res['send_retries']}",
-            res.get("router", {}).get("overflows", ""),
-        )
+    overrides = {k: json.loads(v) for k, v in (item.split("=", 1) for item in args.set)}
+    keys = ("goodput", "served", "rejected", "served_late", "ttft_p95", "energy_kj")
+    rows: dict = {}
+    for seed in range(args.seed, args.seed + args.seeds):
+        meta, arrivals = trace(table, profile, seed)
+        for policy in args.policies.split(","):
+            sim, res = run_policy(policy, table, arrivals, meta, overrides)
+            for phase in [p["name"] for p in meta["phases"]] + ["total"]:
+                row = dict(res[phase])
+                row["served"] = row["served"] / max(row["offered"], 1)
+                row["energy_kj"] = res["energy_kj"] if phase == "total" else None
+                rows.setdefault((phase, policy), []).append(row)
+            if args.out is not None:
+                args.out.mkdir(parents=True, exist_ok=True)
+                (args.out / f"{policy}_{seed}_timeline.json").write_text(json.dumps(sim.timeline))
+    print(f"mean of {args.seeds} seed(s), load x {args.load_scale} (served = share of offered)")
+    print(f"{'phase':>9} {'policy':>15} " + " ".join(f"{k:>11s}" for k in keys))
+    for (phase, policy), values in rows.items():
+        cells = []
+        for k in keys:
+            vals = [v[k] for v in values if v.get(k) is not None]
+            cells.append(f"{statistics.mean(vals):>11.3f}" if vals else f"{'':>11s}")
+        print(f"{phase:>9} {policy:>15} " + " ".join(cells))
     return 0
 
 

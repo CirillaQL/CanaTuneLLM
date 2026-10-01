@@ -1,12 +1,13 @@
 """State-based admission: KV geometry, prefill cost, an online TTFT predictor and a
-risk table over predicted slack (measurements r6b / r7, offline replay).
+risk table over predicted slack. Every number comes from the config (model KV
+geometry, SLO) or from the Canary's calibration on this cluster.
 
 Per request the Router knows, at arrival, for each group:
   own prefill cost S(L)             from the Canary's single-request length table
   pending P work                    sum S(L) of requests sent to P, not yet returned
   KV bytes in flight                prompt tokens x KV bytes/token of requests whose P
                                     returned and whose first token has not arrived
-                                    (the D receive buffer holds these: r7's cliff)
+                                    (the D receive buffer holds these)
   requests decoding on D
 It predicts TTFT with a linear model refitted online on its own clean samples,
 and admits when the violation risk of the predicted-slack bucket (slack = SLO -
@@ -20,16 +21,17 @@ import os
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 FEATURES = ("intercept", "s_own_ms", "pending_ms", "inflight_gb", "decoding")
-# Generic fallback (ms, ms/ms, ms/ms, ms/GB, ms/request), used only when the model
-# or GPU spec is unknown: the deployment's prior comes from `priors.Priors`, the
-# Canary's calibration windows replace it, production refits it online.
-PRIOR_COEF = (150.0, 1.0, 1.0, 800.0, 2.0)
+
+
+def slack_edges(ttft_slo_ms: float) -> tuple[float, ...]:
+    """Slack bucket edges in tenths of the TTFT SLO, from -0.4 to +0.8 SLO."""
+    return tuple(ttft_slo_ms * k / 10 for k in range(-4, 9))
 
 
 def kv_bytes_per_token(model_config: Mapping[str, Any], dtype_bytes: int = 2) -> int:
@@ -53,16 +55,17 @@ def kv_bytes_from_model_dir(path: str | os.PathLike | None) -> int | None:
 
 
 class PrefillCost:
-    """Single-request prefill time S(L) in ms: piecewise linear over a length table
-    (measured: plateau + slope), extrapolated with the last segment."""
+    """Single-request prefill time S(L) in ms: piecewise linear over the Canary's
+    length table (plateau + slope), extrapolated with the last segment. Without a
+    table (cold start, admission open) it is 0."""
 
     def __init__(self, table: Mapping[int, float] | None = None) -> None:
-        points = sorted((int(k), float(v)) for k, v in (table or {}).items())
-        # No table and no priors: a generic plateau + slope (only for cold start).
-        self.points = points if len(points) >= 2 else [(256, 35.0), (4096, 340.0)]
+        self.points = sorted((int(k), float(v)) for k, v in (table or {}).items())
 
     def __call__(self, length: int) -> float:
         pts = self.points
+        if len(pts) < 2:
+            return 0.0
         if length <= pts[0][0]:
             return pts[0][1]
         for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
@@ -74,30 +77,19 @@ class PrefillCost:
 
 class CostBook:
     """S(L) per P clock: the Canary's tables measured at several clocks; a clock
-    without one uses the nearest measured clock (prefill time only shortens with
-    the clock: the nearest table at or below it is the conservative choice), and
-    without any measurement the spec priors (`fallback(clock_mhz)`)."""
+    without one uses the nearest measured clock at or below it (prefill time only
+    shortens with the clock, so that is the conservative choice)."""
 
-    def __init__(
-        self,
-        tables: Mapping[int, Mapping[int, float]] | None = None,
-        fallback: "Callable[[int], Mapping[int, float]] | None" = None,
-    ) -> None:
+    def __init__(self, tables: Mapping[int, Mapping[int, float]] | None = None) -> None:
         self.costs = {int(f): PrefillCost(t) for f, t in (tables or {}).items() if len(t) >= 2}
-        self.fallback = fallback
-        self._fallback_costs: dict[int, PrefillCost] = {}
 
     def for_clock(self, mhz: int | None) -> PrefillCost:
-        if self.costs:
-            if mhz is None:
-                return self.costs[max(self.costs)]
-            below = [f for f in self.costs if f <= mhz]
-            return self.costs[max(below) if below else min(self.costs)]
-        key = int(mhz or 0)
-        if key not in self._fallback_costs:
-            table = None if self.fallback is None else self.fallback(key)
-            self._fallback_costs[key] = PrefillCost(table)
-        return self._fallback_costs[key]
+        if not self.costs:
+            return PrefillCost()
+        if mhz is None:
+            return self.costs[max(self.costs)]
+        below = [f for f in self.costs if f <= mhz]
+        return self.costs[max(below) if below else min(self.costs)]
 
 
 def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
@@ -116,22 +108,25 @@ def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None
 
 
 class TtftPredictor:
-    """Linear TTFT model over FEATURES, refitted on a sliding window of clean
-    samples. Ridge-regularized towards the prior, so a sparse window cannot swing
-    the coefficients far (the pending-work weight drifted 0.2-0.64 between runs)."""
+    """Linear TTFT model over FEATURES. The Canary's calibration fits it (plain
+    least squares, no prior); production refits it on a sliding window of clean
+    samples, ridge-regularized towards the Canary's fit so a sparse window cannot
+    swing the coefficients far. Until the Canary publishes, admission is open and
+    the predictor is not used (prior None: all coefficients 0)."""
 
     def __init__(
         self,
-        prior: Sequence[float] = PRIOR_COEF,
+        prior: Sequence[float] | None = None,
         *,
         window: int = 2000,
         refit_every: int = 50,
         ridge: float = 50.0,
-        clip_ms: float = 3000.0,
+        clip_ms: float = math.inf,
     ) -> None:
-        if len(prior) != len(FEATURES):
+        if prior is not None and len(prior) != len(FEATURES):
             raise ValueError(f"prior needs {len(FEATURES)} coefficients")
-        self.prior = [float(c) for c in prior]
+        self.has_prior = prior is not None
+        self.prior = [float(c) for c in (prior or [0.0] * len(FEATURES))]
         self.coef = list(self.prior)
         self.samples: deque[tuple[tuple[float, ...], float]] = deque(maxlen=window)
         self.refit_every = refit_every
@@ -156,18 +151,19 @@ class TtftPredictor:
         with self._lock:
             self.prior = [float(c) for c in prior]
             self.coef = list(self.prior)
+            self.has_prior = True
             if len(self.samples) >= self.refit_every:
                 self._refit()
 
-    def fit(
-        self, samples: Sequence[tuple[Sequence[float], float]], ridge: float = 5.0
-    ) -> list[float]:
-        """Ridge fit of `samples` (features, TTFT ms) towards the prior; -> coefficients
-        (the predictor itself is not changed). The ridge weighs the prior like that
-        many samples: a calibration's hundreds of samples dominate it, while online
-        refits (`self.ridge`) stay close to the calibration."""
+    def fit(self, samples: Sequence[tuple[Sequence[float], float]]) -> list[float]:
+        """Least-squares fit of `samples` (features, TTFT ms); -> coefficients (the
+        predictor itself is not changed). Towards the prior when there is one, with
+        a ridge worth a handful of samples, else plain least squares."""
         probe = TtftPredictor(
-            self.prior, window=max(len(samples), 1), ridge=ridge, clip_ms=self.clip_ms
+            self.prior if self.has_prior else None,
+            window=max(len(samples), 1),
+            ridge=5.0 if self.has_prior else 1e-6,
+            clip_ms=self.clip_ms,
         )
         for x, y in samples:
             probe.samples.append((tuple(x), min(float(y), self.clip_ms)))
@@ -179,7 +175,7 @@ class TtftPredictor:
         with self._lock:
             self.samples.append((tuple(x), min(float(ttft_ms), self.clip_ms)))
             self._since_fit += 1
-            if self._since_fit >= self.refit_every:
+            if self.has_prior and self._since_fit >= self.refit_every:
                 self._since_fit = 0
                 self._refit()
 
@@ -221,28 +217,25 @@ class SlackEstimate:
     bucket: int
     risk: float
     samples: int
-    source: str  # "observed", "pooled", "cold"
+    source: str  # "observed", "bounded" (by a lower-slack bucket), "unknown"
 
 
 class SlackRisk:
     """Violation risk by predicted-slack bucket: Wilson UCB (the calibration's
-    feasibility bound). A bucket with `min_samples` uses its own record. A sparse
-    bucket with at least `cold_margin_ms` of slack is admitted so it can collect
-    samples (pooling it with riskier buckets would reject it forever, the smoke-2
-    deadlock); a sparse bucket below the margin pools with every lower-slack bucket
-    (risk only falls as slack grows, so that is an upper bound), else is rejected."""
+    feasibility bound), over production's own samples plus the Canary's seed. A
+    bucket with `min_samples` uses its own record. A sparse bucket is bounded by the
+    nearest observed bucket with less slack (risk does not grow with slack, so that
+    is an upper bound); with none below it the risk is unknown (1.0)."""
 
     def __init__(
         self,
-        edges_ms: Sequence[float] = tuple(range(-400, 900, 100)),
+        edges_ms: Sequence[float] = slack_edges(1000.0),
         *,
         min_samples: int = 20,
-        cold_margin_ms: float = 200.0,
         path: str | Path | None = None,
     ) -> None:
         self.edges = sorted(float(e) for e in edges_ms)
         self.min_samples = min_samples
-        self.cold_margin_ms = cold_margin_ms
         self.path = None if path is None else Path(path)
         self.counts: dict[int, list[int]] = {}  # bucket -> [admitted, violated]
         self.seed: dict[int, list[int]] = {}  # the Canary's calibration windows
@@ -290,17 +283,12 @@ class SlackRisk:
             n, k = self._cell(b)
             if n >= self.min_samples:
                 return SlackEstimate(b, wilson_ucb(k, n), n, "observed")
-            if slack_ms >= self.cold_margin_ms:
-                return SlackEstimate(b, 0.0, n, "cold")
-            pn, pk = n, k
             lower_buckets = {c for c in set(self.counts) | set(self.seed) if c < b}
             for lower in sorted(lower_buckets, reverse=True):
                 cn, ck = self._cell(lower)
-                pn += cn
-                pk += ck
-                if pn >= self.min_samples:
-                    return SlackEstimate(b, wilson_ucb(pk, pn), pn, "pooled")
-        return SlackEstimate(b, 1.0, n, "cold")
+                if cn >= self.min_samples:
+                    return SlackEstimate(b, wilson_ucb(ck, cn), cn, "bounded")
+        return SlackEstimate(b, 1.0, n, "unknown")
 
     def to_json(self) -> dict[str, Any]:
         with self._lock:

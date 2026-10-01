@@ -3,15 +3,20 @@
 The Canary is an ordinary production group whenever it is not experimenting.
 
 Start (all of):
-* a trigger: cold start (no table: start immediately, production runs at MAX
-  and admits everything meanwhile), a shift of the production length
-  distribution (median or p90 by more than `length_shift`), production
-  violations drifting above theta, or the periodic neighbour check of H;
-* the rest of the pool can carry production: no rejection for `quiet_s`, and
-  the load of the active groups without the Canary <= `others_load_max * C_H`;
+* a trigger: cold start or a table without a cluster model (full calibration;
+  production runs at MAX and admits everything meanwhile), production violations
+  drifting above theta (relocation), a verification (the length distribution
+  shifted by more than `length_shift`, or the Controller's plan runs a point at a
+  per-group rate the Canary has not confirmed), or the periodic neighbour check;
+* the rest of the pool can carry production: no pressure for `quiet_s`, and the
+  solver finds the active groups without the Canary feasible for the demand;
 * budget: `min_interval_s` since the last experiment and at most `max_duty` of
   the time spent experimenting.
 The Canary then drains (no new requests; in-flight ones finish) and explores.
+
+A verification is one window at the plan's point and per-group rate with the
+current length mix: a pass records the rate as confirmed, a failure caps the
+point below that rate in the model (the solver then avoids it).
 
 Stop: the locator finishes (the new table is published), or the Controller
 reports pressure it cannot relieve by waking a parked group (abort: the
@@ -36,7 +41,6 @@ from canatune.domain.load import LengthStats, LengthSummary
 class SchedulerSettings:
     period_s: float = 1.0
     quiet_s: float = 60.0
-    others_load_max: float = 0.7
     min_interval_s: float = 600.0
     max_duty: float = 0.10
     periodic_s: float = 1800.0
@@ -80,6 +84,7 @@ class CanaryScheduler:
         self._draining_since: float | None = None
         self._pending: tuple[str, str] | None = None
         self.history: list[dict[str, Any]] = []
+        self.verified: dict[str, float] = {}  # point -> highest per-group rate confirmed
         controller.on_pressure = self.abort
 
     @property
@@ -99,13 +104,17 @@ class CanaryScheduler:
             self._last_rejection_at = self._clock()
 
     def trigger(self) -> tuple[str, str] | None:
-        """-> (kind, reason): kind is "full", "relocate" or "recheck"."""
+        """-> (kind, reason): kind is "full", "relocate", "verify" or "recheck"."""
         table = self.controller.tiers.table
         if table is None:
             return "full", "cold_start"
+        if self.controller.tiers.model_json() is None:
+            return "full", "no_model"
         if self._reference is not None and not self.lengths.using_default:
             if self.lengths.summary().shifted(self._reference, self.s.length_shift):
-                return "relocate", "length_shift"
+                return "verify", "length_shift"
+        if self._unverified() is not None:
+            return "verify", "plan"
         outcomes = self.controller.router.outcomes
         if len(outcomes) >= self.s.drift_min_samples:
             k = sum(outcomes)
@@ -138,16 +147,28 @@ class CanaryScheduler:
         canary = self.canary
         if canary is None:
             return False, "no_canary"
-        loads = self.controller.loads(now)
         others = [
             g for g in self.controller.groups if g is not canary and g.state is GroupState.ACTIVE
         ]
-        total = sum(loads[g.name] for g in self.controller.groups if g.state is GroupState.ACTIVE)
         if not others:
             return False, "no_other_active_group"
-        if total > self.s.others_load_max * table.capacity_h * len(others):
+        if self.controller.tiers.model_json() is not None and not self.controller.can_carry(
+            len(others), now
+        ):
             return False, "others_cannot_carry"
         return True, "ok"
+
+    def _unverified(self) -> tuple[Any, float] | None:
+        """(point, per-group rate) of the current plan when the Canary has not seen
+        that point feasible at that rate; None otherwise."""
+        plan = self.controller.plan
+        if plan is None or not plan.feasible:
+            return None
+        rate, _, _ = self.controller.demand(self._clock())
+        per_group = rate / max(plan.n, 1)
+        if per_group <= self.verified.get(plan.point.key(), 0.0):
+            return None
+        return plan.point, per_group
 
     # ---- control --------------------------------------------------------------------------
 
@@ -222,7 +243,7 @@ class CanaryScheduler:
         pairs = self.lengths.pairs()
         prompts = sorted(p for p, _ in pairs)
         # Include the longest prompt: lengths that miss the SLO even when idle must be
-        # found here, or they poison every later window (smoke r2 never tested 2048).
+        # found here, or they poison every later window.
         picks = {prompts[int(q * (len(prompts) - 1))] for q in (0.1, 0.3, 0.5, 0.7, 0.9)}
         picks.add(prompts[-1])
         if len(picks) < 2:
@@ -238,6 +259,11 @@ class CanaryScheduler:
         error_text = None
         try:
             summary = self.lengths.summary()
+            if kind == "verify" and table is not None:
+                await self._verify()
+                self._reference = summary
+                outcome = "verified"
+                return
             if kind == "recheck" and table is not None:
                 new = await self.locator.recheck(table, self._prompts())
             else:
@@ -251,6 +277,10 @@ class CanaryScheduler:
             self._reference = summary
             controller.router.outcomes.clear()
             await controller.publish(new, reason)
+            self.verified = {}
+            capacity = new.evidence.get("capacity_rps")
+            if capacity:  # the fill windows confirmed H up to C_H
+                self.verified[new.h.key()] = float(capacity)
             outcome = "published"
         except asyncio.CancelledError:
             outcome = "aborted"
@@ -280,6 +310,42 @@ class CanaryScheduler:
                     await controller.set_tier(canary, Tier.H, f"canary_{outcome}")
                 else:
                     await controller.set_tier(canary, Tier.MAX, f"canary_{outcome}")
+
+    async def _verify(self) -> None:
+        """Layer 3: the plan's point at its per-group rate, current length mix."""
+        assert self.locator is not None
+        controller = self.controller
+        target = self._unverified()
+        if target is None:  # a length shift: re-check the current plan as it is
+            plan = controller.plan
+            if plan is None:
+                return
+            rate, _, _ = controller.demand(self._clock())
+            target = (plan.point, rate / max(plan.n, 1))
+        point, per_group = target
+        self.locator.mean_prompt = self.lengths.summary().prompt_mean
+        w = await self.locator.verify(point, per_group, controller.tiers.alpha_tokens)
+        ok = self.locator.meets_target(w)
+        key = point.key()
+        controller.log.write(
+            {
+                "event": "canary_verify",
+                "point": key,
+                "rate_rps": per_group,
+                "ok": ok,
+                "requests": w.requests,
+                "violations": w.violations,
+            }
+        )
+        if ok:
+            self.verified[key] = max(self.verified.get(key, 0.0), per_group)
+            return
+        model = controller.tiers.model_json()
+        if model is not None:  # the point is infeasible at this rate: cap it below
+            caps = model.setdefault("caps", {})
+            caps[key] = min(float(caps.get(key, per_group)), per_group)
+            if controller.store is not None and controller.tiers.table is not None:
+                controller.store.save(controller.tiers.table)
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

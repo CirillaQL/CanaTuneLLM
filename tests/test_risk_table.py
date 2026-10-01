@@ -28,15 +28,6 @@ def test_config_table_starts_empty_and_unknown_is_unsafe() -> None:
     assert (estimate.source, estimate.risk) == ("unknown", 1.0)
 
 
-def test_seed_is_keyed_by_clock_point() -> None:
-    config = load_config()
-    raw = dict(config["risk"])
-    raw["seed"] = {"1815/1050": [[0.05] * 5 for _ in range(6)]}
-    t = RiskTable.from_config(raw, identity(config))
-    assert t.lookup(H, 0, 128, True).risk == pytest.approx(0.05)
-    assert t.lookup(L, 0, 128, True).source == "unknown"
-
-
 def test_sparse_cell_uses_heavier_bound_and_lighter_floor() -> None:
     t = table()
     heavy = t.cell(L, 3, 1024, False)
@@ -81,18 +72,6 @@ def test_pooled_bound_uses_sparse_heavier_cells() -> None:
     assert t.estimate(t.cell(H, 2, 2048, True)).source == "unknown"
     # Lighter cells never enter the pool.
     assert t.estimate(t.cell(H, 3, 128, True)).source == "unknown"
-
-
-def test_sparse_observations_can_raise_but_not_lower_a_seed() -> None:
-    t = table()
-    t.load_seed(H, [[0.2] * 5 for _ in range(6)])
-    cell = t.cell(H, 0, 128, True)
-    t.record(cell, False)
-    assert t.estimate(cell).risk == pytest.approx(0.2)
-    t.record(cell, True)
-    assert t.estimate(cell).risk == pytest.approx(0.5)
-    t.record(cell, False)  # now 3 samples: observed 1/3 replaces the seed
-    assert t.estimate(cell).source == "observed"
 
 
 def test_clock_usable_needs_a_safe_well_sampled_cell() -> None:

@@ -39,236 +39,122 @@ parameters**, not as scheduling knobs.
 
 ## Design
 
+Everything the system uses comes from the configuration or from the Canary's own
+experiments on the running cluster; nothing is carried over from other clusters or
+offline runs.
+
+| Source | What |
+|---|---|
+| configuration | the model's `config.json` (KV bytes per token), `kv_transfer` (connector, `kv_buffer_bytes`), topology, the policy: SLOs, theta, `max_wait_ms`, `hold_max_ms`, `t_down_s` |
+| Canary experiments | everything else: tiers, S(L) per clock, D iteration model, power per clock vs load, capacity, the admission predictor, the slack-risk seed, the KV-in-flight gate |
+| production, online | predictor refits, slack-risk counts, offered rate and length mix for the solver |
+
 ### Lifecycle
 
 ```text
-deploy ─> cold start ─────────────────────> publish ─> steady state ─> re-exploration ─┐
-          production: MAX clocks,            groups move   Router: risk admission     │
-          admit everything                   to H one by   Controller: park / wake /  │
-          Canary: calibrate at once          one           L-H                        │
-          (~15 min)                                        Canary: serves             │
-                                                           ^──────────────────────────┘
+deploy ─> cold start ──────────────> publish ─> steady state ──────────────────> re-exploration
+          production at MAX,          table +     Router: state-based admission      (verify /
+          admit everything            cluster     Controller: solver plan, pressure  relocate /
+          Canary: calibrate at once   model       Canary: serves, verifies plans     recheck)
 ```
 
-- **Cold start.** Without a stored tier table, every production group runs at
-  MAX (the highest clocks the agents report) and the Router admits every request
-  (no table yet, nothing to reject on). The Canary starts calibrating at once and
-  never serves during that time. Production samples are recorded at the MAX clock
-  point; they are not used as H risk (MAX is faster than H).
-- **Publish.** The Canary publishes a tier table. Production groups move to H one
-  at a time (`controller.stagger_s`), and the Router switches to risk admission.
-  The table is saved with the configuration identity and reused on restart; a
-  table from another configuration is ignored.
-- **Steady state.** The Canary is an ordinary production group whenever it is not
-  experimenting.
+- **Cold start.** No table: every production group runs at MAX and the Router
+  admits every request. The Canary calibrates at once.
+- **Publish.** The tier table carries the Canary's evidence (S(L) per clock, the
+  admission calibration and the cluster model). Groups move to the working point
+  one at a time; the table is saved with the configuration identity.
+- **Steady state.** The Canary serves as an ordinary group when not experimenting.
 
-### Load unit: equivalent prompt tokens/s
-
-```text
-load(group) = Σ over requests admitted in the window (L_in + alpha) / window
-```
-
-`alpha` is the fixed per-request prefill cost expressed in tokens. The Canary
-fits prefill time = a + b·L_in and sets alpha = a/b (K2 on L40S: 28 ms +
-0.0615 ms/token, alpha ≈ 460). Plain RPS ignores prompt length; plain tokens/s
-under-counts short requests (a 128-token request costs as much as ~590 tokens).
-Capacity `C_H` uses the same unit. Group-level decisions (how many groups, which
-tier, Canary load) use this load; per-request admission uses the risk table.
-
-### Tiers (published by the Canary)
-
-| Tier | Meaning | Current cluster (expected) |
-|---|---|---|
-| MAX | highest supported clocks, cold start only | P 2520 (runs ~2040, power cap), D 1500 |
-| **H** | P: upper edge of the loaded energy valley at 0.8·C0, excluding power-limited clocks; D: lowest J/token clock meeting TPOT | P ≈ 1815–2000, D 1050 |
-| L (optional) | only if it saves > 2·eps against H at 0.3·C0 | none (one working tier) |
-| **Park** | lowest idle power | P 900, D 450 |
-
-D is limited by a **KV wall** (K3b: 48 sequences at 0.82 memory utilization; 64
-concurrent gives preemptions and TPOT p95 210–216 ms at both 1050 and 1500).
-Raising the D clock does not move it, so D has one clock and a KV admission limit
-instead of a boost valve.
-
-### Online risk table (per-request admission)
-
-```text
-R(clock point, N_await bucket, L_in bucket, D busy)
-    = fraction of admitted requests in that state that violated TTFT >= 500 ms or TPOT > 200 ms
-```
-
-- Cells are keyed by the locked clock point (`"1815/1050"`), not by tier name, so
-  Canary windows at any clock and production at any tier land in one table.
-- Monotone in `N_await` and `L_in`: a sparse cell is bounded by heavier
-  well-sampled cells and floored by lighter ones; a cell with neither is
-  **unknown = unsafe**.
-- Only clean samples are recorded (served OK, TTFT known, exact prompt length, no
-  clock change in flight).
-- The table starts empty on a new cluster. The Canary's last step fills the H
-  cells before production switches to H.
-
-### State-based admission (`router.admission: slack`, default)
-
-Measured in r6b/r7: the capacity cliff came from the KV connector's receive buffer
-on D overflowing (P then retries its sends and stalls; on L4 the fallback GPU
-allocation crashed D), and a request's TTFT depends on the work ahead of it, not on
-a queue count. Per group the Router tracks, from the proxy's stage events
-(P sent → P returned → first token → done):
-
-```text
-pending P work   = sum S(L) of requests at P      S(L): Canary length table (plateau + slope)
-KV in flight     = sum L x KV bytes/token of requests between P return and first token
-decoding         = requests past their first token
-predicted TTFT   = linear model over (S(L_own), pending, KV in flight, decoding),
-                   initial fit from the Canary's windows, refitted online on clean
-                   production samples (ridge towards the Canary's fit)
-slack            = TTFT SLO - predicted TTFT  ->  risk of that slack bucket (Wilson UCB)
-```
-
-Hard limits: KV in flight to the group's D <= the gate x
-`kv_transfer.kv_buffer_bytes` (the gate is measured by the Canary; the prior
-`kv_inflight_fraction` 0.5 until then; r6b/r7: above half the buffer 58-67 % of
-requests violated), plus the D concurrency and KV usage limits. Then slack risk <= theta.
-Sparse slack buckets with >= 200 ms of predicted slack are admitted to learn;
-below that they pool with lower-slack buckets. Offline replay (train on one run,
-test on the other, `scripts/analysis/admission_replay.py`): more requests admitted
-and fewer wrongly rejected than the v1 cells, violations below theta in both
-directions. Text prompts are tokenized with the model's tokenizer (`MODEL_PATH`)
-when available. `router.admission: cells` keeps the v1 table below.
-
-### Deployment inputs and self-calibration
-
-On a new cluster nothing comes from offline tests. Inputs: the model's
-`config.json` (`MODEL_PATH`), the GPU models (`topology.*.gpu_type`, datasheet
-table in `domain/priors.py`, or `cluster.gpu_specs`), `kv_transfer.kv_buffer_bytes`
-and `kv_transfer.link_gbps`, plus the policy (SLOs, theta, `hold_max_ms`).
-
-```text
-priors (cold start)   roofline from the specs: S(L) plateau = weights / P bandwidth,
-                      slope = 2 x params / P FLOPS (scaled by clock), D iteration =
-                      weights / D bandwidth, D KV capacity, TTFT predictor prior
-                      (proxy + 2 D iterations, own/pending S(L) x 1, KV in flight /
-                      link, decoding x per-sequence cost)
-Canary (locator)      S(L) at MAX, H and L (16, 64, 256, ... up to the longest
-                      prompt) -> plateau + slope per clock; every probe records the
-                      state it was sent into -> predictor coefficients (TTFT <= 2 x
-                      SLO), two-fold slack seed for the risk table, the KV-in-flight
-                      gate (first bin clearly above theta)  -> evidence.admission
-production            S(L) by the group's clock; the published calibration replaces
-                      the priors; online refits; backfill margin = lowest slack
-                      with observed risk <= theta / 2
-```
-
-Simulated on four unseen "clusters" with only these inputs
-(`scripts/analysis/selfcal_sim.py`: the real locator over a probe backend that
-simulates the pair, then production on the smoke-2 profile, 3 seeds):
-
-| cluster | C_H found | KV gate | goodput priors only | goodput calibrated | energy vs default |
-|---|---|---|---|---|---|
-| L40S / L4 (r6b physics) | 4.0 req/s | 0.2 | 97.7 % | 98.8 % | -26 % |
-| 2 Gb/s link | 0.9 req/s | 0.1 | 90.6 % | 96.4 % | -19 % |
-| kv_buffer 0.3 GB | 4.0 req/s | 0.5 | 97.4 % | 98.5 % | -30 % |
-| H100 / A100, 25 Gb/s | 22.4 req/s | 0.5 | 99.4 % | 99.5 % | -51 % |
-
-The power model of the simulation is synthetic (energy falls with the clock, so H
-lands on the lowest clocks); goodput is bounded by theta = 10 % by design.
-
-### Overload: serve instead of reject (`router.overload: serve`, default)
-
-In production a request at risk is served on the best group rather than refused.
-After `max_wait_ms` without a group within the risk bound (the slack counts the
-time already waited at the proxy; the predictor learns the part after dispatch):
-
-```text
-rescue    best group (lowest predicted TTFT, within the hard limits) still meets
-          the SLO                          -> dispatch there now (any waiter)
-doomed    SLO lost on every group          -> hold, first come first served, and
-          backfill: dispatch only where a fresh request would keep
-          backfill_slack_ms (400) of slack and no fresh request is waiting;
-          503 after hold_max_ms (30 s)
-hard      KV in flight / D walls           -> never overridden (buffer overflow
-          stalls the group and crashed D in r7): hold
-```
-
-Rescues, backfills and holds count as pressure (wake → abort Canary → MAX), like
-rejections did. Doomed requests are not dispatched at once (`doomed: dispatch`):
-under sustained overload a late request takes capacity from an on-time one.
-Simulation calibrated on r6b/r7 (`scripts/analysis/overload_sim.py`, smoke-2
-profile, two pairs, 5 seeds; overload phase at C_H = 6 req/s, past MAX capacity):
-
-| policy | goodput | served | rejected |
-|---|---|---|---|
-| default system (round robin, MAX) | 11 % | 100 % | 0 |
-| CanaTune, reject | 81 % | 81 % | 226 |
-| CanaTune, serve, doomed dispatched | 69 % | 92 % | 94 |
-| CanaTune, serve, doomed backfilled | 79 % | 86 % | 165 |
-
-At C_H = 4-5 (overload within MAX capacity) serve matches reject's goodput and
-rejects fewer. What cannot be served within `hold_max_ms` under sustained
-overload is still refused: serving it would only make every request late.
-
-### Router (per request; never changes clocks)
-
-```text
-cold start (no table):  admit; send to the least-loaded active group
-with a table:
-  for each active group g:
-      D check:  D running+waiting (or g's in-flight) + 1 <= B*, and KV usage <= kv_limit
-      slack:    KV in flight(g) <= 0.5 x buffer and risk(slack of predicted TTFT) <= theta
-      cells:    R(effective clock of g, N_await(g), L_in, D busy(g)) <= theta (10 %)
-  admit to the MOST loaded feasible group        # concentrate for batching
-  none: retry within max_wait_ms, then reject 503 (X-CanaTune-Rejected: 1)
-```
-
-### Controller (every second)
-
-```text
-cold start: nothing (everything at MAX)
-pressure (Router rejected, or mean active load > 0.85 C_H):
-    wake a parked group at H; if none is parked, abort the Canary experiment
-L/H (only if L is published): > tau_up -> H at once; < tau_down for t_down -> L
-consolidate: total load <= 0.7 C_H x (active - 1) for t_down -> drain the least-loaded
-             group (Canary first), then park it at the park clocks
-```
-
-While a group's clocks change, the Router assumes the slower of the old and new
-clock point, and samples in flight are not recorded.
-
-### Canary (G0)
-
-**Tier locator** (`controller/locator.py`), full run ≈ 40 windows, ≈ 15 min:
+### Canary calibration (`controller/locator.py`)
 
 | Step | What |
 |---|---|
-| park | idle power at 5 clocks per GPU; lowest (within noise → lowest clock) |
-| alpha | sequential single probes at 5 prompt lengths × 3; linear fit |
-| ramp | at MAX: double the load until TTFT p95 > 0.8·SLO or violations, bisect twice → C0; the median busy clock gives the ceiling f_eff (power cap) |
-| coarse | 5 clocks from f_eff down at 0.8·C0; stop descending at the first infeasible clock |
-| refine | golden section around the cheapest point, or bisection of the SLO edge |
-| choose H | highest clock within eps (2 %) of the minimum, skipping clocks power/thermal-limited > 30 % of busy samples |
-| tiers | repeat at 0.3·C0; publish L only if it saves > 2·eps |
-| decode | J/token over 5 D clocks at concurrency 16; B* (clean: TPOT ≤ SLO, no preemption, no waiting) by doubling + bisection; one window beyond B* at the highest D clock decides KV wall vs frequency step |
-| fill | windows at H at 0.3/0.5/0.8/1.0·C0 → risk samples and C_H |
+| park | idle power at 5 clocks per GPU; the lowest is the park point |
+| service | single requests at 16, 64, 256, ... up to the longest prompt (x3) at MAX: S(L), the KV residence (idle TTFT - prefill), prompts that miss the SLO even when idle |
+| ramp | at MAX: double the load until the violation bound exceeds theta, bisect → C0; the busy clock gives the power-capped ceiling |
+| search | coarse + refine of the P clock at 0.8·C0 by measured J/request → H |
+| tables | S(L) at every coarse P clock (the solver's choices) |
+| decode | J/token over the D clocks at 0.7·B* and at half that (D iteration vs running sequences); B* at the chosen and the top D clock |
+| joint | P at H with the D ladder at 0.8·C0 |
+| fill | windows at H over loads → C_H |
+| model | from every probe and window of the run (below) |
 
-- Feasibility uses the one-sided 90 % Wilson upper bound of the violation rate
-  (≤ theta). Windows last until 30 requests are done (20–60 s). A window stops
-  early when violations clearly exceed 2·theta.
-- Every window result is cached; an aborted run resumes from the cache.
+Every probe records the state it was sent into (prompt lengths at P, KV tokens
+between P's return and the first token, requests decoding), its TTFT and SLO
+outcome; every window its average P and D power, D busy share and running
+sequences. From these (`domain/calibration.py`, `domain/models.py`):
 
-**Probes** (`controller/probe.py`): random token-id prompts (no prefix-cache
-hits), lengths drawn jointly from the recent production (prompt, output) pairs
-(default pairs until 50 real requests finished), `ignore_eos` so every clock does
-the same work, Poisson arrivals (open windows) or a fixed concurrency (closed
-windows). They go straight to the Canary pair and are recorded in the risk table.
-Energy comes from the NVML energy counters through the agents, sampled every
-0.25 s together with the SM clock and clock-limit reasons.
+```text
+admission   TTFT predictor = least squares over (1, S(L_own), pending S(L), KV in
+            flight, decoding) on probes with TTFT <= 2 x SLO; slack-risk counts
+            (two-fold: each half predicted by the fit on the other); KV gate = the
+            first in-flight share of the buffer whose violation rate is clearly
+            above theta (else the whole buffer)
+model       S(L) per P clock (plateau + slope); residence per length; D iteration
+            alpha + delta x running per D clock; power: idle (park step) + dynamic
+            x utilization per clock; D KV capacity (vLLM cache blocks); B*
+```
 
-**Scheduler** (`controller/canary.py`):
+Windows are cached, so an aborted run resumes; feasibility is the one-sided 90 %
+Wilson bound of the violation rate <= theta.
+
+### Router (`controller/router.py`, per request; never changes clocks)
+
+Per group it tracks, from the proxy's stage events, the pending P work (sum of
+S(L) at the group's clock), the KV bytes in flight and the requests decoding.
+
+```text
+hard limits   D concurrency (B*), D KV usage, KV in flight <= gate x kv_buffer_bytes
+risk          predicted TTFT (Canary's fit, refitted online) -> slack = SLO - waited
+              - predicted -> violation risk of that slack bucket (Canary's seed +
+              production's counts; a sparse bucket is bounded by the nearest
+              observed bucket with less slack) <= theta
+admit         to the most loaded feasible group (concentration keeps batches large)
+overload      (no group within the risk bound after max_wait_ms)
+              reject: 503
+              serve (default): rescue to the lowest-predicted group if it still meets
+              the SLO; a doomed request holds (first come first served) and backfills
+              only where a fresh request keeps backfill_slack_ms of slack (auto: the
+              lowest slack with observed risk <= theta / 2) and none is waiting;
+              503 after hold_max_ms. Hard limits are never overridden.
+```
+
+Rescues, backfills, holds and rejections are the pressure signal.
+
+### Solver and Controller (`domain/models.py`, `controller/tier_controller.py`)
+
+Every second, from the offered rate (Router arrivals over `load_window_s`) and the
+recent length mix, the solver evaluates every (groups, P clock, D clock) of the
+Canary's model:
+
+```text
+TTFT     the admission predictor at steady-state feature means (pending P work =
+         M/G/1 mean unfinished work, KV in flight and decoding by Little's law) for
+         each length of the mix -> violation risk from the slack-risk counts;
+         mean risk <= theta
+D        running sequences (Little's law on alpha + delta X) <= min(KV capacity /
+         mean context, B*, (TPOT SLO - alpha) / delta)
+KV       mean KV in flight <= the gate;   idle TTFT of the longest prompt <= SLO
+verified a point the Canary saw fail at a rate stays below that rate
+power    active groups at their clocks + parked groups at the park clocks
+```
+
+The plan is the lowest-power feasible configuration for the peak rate of the last
+`t_down_s`. It applies at once when the current configuration cannot carry the
+current rate (up); otherwise only once the same target held for `t_down_s`, with
+no pressure in that time, and when it saves more than the Canary's noise band
+(`canary.locator.eps`). Extra groups drain (the Canary first) and park; missing
+ones wake. Pressure wakes a parked group, else aborts the Canary's experiment, else
+raises a group to MAX until `t_down_s` without pressure. While clocks change the
+Router assumes the slower point and in-flight samples are not recorded.
+
+### Canary scheduler (`controller/canary.py`)
 
 | | Condition |
 |---|---|
-| triggers | cold start; length distribution shift (median or p90 > 30 %) → P relocation; production violations above theta (lower confidence bound, ≥ 200 samples) → P relocation; every 30 min → neighbour check of H |
-| start | no rejection for 60 s; the other active groups carry the load at ≤ 0.7·C_H; ≥ 10 min since the last experiment; ≤ 10 % of time experimenting. Then drain the Canary (≤ 30 s) |
-| stop | finished (publish), or pressure the Controller cannot relieve by waking a parked group (abort; Canary serves at H) |
+| triggers | cold start or a table without a model (full); production violations above theta (relocation); the length mix shifted or the plan runs a point at a per-group rate the Canary has not confirmed (verify: one window; a failure caps the point below that rate); every 30 min a neighbour check of H |
+| start | no pressure for `quiet_s`; the solver finds the other active groups feasible; `min_interval_s` since the last experiment; at most `max_duty` of the time |
+| stop | finished, or pressure the Controller cannot relieve by waking a group (abort) |
 
 ## Implementation status
 
@@ -283,12 +169,13 @@ in turn, no admission, no clock control) or `cantune`.
 | Online risk table keyed by clock point | `domain/risk.py` | done |
 | Telemetry: `/metrics` scraper, snapshot age | `infrastructure/telemetry.py` | done |
 | GPU agent per node: supported clocks ≥ `min_mhz`, serialized locks, NVML read-back, energy/clock/limit readings, reset on exit | `infrastructure/gpu_agent.py` | done |
-| Router: open admission at cold start; risk + D wall admission; equivalent-token load | `controller/router.py` | done |
-| Controller: MAX cold start, staggered publish, wake / abort / reject order, L/H, drain and park | `controller/tier_controller.py` | done |
+| Router: open admission at cold start; state-based admission; serve/reject overload | `controller/router.py` | done |
+| Cluster model and solver from the Canary's measurements | `domain/models.py`, `domain/calibration.py` | done; simulated, not yet on GPUs |
+| Controller: MAX cold start, solver plan with switching rules, pressure (wake / abort / MAX), drain and park | `controller/tier_controller.py` | done |
 | Tier locator | `controller/locator.py` | done; validated on a replay surrogate (tests), not yet on GPUs |
 | Probe backend | `controller/probe.py` | done; tested against mocked vLLM/agents |
 | Canary scheduler | `controller/canary.py` | done |
-| API: `GET /canatune/state`, `/tiers`, `/risk`; `POST /canatune/canary {"action": full|relocate|recheck|abort}` | `api/control.py` | done |
+| API: `GET /canatune/state`, `/tiers`, `/risk`; `POST /canatune/canary {"action": full|relocate|recheck|verify|abort}` | `api/control.py` | done |
 | Process controller: agents first (`CANATUNE_AGENT_MIN_MHZ`), then P/D, then proxy | `controller/process_controller.py` | done |
 | Legacy per-workload frequency table | `controller/frequency_table.py` | superseded; kept for old data |
 

@@ -1,36 +1,41 @@
-"""Seconds-scale Controller: group tiers, waking and parking.
+"""Seconds-scale Controller: how many groups run, at which clocks.
 
 Cold start (no tier table): every production group is active at MAX and the
-Router admits everything; the Controller neither consolidates nor switches.
-Once the Canary publishes a table, production groups move to H one at a time,
-and from then on the Controller
-* wakes a parked group when the Router rejected, held or overflowed requests
-  (`router.pressure`) or the mean active load exceeds `wake_load_fraction *
-  C_H`; if nothing is parked it asks the Canary to abort its experiment; if
-  the Canary is not experimenting either, it raises the most loaded working
-  group to MAX (pressure order: wake -> abort Canary -> MAX -> reject), so C_H
-  never caps what MAX could serve; groups go back to H once the mean load stays
-  below `park_load_fraction * C_H` for
-  `t_down_s`,
-* switches L/H per group when the Canary published an L tier,
-* drains and parks the least-loaded group when the rest could carry the total
-  at `park_load_fraction * C_H` for `t_down_s` and there was no pressure (a
-  rejection or load above the wake level) within the last `t_down_s`.
+Router admits everything; the Controller does nothing else.
 
-Loads are equivalent prompt tokens/s. A clock change takes ~0.2-0.5 s, so the
-Controller acts on windowed trends; while a group's clock changes the Router
-assumes the slower of the old and new clock point, and every change bumps the
-group's clock epoch so in-flight samples are not written to the risk table.
+With a table, every tick:
+* pressure (the Router rejected, held or overflowed requests): wake a parked
+  group; with none left ask the Canary to abort its experiment; else raise the
+  most loaded working group to MAX. Boosted groups return to the working point
+  after `t_down_s` without pressure.
+* plan (the Canary's cluster model, `domain.models.Solver`): from the offered
+  request rate (Router arrivals over `load_window_s`; its burst factor over
+  `burst_window_s` is logged) and the length mix of recent requests, the
+  lowest-power feasible (groups, P clock, D clock). Switching rules:
+    target the configuration for the peak demand of the last `t_down_s`
+          (hysteresis from the observed demand itself): it stays feasible while
+          the demand moves below that peak
+    up    (the current configuration cannot carry the current demand): at once
+    down  (fewer groups or slower clocks): once the same target held for
+          `t_down_s`, with no pressure in that time, and when it saves more than
+          `switch_gain` of the current power (the Canary's measurement noise band)
+  Extra groups are drained (the Canary first, so it is free to explore) and then
+  parked; missing ones are woken (production first). A clock change takes
+  ~0.2-0.5 s; meanwhile the Router assumes the slower of old and new clock point,
+  and every change bumps the group's clock epoch so in-flight samples are not
+  written to the risk table.
 """
 
 import asyncio
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from canatune.controller.router import CanaTuneRouter
 from canatune.domain.groups import Group, GroupState, Tier, TierState, TierStore, TierTable, slower
+from canatune.domain.models import ClusterModel, Evaluation, Solver
 from canatune.infrastructure.clocks import ClockActuator, GpuRef
 from canatune.infrastructure.records import JsonlLog
 
@@ -39,23 +44,17 @@ class ControllerConfigError(ValueError):
     """Controller settings are invalid."""
 
 
-def _fraction(raw: Mapping[str, Any], key: str, default: float) -> float:
-    value = raw.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
-        raise ControllerConfigError(f"controller.{key} must be in (0, 1]")
-    return float(value)
-
-
 @dataclass(frozen=True)
 class ControllerSettings:
     period_s: float = 1.0
     load_window_s: float = 10.0
     t_down_s: float = 30.0
-    wake_load_fraction: float = 0.85
-    park_load_fraction: float = 0.7
     min_active_groups: int = 1
     stagger_s: float = 2.0
     energy_log_period_s: float = 5.0
+    burst_window_s: float = 120.0
+    burst_bucket_s: float = 10.0
+    switch_gain: float = 0.02  # = canary.locator.eps (measurement noise band)
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControllerSettings":
@@ -66,9 +65,12 @@ class ControllerSettings:
             period_s=float(raw.get("period_s", 1.0)),
             load_window_s=float(raw.get("load_window_s", 10.0)),
             t_down_s=float(raw.get("t_down_s", 30.0)),
-            wake_load_fraction=_fraction(raw, "wake_load_fraction", 0.85),
-            park_load_fraction=_fraction(raw, "park_load_fraction", 0.7),
             min_active_groups=int(raw.get("min_active_groups", 1)),
+            burst_window_s=float(raw.get("burst_window_s", 120.0)),
+            burst_bucket_s=float(raw.get("burst_bucket_s", 10.0)),
+            switch_gain=float(
+                config.get("canary", {}).get("locator", {}).get("eps", raw.get("switch_gain", 0.02))
+            ),
             stagger_s=float(raw.get("stagger_s", 2.0)),
             energy_log_period_s=float(raw.get("energy_log_period_s", 5.0)),
         )
@@ -97,9 +99,14 @@ class TierController:
         self.store = store
         self.log = log or JsonlLog(None)
         self._clock = clock
-        self._low_since: dict[str, float] = {}
-        self._consolidate_since: float | None = None
         self._calm_since: float | None = None
+        self._target: tuple | None = None  # (n, point) the solver keeps choosing
+        self._target_since: float | None = None
+        self.plan: Evaluation | None = None  # the solver's last answer
+        self._solver_key: object = None
+        self._solver: Solver | None = None
+        self._demand: deque[tuple[float, float]] = deque()  # (t, rate x burst) for down
+        router.arrival_keep_s = max(settings.burst_window_s, settings.load_window_s) + 1
         self._pressure_at = float("-inf")
         self._rejections_seen = 0
         self._last_energy_log = float("-inf")
@@ -171,13 +178,15 @@ class TierController:
         """Adopt a new tier table; active groups move to it one at a time so that
         not every group is slowed by a clock change at once."""
         self.tiers.table = table
+        self.tiers.working = None  # the solver chooses again on the new model
+        self._target = self._target_since = None
         if self.store is not None:
             self.store.save(table)
         self.log.write({"event": "publish", "reason": reason, "table": table.to_json()})
         for group in self.groups:
             if group.state is not GroupState.ACTIVE:
                 continue
-            tier = Tier.H if group.tier in (Tier.MAX, Tier.H) or table.l is None else group.tier
+            tier = Tier.H
             if group.effective != self.tiers.clocks(tier):
                 await self.set_tier(group, tier, f"publish:{reason}")
                 await asyncio.sleep(self.settings.stagger_s)
@@ -197,55 +206,79 @@ class TierController:
 
     # ---- one control step -------------------------------------------------------------
 
+    def solver(self) -> Solver | None:
+        """Solver over the published cluster model (rebuilt when a table is published
+        or the Canary's verification capped a point)."""
+        raw = self.tiers.model_json()
+        key = None if raw is None else (self.tiers.table.published_at, str(raw.get("caps")))
+        if key != self._solver_key:
+            self._solver_key = key
+            self._solver = (
+                None if raw is None else Solver(ClusterModel.from_json(raw), len(self.groups))
+            )
+        return self._solver
+
+    def demand(self, now: float) -> tuple[float, float, list[tuple[int, int]]]:
+        """-> (offered requests/s, burst factor, recent (prompt, output) lengths)."""
+        s = self.settings
+        rate, _ = self.router.offered(now, s.load_window_s, s.burst_bucket_s)
+        _, burst = self.router.offered(now, s.burst_window_s, s.burst_bucket_s)
+        lengths = self.router.lengths.pairs() if self.router.lengths is not None else []
+        return rate, burst, lengths
+
+    def can_carry(self, n: int, now: float | None = None) -> bool:
+        """Would n groups at the working point carry the current demand?"""
+        solver = self.solver()
+        if solver is None or n < 1:
+            return False
+        now = self._clock() if now is None else now
+        rate, _, lengths = self.demand(now)
+        if rate <= 0:
+            return True  # no demand to carry
+        if not lengths:
+            return False  # demand without length data: cannot tell
+        peak = max([rate] + [d for _, d in self._demand])
+        point = self.tiers.clocks(Tier.H)
+        return solver.evaluate(peak, lengths, n, point).feasible
+
+    # ---- one control step -------------------------------------------------------------
+
     async def tick(self) -> None:
         now = self._clock()
         await self._log_energy(now)
         table = self.tiers.table
         if table is None:
             return  # cold start: everything at MAX, nothing to decide
-        s = self.settings
-        # Rejections, or (overload: serve) overflows beyond the risk bound.
-        new_rejections = self.router.pressure - self._rejections_seen
+        new_pressure = self.router.pressure - self._rejections_seen
         self._rejections_seen = self.router.pressure
-        loads = self.loads(now)
         active = [g for g in self.groups if g.state is GroupState.ACTIVE]
-        capacity = table.capacity_h
-        mean_load = sum(loads[g.name] for g in active) / len(active) if active else float("inf")
 
         # Pressure: wake a parked group; with none left, the Canary must come back;
         # with the Canary serving too, raise a group to MAX before the Router rejects.
-        if new_rejections > 0 or mean_load > s.wake_load_fraction * capacity:
+        if new_pressure > 0:
             self._calm_since = None
             self._pressure_at = now
-            reason = "rejections" if new_rejections else "load_above_wake"
-            woken = await self.wake(reason)
+            woken = await self.wake("pressure")
             if woken is not None:
                 active.append(woken)
-            elif not (self.on_pressure is not None and self.on_pressure(reason)):
-                await self._boost(active, loads, reason)
+            elif not (self.on_pressure is not None and self.on_pressure("pressure")):
+                await self._boost(active, "pressure")
         else:
-            await self._unboost(active, loads, mean_load <= s.park_load_fraction * capacity, now)
-
-        await self._switch_l_h(table, active, loads, now)
-        await self._consolidate(table, active, loads, now)
+            await self._unboost(active, now)
+        await self._plan(now)
         await self._finish_draining()
 
-    async def _boost(
-        self, active: Sequence[Group], loads: Mapping[str, float], reason: str
-    ) -> None:
-        """Raise the most loaded H group to MAX (one per tick); L groups go to H
-        first through the tau_up switch."""
+    async def _boost(self, active: Sequence[Group], reason: str) -> None:
+        """Raise the most loaded working group to MAX (one per tick)."""
         working = [g for g in active if g.tier is Tier.H]
         if working:
-            group = max(working, key=lambda g: (loads[g.name], g.n_inflight))
+            group = max(working, key=lambda g: (g.n_inflight, g.pending_ms))
             await self.set_tier(group, Tier.MAX, f"boost:{reason}")
 
-    async def _unboost(
-        self, active: Sequence[Group], loads: Mapping[str, float], calm: bool, now: float
-    ) -> None:
-        """Return one MAX group to H after the load stayed low for t_down_s."""
+    async def _unboost(self, active: Sequence[Group], now: float) -> None:
+        """Return one MAX group to the working point after t_down_s without pressure."""
         boosted = [g for g in active if g.tier is Tier.MAX]
-        if not boosted or not calm:
+        if not boosted:
             self._calm_since = None
             return
         if self._calm_since is None:
@@ -254,56 +287,70 @@ class TierController:
         if now - self._calm_since < self.settings.t_down_s:
             return
         self._calm_since = now  # the next group waits another t_down_s
-        group = min(boosted, key=lambda g: (loads[g.name], g.n_inflight))
+        group = min(boosted, key=lambda g: (g.n_inflight, g.pending_ms))
         await self.set_tier(group, Tier.H, "unboost")
 
-    async def _switch_l_h(
-        self, table: TierTable, active: Sequence[Group], loads: Mapping[str, float], now: float
-    ) -> None:
-        active = [g for g in active if g.tier is not Tier.MAX]  # boosted: see _unboost
-        if table.l is None or table.tau_up is None or table.tau_down is None:
-            for group in active:
-                if group.tier is not Tier.H:
-                    await self.set_tier(group, Tier.H, "single_working_tier")
+    async def _plan(self, now: float) -> None:
+        solver = self.solver()
+        if solver is None:
             return
-        for group in active:
-            load = loads[group.name]
-            if group.tier is not Tier.H and (group.tier is not Tier.L or load > table.tau_up):
-                self._low_since.pop(group.name, None)
-                await self.set_tier(group, Tier.H, "load_above_tau_up")
-            elif group.tier is Tier.H:
-                if load < table.tau_down:
-                    since = self._low_since.setdefault(group.name, now)
-                    if now - since >= self.settings.t_down_s:
-                        self._low_since.pop(group.name)
-                        await self.set_tier(group, Tier.L, "load_below_tau_down")
-                else:
-                    self._low_since.pop(group.name, None)
-
-    async def _consolidate(
-        self, table: TierTable, active: Sequence[Group], loads: Mapping[str, float], now: float
-    ) -> None:
         s = self.settings
-        # Rejected requests never enter the admitted load, so right after pressure the
-        # load looks low; parking then would feed the rejections (smoke 2 sim).
-        if len(active) <= s.min_active_groups or now - self._pressure_at < s.t_down_s:
-            self._consolidate_since = None
+        rate, burst, lengths = self.demand(now)
+        if not lengths:
             return
-        total = sum(loads[g.name] for g in active)
-        if total > s.park_load_fraction * table.capacity_h * (len(active) - 1):
-            self._consolidate_since = None
+        serving = [g for g in self.groups if g.state in (GroupState.ACTIVE, GroupState.PARK)]
+        demand = rate  # variability enters through the peak over t_down_s below
+        self._demand.append((now, demand))
+        while self._demand and self._demand[0][0] < now - s.t_down_s:
+            self._demand.popleft()
+        active = [g for g in self.groups if g.state is GroupState.ACTIVE]
+        point = self.tiers.clocks(Tier.H)
+        current = solver.evaluate(demand, lengths, max(len(active), 1), point)
+        up = not current.feasible  # the current configuration cannot carry the demand
+        # Plan for the peak demand of the last t_down_s (both directions): the chosen
+        # configuration then stays feasible while the demand moves below that peak.
+        peak = max(d for _, d in self._demand)
+        target = solver.solve(peak, lengths, min_groups=s.min_active_groups, groups=len(serving))
+        self.plan = target
+        key = (target.n, target.point)
+        if key != self._target:
+            self._target, self._target_since = key, now
+        held = now - (self._target_since or now) >= s.t_down_s
+        calm = now - self._pressure_at >= s.t_down_s
+        gain = current.power_w - target.power_w > s.switch_gain * current.power_w
+        if key == (len(active), point):
             return
-        if self._consolidate_since is None:
-            self._consolidate_since = now
+        if not (up or (held and calm and gain)):
             return
-        if now - self._consolidate_since < s.t_down_s:
-            return
-        self._consolidate_since = None
-        # Drain the Canary first so it is free to explore (it cannot start while it is
-        # the only active group), then the least-loaded production group.
-        victim = min(active, key=lambda g: (not g.canary, loads[g.name], g.n_inflight))
-        victim.state = GroupState.DRAINING
-        self.log.write({"event": "drain", "group": victim.name, "total_load": total})
+        self.log.write(
+            {
+                "event": "plan",
+                "t": round(now, 1),
+                "rate_rps": round(rate, 3),
+                "burst": round(burst, 3),
+                "from": {"n": len(active), "point": point.key(), "power_w": current.power_w},
+                "to": {"n": target.n, "point": target.point.key(), "power_w": target.power_w},
+                "feasible": target.feasible,
+                "binding": target.binding,
+                "use": {k: round(v, 3) for k, v in target.use.items()},
+                "reason": "up" if up else "down",
+            }
+        )
+        if target.point != point:
+            self.tiers.working = target.point
+            for group in active:
+                if group.tier is Tier.H and group.effective != target.point:
+                    await self.set_tier(group, Tier.H, "plan")
+        while len(active) < target.n:
+            woken = await self.wake("plan")
+            if woken is None:
+                break
+            active.append(woken)
+        if len(active) > max(target.n, s.min_active_groups):
+            # Drain one group per step: the Canary first so it is free to explore.
+            victim = min(active, key=lambda g: (not g.canary, g.n_inflight, g.pending_ms))
+            victim.state = GroupState.DRAINING
+            self.log.write({"event": "drain", "group": victim.name, "reason": "plan"})
 
     async def _finish_draining(self) -> None:
         for group in self.groups:

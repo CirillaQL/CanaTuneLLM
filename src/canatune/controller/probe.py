@@ -391,6 +391,8 @@ class CanaryProbe:
             r for r in busy if r.get("throttle_reasons") and int(r["throttle_reasons"]) & LIMIT_MASK
         ]
         decode_snaps = [s[3] for s in samples if s[3] is not None]
+        running = [s.running or 0.0 for s in decode_snaps]
+        tpots = sorted(o.tpot_ms for o in ok if o.tpot_ms is not None)
         preempt = 0.0
         if len(decode_snaps) >= 2 and decode_snaps[0].preemptions_total is not None:
             preempt = max(
@@ -418,6 +420,11 @@ class CanaryProbe:
             decode_running_max=max((s.running or 0.0 for s in decode_snaps), default=None),
             aborted=aborted,
             samples=probe_samples,
+            prefill_avg_w=p_j / duration if duration > 0 else None,
+            decode_avg_w=d_j / duration if duration > 0 else None,
+            decode_busy_fraction=sum(x > 0 for x in running) / len(running) if running else None,
+            decode_running_mean=sum(running) / len(running) if running else None,
+            tpot_p50_ms=tpots[len(tpots) // 2] if tpots else None,
         )
 
     async def open_window(
@@ -428,7 +435,7 @@ class CanaryProbe:
         # lengths, so per-request energy is compared on identical work.
         # Exactly round(rate x seconds) arrivals at uniform order statistics: a Poisson
         # process conditioned on its count, so the realised load equals the nominal
-        # one (unconditioned traces deviated by up to +20 %, smoke r4).
+        # one (an unconditioned Poisson trace can deviate from it by tens of percent).
         trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
         rate = eq_tps / (self.lengths.mean_prompt(self.prompt_limit) + alpha)  # requests/s
         count = max(1, round(rate * seconds))

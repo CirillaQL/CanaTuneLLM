@@ -78,7 +78,9 @@ class TierTableError(ValueError):
 
 @dataclass
 class TierTable:
-    """Tiers and capacities published by the Canary (design v2 §6).
+    """Tiers, capacities and the cluster model published by the Canary. `l`,
+    `tau_up` and `tau_down` are kept only to read older tables; the solver over
+    evidence["model"] replaced the second tier.
 
     Loads are in equivalent prompt tokens per second: sum over requests of
     (prompt tokens + alpha), where alpha is the per-request fixed prefill cost
@@ -175,11 +177,13 @@ class TierStore:
 
 @dataclass
 class TierState:
-    """What the Router and Controller share: the highest clocks and the tier
-    table currently in force (None = cold start: MAX, admit everything)."""
+    """What the Router, Controller and Canary share: the highest clocks, the tier
+    table in force (None = cold start: MAX, admit everything) and the working
+    point the Controller's solver chose (H of the table until it chooses)."""
 
     max_point: ClockPoint
     table: TierTable | None = None
+    working: ClockPoint | None = None
 
     @property
     def alpha_tokens(self) -> float:
@@ -188,7 +192,13 @@ class TierState:
     def clocks(self, tier: Tier) -> ClockPoint:
         if tier is Tier.MAX or self.table is None:
             return self.max_point
+        if tier is Tier.H and self.working is not None:
+            return self.working
         return self.table.clocks(tier, self.max_point)
+
+    def model_json(self) -> dict[str, Any] | None:
+        """The Canary's cluster model (evidence["model"]), None before one exists."""
+        return None if self.table is None else self.table.evidence.get("model")
 
 
 @dataclass

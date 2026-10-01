@@ -3,8 +3,8 @@
 A cell's risk is the fraction of admitted requests in that state that violated
 the SLO. Cells are keyed by the locked clock point ("1815/1050"), not by tier
 name, so Canary probe windows at any clock and production traffic at any tier
-all land in the same table. The table is monotone in N_await and L_in (K1b), which gives safe
-bounds for sparse cells:
+all land in the same table. Risk is monotone in N_await and L_in (more work ahead
+or a longer prompt cannot lower the TTFT), which gives safe bounds for sparse cells:
 
 * a heavier cell (more waiting requests, longer prompt) has risk >= this cell,
   so the smallest well-sampled heavier risk is a conservative estimate;
@@ -90,7 +90,6 @@ class Cell:
 class CellStats:
     admitted: int = 0
     violated: int = 0
-    seed_risk: float | None = None  # prior from an offline-measured seed (K1b); not a model
 
     @property
     def observed(self) -> float | None:
@@ -100,7 +99,7 @@ class CellStats:
 @dataclass(frozen=True)
 class RiskEstimate:
     risk: float
-    source: str  # "observed", "seed", "heavier_bound", "unknown"
+    source: str  # "observed", "heavier_bound", "unknown"
     samples: int
 
 
@@ -139,35 +138,9 @@ class RiskTable:
             identity=identity,
             path=raw.get("path"),
         )
-        seed = raw.get("seed") or {}
-        if not isinstance(seed, Mapping):
-            raise RiskTableError("risk.seed must be a mapping")
-        for clock_key, rows in seed.items():
-            table.load_seed(ClockPoint.from_key(str(clock_key)), rows)
         if table.path is not None and table.path.exists():
             table.load()
         return table
-
-    def load_seed(self, clock: ClockPoint, rows: Any) -> None:
-        """Seed rows are indexed [n_await bucket][prompt bucket]; applied to both D states."""
-        n_rows, n_cols = self.buckets.shape
-        if (
-            not isinstance(rows, list)
-            or len(rows) != n_rows
-            or any(not isinstance(row, list) or len(row) != n_cols for row in rows)
-        ):
-            raise RiskTableError(f"seed for {clock.key()} must be a {n_rows}x{n_cols} matrix")
-        with self._lock:
-            for i, row in enumerate(rows):
-                for j, value in enumerate(row):
-                    if value is None:
-                        continue
-                    if not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
-                        raise RiskTableError("seed risks must be in [0, 1] or null")
-                    for d_busy in (False, True):
-                        cell = Cell(clock.key(), i, j, d_busy)
-                        stats = self._cells.setdefault(cell, CellStats())
-                        stats.seed_risk = float(value)
 
     # ---- lookups ----------------------------------------------------------
 
@@ -185,11 +158,6 @@ class RiskTable:
             return None
         if stats.admitted >= self.min_samples:
             return RiskEstimate(stats.observed or 0.0, "observed", stats.admitted)
-        if stats.seed_risk is not None:
-            # Sparse observations can only raise a seed, never lower it.
-            observed = stats.observed
-            risk = stats.seed_risk if observed is None else max(stats.seed_risk, observed)
-            return RiskEstimate(risk, "seed", stats.admitted)
         return None
 
     def estimate(self, cell: Cell) -> RiskEstimate:
@@ -200,8 +168,8 @@ class RiskTable:
         """Own observation, bounded by monotonicity: a cell is at least as risky as
         any lighter one and, when sparse, at most as risky as the least risky
         heavier one. Heavier = more queued requests, a longer prompt, or D busy
-        instead of idle (smoke 2: the Canary's windows keep D busy, so idle-D cells
-        stay empty and would otherwise block the first request on an idle group)."""
+        instead of idle (the Canary's windows keep D busy, so idle-D cells stay
+        empty and would otherwise block the first request on an idle group)."""
         own = self._own(cell)
         n_rows, n_cols = self.buckets.shape
         lighter_d = (False, True) if cell.d_busy else (False,)
@@ -314,7 +282,6 @@ class RiskTable:
                     cell.key(): {
                         "admitted": s.admitted,
                         "violated": s.violated,
-                        "seed_risk": s.seed_risk,
                     }
                     for cell, s in sorted(self._cells.items(), key=lambda kv: kv[0].key())
                 },

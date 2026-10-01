@@ -18,7 +18,7 @@ from canatune.controller.locator import (
 from canatune.controller.probe import CanaryProbe, ProbeSettings
 from canatune.controller.router import CanaTuneRouter, RouterSettings
 from canatune.controller.tier_controller import ControllerSettings, TierController
-from canatune.domain.admission import SlackRisk
+from canatune.domain.admission import SlackRisk, slack_edges
 from canatune.domain.groups import (
     ClockPoint,
     Group,
@@ -29,7 +29,6 @@ from canatune.domain.groups import (
     TierTableError,
 )
 from canatune.domain.load import LengthStats
-from canatune.domain.priors import cluster_priors
 from canatune.domain.risk import RiskTable, RiskTableError
 from canatune.infrastructure.clocks import (
     AgentClockActuator,
@@ -184,10 +183,8 @@ def build_runtime(
 
     groups = build_groups(config)
     router_settings = RouterSettings.from_config(config)
-    # Deployment priors (model config.json + GPU datasheets); None -> generic values.
-    priors = cluster_priors(config)
-    events.write({"event": "priors", "priors": None if priors is None else priors.summary()})
     slack = SlackRisk(
+        slack_edges(router_settings.ttft_slo_ms),
         min_samples=int(risk_raw.get("min_samples", 20)),
         path=None if not risk_raw.get("path") else f"{risk_raw['path']}.slack.json",
     )
@@ -201,7 +198,6 @@ def build_runtime(
         telemetry=telemetry,
         log=requests_log,
         slack=slack,
-        priors=priors,
     )
 
     clock_control = dict(config.get("clock_control", {}))
@@ -257,8 +253,6 @@ def build_runtime(
         admission = AdmissionInputs(
             kv_bytes_per_token=router_settings.kv_bytes_per_token,
             kv_buffer_bytes=router_settings.kv_buffer_bytes,
-            gate_prior=router_settings.kv_inflight_fraction,
-            predictor_prior=tuple(router.predictor.prior),
         )
         locator = TierLocator(
             probe_backend, LocatorSettings.from_config(config), log=events, admission=admission

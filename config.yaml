@@ -22,14 +22,9 @@ runtime:
     NCCL_SOCKET_IFNAME: "^lo"
     NCCL_DEBUG: INFO
 
-# Known before deployment: the model (config.json under MODEL_PATH) and the GPU
-# models (topology.*.gpu_type). Priors for cold start come from these and GPU
-# datasheets (canatune.domain.priors); everything else the Canary measures.
-# cluster.gpu_specs.{prefill,decode}: {memory_gb, bandwidth_gbs, bf16_tflops} for
-# GPUs missing from the datasheet table.
-cluster:
-  gpu_specs: {}
-
+# Known before deployment: the model (config.json under MODEL_PATH: KV bytes per
+# token), the connector settings (kv_transfer) and the policy (SLOs, theta, waits).
+# Every other parameter the Canary measures on this cluster.
 model:
   name: mistralai/Mistral-7B-v0.1
   snapshot_root: /path/to/model/snapshots
@@ -81,7 +76,6 @@ kv_transfer:
   disable_chunked_prefill: true
   kv_buffer_bytes: 1.0e9      # P2pNccl kv_buffer_size on D (vLLM default 1e9)
   kv_bytes_per_token: null    # null: from the model's config.json (Mistral-7B bf16: 131072)
-  link_gbps: 10               # P -> D NIC speed (datasheet): prior of the in-flight KV cost
 
 proxy:
   enabled: true
@@ -114,8 +108,6 @@ router:
   # in flight, requests decoding) and admit when the predicted-slack bucket's risk
   # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy).
   admission: slack
-  kv_inflight_fraction: 0.5   # prior gate on KV in flight (x kv_buffer_bytes) until the
-                              # Canary measures this cluster's knee
   # After max_wait_ms without a group within the risk bound: reject (503), or serve:
   # rescue = dispatch at once to the lowest-predicted group if it still meets the
   # SLO; doomed (SLO lost everywhere) = hold first come first served and backfill
@@ -137,9 +129,9 @@ telemetry:
 controller:
   period_s: 1.0
   load_window_s: 10.0
-  t_down_s: 30                # sustained low load before parking / L down-shift
-  wake_load_fraction: 0.85    # wake a parked group above 0.85 C_H mean active load
-  park_load_fraction: 0.7     # park one when the rest carry the total at <= 0.7 C_H
+  t_down_s: 30                # a cheaper plan must hold this long before switching down
+  burst_window_s: 120         # burst factor of the offered rate over this window
+  burst_bucket_s: 10          # (90th percentile of 10 s rates / mean) -> solver demand
   min_active_groups: 1
   stagger_s: 2.0              # groups move to a new tier one at a time
   energy_log_period_s: 5
@@ -152,7 +144,6 @@ risk:
   prompt_token_edges: [128, 512, 1024, 2048]  # buckets <=128 ... <=2048 and >2048
   min_samples: 20
   path: null                  # or set CANATUNE_RISK_TABLE
-  seed: {}                    # optional {"1815/1050": 6x5 matrix}; not used by default
 
 clock_control:
   enabled: false              # true: lock clocks through the per-node GPU agents
@@ -176,7 +167,6 @@ canary:
   # scheduler
   period_s: 1.0
   quiet_s: 60                 # no Router rejection for this long before switching out
-  others_load_max: 0.7        # rest of the pool must carry production at <= 0.7 C_H
   min_interval_s: 600
   max_duty: 0.10              # at most 10 % of the time experimenting
   periodic_s: 1800            # neighbour check of H
@@ -186,7 +176,6 @@ canary:
   locator:
     eps: 0.02                 # energy band: within 2 % of the minimum
     target_load_fraction: 0.8 # search at 0.8 C0 (consolidated operating point)
-    low_load_fraction: 0.3    # second load for the one-or-two-tiers check
     fill_load_fractions: [0.3, 0.5, 0.8, 1.0]
     fill_bisect_steps: 2      # C_H between the fill loads (bisection)
     window_s: 20

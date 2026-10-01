@@ -1,6 +1,6 @@
 """Canary tier locator: find park, H (and L), D clocks and capacities online.
 
-Procedure (design v2 §6.2; validated offline by replaying K2/K3b/K4a data):
+Procedure (design v2 §6.2):
 
 1. park     idle power at a few clocks, lowest power wins (noise -> lowest clock)
 2. alpha    per-request fixed prefill cost in tokens: fit prefill time = a + b*L;
@@ -16,22 +16,23 @@ Procedure (design v2 §6.2; validated offline by replaying K2/K3b/K4a data):
             feasibility edge when the cheapest point sits next to an infeasible one
 6. choose   H = highest clock whose energy is within (1+eps) of the minimum and
             that is not held down by power/thermal limits most of the time
-7. tiers    repeat at 0.3*C0: publish L only if it saves more than 2*eps against
-            H there (a second tier must pay for its clock switches)
-8. decode   J/token over D clocks at a fixed concurrency; B* (clean concurrency)
-            at the chosen and the highest D clock: equal -> KV wall
+7. tables   single-request S(L) at every coarse P clock (the solver's P choices)
+8. decode   J/token over D clocks at a fixed concurrency, plus half that
+            concurrency (D iteration time against running sequences per clock);
+            B* (clean concurrency) at the chosen and the highest D clock
 9. joint    P at H together with D at the chosen clock at 0.8*C0 (and L at
             0.3*C0): raise D a step until it holds; P and D are each measured with
             the other at its ceiling, and a slow D also delays the first token
-            (smoke r3: D 735 alone was clean, with P at H TTFT doubled)
 10. fill    windows at H over several loads so the risk table has samples before
             production switches to it; C_H = highest load meeting the target,
             bisected between the last feasible and the first infeasible load
-11. admission  single-request length tables at H (and L) besides MAX (S(L) per
-            clock: plateau + slope); from every probe of the run (state at send ->
-            TTFT, SLO): the TTFT predictor's coefficients, the slack risk seed and
-            the KV-in-flight gate (`domain.calibration`), so production starts
-            from this cluster's own measurements, not from offline fits
+11. model   from every probe and window of the run: the TTFT predictor, the slack
+            risk seed and the KV-in-flight gate (`domain.calibration`), and the
+            cluster model for the solver (`domain.models`: S(L) per P clock, KV
+            residence, D iteration per D clock, power per clock vs load, the
+            SLO-limited P utilization at C_H, the D limits)
+H is the working point at the search load; production picks its configuration
+per load and length mix with the solver and the Canary verifies it (`verify`).
 
 Every window result is cached, so an aborted run resumes where it stopped.
 The locator never touches production: the backend drives only the Canary pair.
@@ -44,9 +45,10 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
-from canatune.domain.admission import PRIOR_COEF, CostBook
+from canatune.domain.admission import CostBook
 from canatune.domain.calibration import calibrate_admission, fit_plateau_slope
 from canatune.domain.groups import ClockPoint, TierTable
+from canatune.domain.models import ClusterModel, fit_decode, fit_power, interpolate
 from canatune.infrastructure.records import JsonlLog
 
 
@@ -83,6 +85,12 @@ class WindowResult:
     decode_running_max: float | None = None  # sequences D actually ran (telemetry)
     aborted: bool = False
     samples: list = field(default_factory=list, repr=False)  # ProbeSample per request
+    # For the cluster model (power vs clock and load, D iteration vs running):
+    prefill_avg_w: float | None = None
+    decode_avg_w: float | None = None
+    decode_busy_fraction: float | None = None  # share of samples with D running > 0
+    decode_running_mean: float | None = None
+    tpot_p50_ms: float | None = None
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -147,10 +155,8 @@ class LocatorSettings:
     ttft_slo_ms: float = 500.0
     tpot_slo_ms: float = 200.0
     target_load_fraction: float = 0.8  # search load = 0.8 C0
-    low_load_fraction: float = 0.3
-    l_tier_min_gain: float = 0.04  # add L only when it saves clearly more than noise (2 eps)
     fill_load_fractions: tuple[float, ...] = (0.3, 0.5, 0.8, 1.0)
-    fill_bisect_steps: int = 2  # C_H between the fill loads (smoke r3: 0.5 vs 0.8 C0)
+    fill_bisect_steps: int = 2  # C_H between the fill loads
     window_s: float = 20.0
     min_window_requests: int = 60  # 0 violations -> bound ~3 %: tells 5 % from 10 %
     max_window_s: float = 120.0
@@ -170,7 +176,7 @@ class LocatorSettings:
     decode_wall_tolerance: float = 0.25  # frequency step only if B* grows >= 25 %
     decode_load_fraction: float = 0.7  # choose the D clock at 0.7 B* (near full load)
     decode_kv_limit: float = 0.90
-    decode_window_s: float = 60.0  # closed windows: several requests per worker (r4: 20 s)
+    decode_window_s: float = 60.0  # closed windows: several requests per worker
     decode_clock_repeats: int = 2  # D clock choice: median J/token of this many windows
     service_repeats: int = 3
     service_lengths: tuple[int, ...] = ()  # extra S(L) lengths; () = 16, 64, 256, ... up
@@ -300,16 +306,16 @@ class LocatorRun:
     reused: int = 0
     evidence: dict[str, Any] = field(default_factory=dict)
     samples: list = field(default_factory=list)  # ProbeSample of every window
+    results: list = field(default_factory=list)  # every WindowResult of the run
 
 
 @dataclass(frozen=True)
 class AdmissionInputs:
     """What the admission calibration needs besides the windows (config + priors)."""
 
-    kv_bytes_per_token: float = 131072.0
-    kv_buffer_bytes: float = 1e9
-    gate_prior: float = 0.5  # share of the buffer in flight before it is measured
-    predictor_prior: tuple[float, ...] = PRIOR_COEF
+    kv_bytes_per_token: float
+    kv_buffer_bytes: float
+    predictor_prior: tuple[float, ...] | None = None  # None: plain least squares
 
 
 def service_lengths(prompts: Sequence[int], extra: Sequence[int] = ()) -> list[int]:
@@ -339,7 +345,7 @@ class TierLocator:
     ) -> None:
         self.backend = backend
         self.s = settings
-        self.admission = admission or AdmissionInputs()
+        self.admission = admission  # None: no admission calibration (KV geometry unknown)
         self.log = log or JsonlLog(None)
         self._clock = clock
         self._cache: dict[tuple, _Cached] = {}
@@ -364,12 +370,14 @@ class TierLocator:
             self.run.reused += 1
             if isinstance(hit.result, WindowResult):
                 self.run.samples.extend(hit.result.samples)
+                self.run.results.append(hit.result)
             return hit.result
         result = await measure()
         self._cache[key] = _Cached(result, self._clock())
         self.run.windows += 1
         if isinstance(result, WindowResult):
             self.run.samples.extend(result.samples)
+            self.run.results.append(result)
             self.log.write({"event": "locator_window", **result.summary()})
         return result
 
@@ -396,7 +404,7 @@ class TierLocator:
 
     async def closed_median(self, clock: ClockPoint, concurrency: int) -> WindowResult:
         """decode_clock_repeats windows with different fixed traces: clean only if every
-        one is clean, J/token their median (one window is too noisy: r3 1170, r4 1605)."""
+        one is clean, J/token their median (one window alone is noisy)."""
         ws = [
             await self.closed(clock, concurrency, rep) for rep in range(self.s.decode_clock_repeats)
         ]
@@ -422,7 +430,7 @@ class TierLocator:
 
     def meets_target(self, w: WindowResult) -> bool:
         """Capacity uses the admission criterion itself (violation bound <= theta);
-        TTFT p95 is recorded but not a separate, stricter target (smoke r2)."""
+        TTFT p95 is recorded but not a separate, stricter target."""
         return self.feasible(w) and not w.aborted
 
     def decode_clean(self, w: WindowResult) -> bool:
@@ -505,6 +513,10 @@ class TierLocator:
                 "prefill_ms_by_clock": {
                     top.prefill_mhz: dict(_medians([(t, ms) for t, ms, _ in samples]))
                 },
+                # KV transfer + D's first token on an idle pair, per prompt length
+                "residence_ms_by_length": dict(
+                    _medians([(t, ttft - ms) for t, ms, ttft in samples if ttft is not None])
+                ),
             }
         )
         return alpha, limit
@@ -521,26 +533,138 @@ class TierLocator:
         self.run.evidence.setdefault("prefill_ms_by_clock", {})[clock.prefill_mhz] = table
         return table
 
-    def calibrate(self) -> None:
-        """Plateau + slope per measured clock and the admission parameters from every
-        probe of this run (evidence["prefill_fit"], evidence["admission"])."""
+    def calibrate(
+        self,
+        *,
+        park: ClockPoint | None = None,
+        capacity_window: WindowResult | None = None,
+        b_star: int | None = None,
+    ) -> None:
+        """From every probe and window of this run: plateau + slope per clock, the
+        admission parameters (evidence["admission"]) and the cluster model for the
+        solver (evidence["model"])."""
         assert self.run is not None
-        tables = self.run.evidence.get("prefill_ms_by_clock", {})
-        self.run.evidence["prefill_fit"] = {f: fit_plateau_slope(t) for f, t in tables.items()}
+        ev = self.run.evidence
+        tables = ev.get("prefill_ms_by_clock", {})
+        ev["prefill_fit"] = {f: fit_plateau_slope(t) for f, t in tables.items()}
         a = self.admission
-        result = calibrate_admission(
-            self.run.samples,
-            CostBook(tables),
-            prior=a.predictor_prior,
-            ttft_slo_ms=self.s.ttft_slo_ms,
-            theta=self.s.theta,
-            kv_bytes_per_token=a.kv_bytes_per_token,
-            buffer_bytes=a.kv_buffer_bytes,
-            gate_prior=a.gate_prior,
-        )
+        costs = CostBook(tables)
+        result = None
+        if a is not None:
+            result = calibrate_admission(
+                self.run.samples,
+                costs,
+                prior=a.predictor_prior,
+                ttft_slo_ms=self.s.ttft_slo_ms,
+                theta=self.s.theta,
+                kv_bytes_per_token=a.kv_bytes_per_token,
+                buffer_bytes=a.kv_buffer_bytes,
+            )
         if result is not None:
-            self.run.evidence["admission"] = result
+            ev["admission"] = result
             self.log.write({"event": "locator_admission", **result})
+        if park is None or capacity_window is None:
+            return
+        model = self.build_model(costs, park, capacity_window, b_star)
+        if model is not None:
+            ev["model"] = model.to_json()
+            self.log.write({"event": "locator_model", **ev["model"]})
+
+    def _utilization(self, w: WindowResult, costs: CostBook) -> float:
+        """Share of the window P spent prefilling: sum S_f(L) / duration (single-request
+        service times; batching makes the real busy share lower)."""
+        cost = costs.for_clock(w.clock.prefill_mhz)
+        return sum(cost(s.prompt_tokens) for s in w.samples) / 1000.0 / max(w.duration_s, 1e-6)
+
+    def build_model(
+        self, costs: CostBook, park: ClockPoint, capacity_window: WindowResult, b_star: int | None
+    ) -> ClusterModel | None:
+        assert self.run is not None
+        ev = self.run.evidence
+        idle = ev.get("idle_power_w") or {}
+        idle_p = {int(f): float(w) for f, w in (idle.get("prefill") or {}).items()}
+        idle_d = {int(f): float(w) for f, w in (idle.get("decode") or {}).items()}
+        results = self.run.results
+        p_windows = [
+            (w.clock.prefill_mhz, w.prefill_avg_w, self._utilization(w, costs))
+            for w in results
+            if w.prefill_avg_w is not None and w.samples
+        ]
+        d_windows = [
+            (w.clock.decode_mhz, w.decode_avg_w, w.decode_busy_fraction)
+            for w in results
+            if w.decode_avg_w is not None and w.decode_busy_fraction
+        ]
+        d_points: dict[int, list[tuple[float, float]]] = {}
+        for w in results:
+            if w.decode_running_mean and w.tpot_p50_ms and w.decode_running_mean >= 1:
+                d_points.setdefault(w.clock.decode_mhz, []).append(
+                    (w.decode_running_mean, w.tpot_p50_ms)
+                )
+        decode = fit_decode(d_points)
+        power_p = fit_power(idle_p, p_windows)
+        power_d = fit_power(idle_d, d_windows)
+        # SLO-limited P utilization: the highest P utilization among windows that met
+        # the target (a measured lower bound; at C_H the limit may be D or KV, the
+        # low-clock windows of the search push P itself further).
+        rho = max(
+            [self._utilization(w, costs) for w in results if w.samples and self.meets_target(w)]
+            + [self._utilization(capacity_window, costs)]
+        )
+        if not decode or not power_p or not power_d or rho <= 0:
+            self.log.write(
+                {
+                    "event": "locator_model_incomplete",
+                    "decode": bool(decode),
+                    "power_prefill": bool(power_p),
+                    "power_decode": bool(power_d),
+                    "rho": rho,
+                }
+            )
+            return None
+        adm = ev.get("admission") or {}
+        gate = adm.get("kv_gate_fraction")
+        d_ev = ev.get("decode") or {}
+        b_by_clock = {int(f): int(c) for f, c in (d_ev.get("b_star_concurrency") or {}).items()}
+        park_w = (interpolate(idle_p, park.prefill_mhz) or 0.0) + (
+            interpolate(idle_d, park.decode_mhz) or 0.0
+        )
+        return ClusterModel(
+            prefill={
+                int(f): {int(k): float(v) for k, v in t.items()}
+                for f, t in ev.get("prefill_ms_by_clock", {}).items()
+            },
+            residence={
+                int(k): float(v) for k, v in (ev.get("residence_ms_by_length") or {}).items()
+            },
+            decode=decode,
+            power_prefill=power_p,
+            power_decode=power_d,
+            park_power_w=park_w,
+            rho_prefill=rho,
+            ttft_slo_ms=self.s.ttft_slo_ms,
+            tpot_slo_ms=self.s.tpot_slo_ms,
+            kv_bytes_per_token=0.0 if self.admission is None else self.admission.kv_bytes_per_token,
+            kv_gate_bytes=None
+            if gate is None or self.admission is None
+            else gate * self.admission.kv_buffer_bytes,
+            kv_capacity_tokens=d_ev.get("kv_capacity_tokens"),
+            b_star=b_by_clock or ({} if b_star is None else {park.decode_mhz: b_star}),
+            prompt_limit=ev.get("prompt_limit"),
+            predictor_coef=adm.get("predictor_coef"),
+            slack_counts=adm.get("slack_counts"),
+            theta=self.s.theta,
+        )
+
+    async def verify(self, point: ClockPoint, rate_rps: float, alpha: float) -> WindowResult:
+        """Layer 3: one window at a configuration the solver chose, at the per-group
+        rate with the current length mix (the probe samples production's lengths)."""
+        self.run = LocatorRun(started_at=self._clock())
+        self._phase("verify")
+        load = rate_rps * (self.mean_prompt + alpha)
+        w = await self.open(point, load, alpha)
+        self._phase("done")
+        return w
 
     async def ramp(
         self, hw: Hardware, top: ClockPoint, alpha: float, mean_prompt: float
@@ -717,6 +841,8 @@ class TierLocator:
             per_clock[f] = w
             if not self.decode_clean(w):
                 break  # lower D clocks only get slower
+            if load >= 2:  # a second load level: D iteration time vs running sequences
+                await self.closed(ClockPoint(prefill_mhz, f), max(1, load // 2))
         ok = {
             f: w.decode_j_per_token
             for f, w in per_clock.items()
@@ -785,27 +911,30 @@ class TierLocator:
             f"P {prefill_mhz} MHz misses the SLO at load {load:.0f} with every D clock"
         )
 
-    async def fill(self, point: ClockPoint, c0: float, alpha: float) -> float:
-        """Windows at H over several loads (risk-table samples); -> C_H."""
+    async def fill(self, point: ClockPoint, c0: float, alpha: float) -> tuple[float, WindowResult]:
+        """Windows at H over several loads (risk-table samples); -> (C_H, its window)."""
         self._phase("fill")
-        good: list[float] = []
+        good: list[WindowResult] = []
         bad: list[float] = []
         for fraction in self.s.fill_load_fractions:
             w = await self.open(point, fraction * c0, alpha)
-            (good if self.meets_target(w) else bad).append(w.load)
+            if self.meets_target(w):
+                good.append(w)
+            else:
+                bad.append(w.load)
         if not good:
             raise LocatorError("no fill load is feasible at H: table not published")
-        lo = max(good)
-        above = [load for load in bad if load > lo]
+        best = max(good, key=lambda w: w.load)
+        above = [load for load in bad if load > best.load]
         if above:
             hi = min(above)
             for _ in range(self.s.fill_bisect_steps):
-                w = await self.open(point, (lo + hi) / 2, alpha)
+                w = await self.open(point, (best.load + hi) / 2, alpha)
                 if self.meets_target(w):
-                    lo = w.load
+                    best = w
                 else:
                     hi = w.load
-        return lo
+        return best.load, best
 
     # ---- full and partial runs ---------------------------------------------------------
 
@@ -826,22 +955,11 @@ class TierLocator:
         f_h, meas_hi = await self.search_prefill(
             hw, f_eff, top.decode_mhz, self.s.target_load_fraction * c0, alpha, "target"
         )
-
-        # One working tier or two: does the low-load band contain H?
-        self._phase("tiers")
-        low_load = self.s.low_load_fraction * c0
-        low: dict[int, WindowResult] = {}
-        for f in sorted({f for f in meas_hi if f <= f_h}, reverse=True)[:4]:
-            low[f] = await self.open(ClockPoint(f, top.decode_mhz), low_load, alpha)
-        low_e = {
-            f: w.prefill_j_per_request
-            for f, w in low.items()
-            if self.feasible(w) and w.prefill_j_per_request is not None
-        }
-        f_l = None
-        if low_e and f_h in low_e:
-            if low_e[f_h] > (1 + self.s.l_tier_min_gain) * min(low_e.values()):
-                f_l = self.choose(low, low_e)
+        self._phase("tables")  # S(L) at every P clock the solver may choose
+        grid = [f for f in hw.prefill_clocks if f <= f_eff]
+        for f in sorted(set(spread(grid, grid[0], f_eff, self.s.coarse_points)) | {f_h}):
+            if f != top.prefill_mhz:
+                await self.prefill_table(ClockPoint(f, top.decode_mhz), prompts)
 
         if previous is not None:
             f_d, b_star, wall = (
@@ -858,30 +976,18 @@ class TierLocator:
         f_d_alone = f_d
         f_d, joint_h = await self.joint(hw, f_h, f_d, target_load, alpha)
         joint_evidence: dict[str, Any] = {"h": joint_h, "decode_alone": f_d_alone}
-        if f_l is not None:
-            w = await self.open(ClockPoint(f_l, f_d), low_load, alpha)
-            joint_evidence["l"] = {"violations": w.violations, "requests": w.requests}
-            if not self.feasible(w):
-                f_l = None  # L was only checked with D at its ceiling
         h = ClockPoint(f_h, f_d)
-        capacity = await self.fill(h, c0, alpha)
-        self._phase("admission")
-        for f in {f_h} | ({f_l} if f_l is not None else set()):
-            if f != top.prefill_mhz:
-                await self.prefill_table(ClockPoint(f, top.decode_mhz), prompts)
-        self.calibrate()
+        capacity, capacity_window = await self.fill(h, c0, alpha)
 
         assert self.run is not None
         self.run.evidence.update(
             {
                 "f_h": f_h,
-                "f_l": f_l,
                 "target_load": target_load,
-                "low_load": low_load,
+                "capacity_rps": capacity / max(self.mean_prompt + alpha, 1.0),
                 "prefill_energy_target": {
                     str(f): w.prefill_j_per_request for f, w in sorted(meas_hi.items())
                 },
-                "prefill_energy_low": {str(f): e for f, e in sorted(low_e.items())},
                 "decode": d_evidence,
                 "joint": joint_evidence,
                 "capacity_h_fraction": capacity / c0,
@@ -890,14 +996,13 @@ class TierLocator:
                 "duration_s": self._clock() - self.run.started_at,
             }
         )
+        self._phase("model")  # after the evidence above: the model reads the D results
+        self.calibrate(park=park, capacity_window=capacity_window, b_star=b_star)
         table = TierTable(
             park=park,
             h=h,
             capacity_h=capacity,
             alpha_tokens=alpha,
-            l=None if f_l is None else ClockPoint(f_l, f_d),
-            tau_up=None if f_l is None else 0.65 * c0,
-            tau_down=None if f_l is None else 0.45 * c0,
             decode_max_running=b_star,
             decode_kv_limit=self.s.decode_kv_limit,
             decode_wall=wall,
