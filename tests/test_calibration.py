@@ -222,3 +222,30 @@ def test_verified_failure_caps_a_point() -> None:
     m.caps[first.point.key()] = 2.0  # the Canary saw that point fail at 2 req/s
     second = Solver(ClusterModel.from_json(m.to_json()), groups=1).solve(2.0, mix)
     assert second.point != first.point and second.feasible
+
+
+def test_solver_packs_decode_load_and_accounts_for_busy_power_once():
+    solver = Solver(model(), groups=3)
+    mix = [(128, 64)]
+    point = ClockPoint(1080, 1170)
+    rate = 1.5
+    packed = solver.evaluate(rate, mix, 3, point)
+    spread = solver._uniform(rate, mix, 3, point)
+    assert sum(packed.rates) == pytest.approx(rate)
+    assert packed.rates == (rate, 0, 0)
+    assert packed.feasible and packed.power_w < spread.power_w
+    cap = solver.capacity(mix, point)
+    two = solver.evaluate(1.5 * cap, mix, 2, point)
+    assert two.feasible and two.rates == pytest.approx((cap, cap / 2))
+    assert not solver.evaluate(2.1 * cap, mix, 2, point).feasible
+
+
+def test_solver_keeps_offered_long_prompts_in_the_slo_constraints():
+    solver = Solver(model(prompt_limit=512, ttft_slo_ms=100), groups=3)
+    result = solver.solve(1, [(128, 64), (2048, 64)])
+    assert not result.feasible
+
+
+def test_solver_length_sampling_retains_a_rare_longest_prompt():
+    solver = Solver(model(), groups=3)
+    assert (10000, 64) in solver._mix([(128, 64)] * 1000 + [(10000, 64)])

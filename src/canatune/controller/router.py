@@ -13,24 +13,12 @@ With a published table, for each routable group the Router checks
   violation risk of that predicted slack; `cells` (v1) looks up the risk table
   cell (clock point, queue, prompt bucket, D busy),
 and admits to the most loaded feasible group (concentration keeps batches large).
-Otherwise it waits briefly within the TTFT budget (`max_wait_ms`, covers waking a
-parked group), and then, by `overload`:
-* `reject`: HTTP 503,
-* `serve` (production practice: a request at risk is served rather than refused):
-  - *rescue*: the routable group (within the hard limits) with the lowest
-    predicted TTFT would still meet the SLO, only not within the risk bound:
-    dispatch there at once;
-  - *doomed*: the SLO is lost on every group. Dispatching it anyway takes P,
-    link and D capacity from requests that can still make it. So it waits for a
-    rescue until its SLO deadline (TTFT SLO - the Canary's idle TTFT at its
-    length: past it no schedule can meet the SLO), and is then served best
-    effort: first come first served, only where a fresh request would keep
-    `backfill_slack_ms` of slack and while no fresh request and no holder
-    within its deadline waits, late but without making others late.
-    `hold_max_ms` is the client's timeout (a service policy), then 503.
-    `doomed: dispatch` sends it at once instead (for comparison).
-  Both count as pressure for the Controller (wake / abort Canary / MAX). The
-  hard limits stay hard: the D receive buffer overflowing stalls the whole group.
+With `best_effort` (default), an unsafe request signals pressure immediately.
+The Controller wakes all groups, reclaims Canary and locks MAX. Waiting requests
+then dispatch FIFO when a hard-limit-safe group becomes available, even if late.
+Only the service wait timeout (`hold_max_ms`) rejects them. Physical KV and
+concurrency limits remain enforced. Legacy `reject` and `serve` policies remain
+available for comparisons; `serve` uses rescue and deadline/backfill priority.
 The predicted TTFT includes the time already spent waiting at the proxy (TTFT
 counts from arrival); the predictor learns the part after dispatch.
 Reservations are taken synchronously inside the event loop, so two requests can
@@ -88,7 +76,7 @@ class RouterSettings:
     admission: str = "slack"  # slack (state-based) or cells (v1 risk table)
     kv_bytes_per_token: float = 131072.0
     kv_buffer_bytes: float = 1e9  # the KV connector's receive buffer on D
-    overload: str = "reject"  # reject, or serve: rescue to the best group / backfill
+    overload: str = "best_effort"  # risk triggers resources; queue only at hard limits
     doomed: str = "backfill"  # serve: backfill (wait for spare capacity) or dispatch
     backfill_slack_ms: float | None = None  # backfill only where a fresh request keeps this
     # slack; None (auto): the lowest slack whose observed risk is <= theta / 2
@@ -115,7 +103,7 @@ class RouterSettings:
             admission=_admission(raw),
             kv_bytes_per_token=float(kv_bytes_setting(config)),
             kv_buffer_bytes=float(config.get("kv_transfer", {}).get("kv_buffer_bytes", 1e9)),
-            overload=_choice(raw, "overload", ("reject", "serve"), "reject"),
+            overload=_choice(raw, "overload", ("reject", "serve", "best_effort"), "best_effort"),
             hold_max_ms=_positive(raw, "hold_max_ms", 30000),
             doomed=_choice(raw, "doomed", ("backfill", "dispatch"), "backfill"),
             backfill_slack_ms=_auto_ms(raw, "backfill_slack_ms"),
@@ -220,7 +208,7 @@ class CanaTuneRouter:
         self.clock_epochs: dict[str, int] = dict(clock_epochs or {g.name: 0 for g in groups})
         self.rejections = 0
         self.admitted = 0
-        self.overflows = {"rescue": 0, "doomed": 0, "backfill": 0}
+        self.overflows = {"rescue": 0, "doomed": 0, "backfill": 0, "best_effort": 0}
         self._holding: deque[int] = deque()  # serve: waiters past max_wait, in arrival order
         self._held = 0  # waiters that ever entered the hold queue
         self._fresh: set[int] = set()  # waiters still within max_wait
@@ -241,6 +229,17 @@ class CanaTuneRouter:
         self._applied_key: object = None
         self._costs = self._cost_book(None)
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
+        self.full_effort = False
+        self.pressure_event = asyncio.Event()
+        self.risk_signals = 0
+        self._signalled: set[int] = set()
+        self._queue: deque[int] = deque()
+
+    def signal_pressure(self, reason: str) -> None:
+        """Wake control immediately; this signal never changes GPU clocks here."""
+        self.risk_signals += 1
+        self.pressure_event.set()
+        self.log.write({"event": "pressure", "reason": reason})
 
     @property
     def open_admission(self) -> bool:
@@ -309,9 +308,13 @@ class CanaTuneRouter:
         )
         return x, self.predictor.predict(x)
 
-    def _kv_blocked(self, group: Group) -> bool:
+    def _kv_blocked(self, group: Group, tokens: int = 0) -> bool:
         s = self.settings
-        return group.inflight_bytes >= self.kv_fraction * s.kv_buffer_bytes
+        return (
+            group.inflight_bytes + tokens * s.kv_bytes_per_token
+            > self.kv_fraction * s.kv_buffer_bytes
+            or group.inflight_bytes >= self.kv_fraction * s.kv_buffer_bytes
+        )
 
     # ---- state ---------------------------------------------------------------------
 
@@ -363,9 +366,18 @@ class CanaTuneRouter:
             if blocked is not None:
                 continue
             cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
-            if self._kv_blocked(group) and self.settings.admission == "slack":
+            if self._kv_blocked(group, tokens) and self.settings.admission == "slack":
                 continue
             self._within_limits.append((group, cell, d_busy))
+            model = self.tiers.model_json()
+            if model and self.settings.overload == "best_effort":
+                decode = model.get("decode") or {}
+                f = group.effective.decode_mhz
+                alpha = interpolate({int(k): v[0] for k, v in decode.items()}, f) or 0
+                delta = interpolate({int(k): v[1] for k, v in decode.items()}, f) or 0
+                if alpha + delta * (group.n_inflight + 1) > self.settings.tpot_slo_ms:
+                    self._slack_by_group[group.name] = (x, predicted, None)
+                    continue  # TPOT risk requests resources, not a hard rejection
             if self.settings.admission == "slack":
                 slack = self.slack.estimate(self.settings.ttft_slo_ms - waited_ms - predicted)
                 self._slack_by_group[group.name] = (x, predicted, slack)
@@ -387,6 +399,7 @@ class CanaTuneRouter:
         *,
         rescue: bool = False,
         backfill: bool = False,
+        best_effort: bool = False,
     ) -> Ticket | None:
         """Admit to a feasible group. With `rescue` (serve mode, wait budget spent):
         to the group within the hard limits with the lowest predicted TTFT if that
@@ -396,7 +409,7 @@ class CanaTuneRouter:
         feasible = self.candidates(tokens, waited_ms)
         kind = None
         if not feasible:
-            if not rescue or not self._within_limits:
+            if not (rescue or best_effort) or not self._within_limits:
                 return None
             ranked = []
             for group, cell, d_busy in self._within_limits:
@@ -405,7 +418,9 @@ class CanaTuneRouter:
                 ranked.append((*order, group, cell, d_busy))
             predicted, _, _, group, cell, d_busy = min(ranked, key=lambda r: r[:3])
             slack = self._slack_by_group[group.name][2]
-            if waited_ms + predicted <= self.settings.ttft_slo_ms:
+            if best_effort:
+                kind = "best_effort"
+            elif waited_ms + predicted <= self.settings.ttft_slo_ms:
                 kind = "rescue"
             elif not backfill:
                 return None
@@ -493,7 +508,7 @@ class CanaTuneRouter:
         """Requests the current configuration could not serve within the SLO risk:
         rejections, overflows and requests held past the wait budget (the
         Controller's and Canary's pressure signal)."""
-        return self.rejections + sum(self.overflows.values()) + self._held
+        return self.rejections + sum(self.overflows.values()) + self._held + self.risk_signals
 
     def new_waiter(self) -> int:
         """One per arriving request (also the offered-rate record for the solver)."""
@@ -521,6 +536,27 @@ class CanaTuneRouter:
         """One admission attempt of a waiting request -> Ticket, "wait" or "reject".
         `admit` drives it on real time; simulations drive it on their own clock."""
         s = self.settings
+        if s.overload == "best_effort":
+            if waited_ms >= s.hold_max_ms:
+                self._release(waiter)
+                self.rejections += 1
+                self.log.write({"event": "reject", "reason": "service_timeout"})
+                return "reject"
+            if waiter not in self._queue:
+                self._queue.append(waiter)
+            feasible = self.candidates(tokens, waited_ms)
+            if not feasible and waiter not in self._signalled:
+                self._signalled.add(waiter)
+                self.signal_pressure("slo_risk_or_capacity")
+            # FIFO prevents late requests from starving behind fresh arrivals.
+            if self._queue[0] == waiter:
+                ticket = self.try_admit(
+                    tokens, exact, waited_ms, best_effort=self.full_effort
+                )
+                if ticket is not None:
+                    self._release(waiter)
+                    return ticket
+            return "wait"
         serve = s.overload == "serve" and not self.open_admission
         past_wait = waited_ms + s.retry_period_ms > s.max_wait_ms
         now = self._clock()
@@ -559,6 +595,11 @@ class CanaTuneRouter:
 
     def _release(self, waiter: int) -> None:
         self._fresh.discard(waiter)
+        self._signalled.discard(waiter)
+        try:
+            self._queue.remove(waiter)
+        except ValueError:
+            pass
         self._expires.pop(waiter, None)
         try:
             self._holding.remove(waiter)
@@ -643,6 +684,8 @@ class CanaTuneRouter:
             ttft_slo_ms=self.settings.ttft_slo_ms,
             tpot_slo_ms=self.settings.tpot_slo_ms,
         )
+        if violated and self.settings.overload == "best_effort":
+            self.signal_pressure("observed_slo_violation")
         # Only clean samples update the table: served OK, TTFT known, exact prompt
         # length, and no clock change on this group while the request was in flight.
         skip = None
@@ -700,6 +743,9 @@ class CanaTuneRouter:
             "admitted": self.admitted,
             "rejections": self.rejections,
             "overload": self.settings.overload,
+            "full_effort": self.full_effort,
+            "risk_signals": self.risk_signals,
+            "queued": len(self._queue),
             "kv_gate_fraction": self.kv_fraction,
             "backfill_slack_ms": self.backfill_slack_ms(),
             "overflows": dict(self.overflows),

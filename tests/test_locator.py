@@ -238,6 +238,7 @@ def test_locate_publishes_a_cluster_model_the_solver_can_use() -> None:
 
 def build(backend, table=None):
     config = load_config()
+    config["router"]["overload"] = "serve"
     config["controller"]["stagger_s"] = 0.0
     risk = RiskTable.from_config(config["risk"], identity(config))
     groups = build_groups(config)
@@ -493,3 +494,84 @@ def test_relocation_keeps_the_cluster_model() -> None:
     old = ClusterModel.from_json(first.evidence["model"])
     assert model.decode == old.decode and model.power_decode == old.power_decode
     assert model.power_prefill and model.b_star == old.b_star
+
+
+def test_full_effort_reclaims_canary_only_after_probe_drain_and_locks_max():
+    groups, tiers, router, controller, scheduler = build(SurrogateBackend(seed=6))
+    import dataclasses
+
+    router.settings = dataclasses.replace(router.settings, overload="best_effort")
+
+    async def run():
+        drained = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def quiesce():
+            entered.set()
+            await drained.wait()
+
+        scheduler.locator.backend.quiesce = quiesce
+        await controller.start()
+        router.signal_pressure("test")
+        tick = asyncio.create_task(controller.tick())
+        await entered.wait()
+        assert groups[0].state is GroupState.EXPLORING
+        assert all(g.tier is Tier.MAX and g.routable for g in groups if not g.canary)
+        assert scheduler.may_start() == (False, "full_effort")
+        drained.set()
+        await tick
+        assert all(g.routable and g.tier is Tier.MAX for g in groups)
+
+    asyncio.run(run())
+
+
+def test_failed_canary_drain_is_retried_without_releasing_group():
+    import dataclasses
+
+    groups, _, router, controller, scheduler = build(SurrogateBackend(seed=6))
+    router.settings = dataclasses.replace(router.settings, overload="best_effort")
+    attempts = []
+
+    async def quiesce():
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TimeoutError("still busy")
+
+    scheduler.locator.backend.quiesce = quiesce
+
+    async def run():
+        await controller.start()
+        router.signal_pressure("test")
+        await controller.tick()
+        assert router.full_effort and groups[0].state is GroupState.EXPLORING
+        await controller.tick()
+        assert len(attempts) == 2
+        assert groups[0].routable and groups[0].tier is Tier.MAX
+
+    asyncio.run(run())
+
+
+def test_verify_uses_packed_peak_rate_and_failed_window_caps_the_point():
+    from canatune.domain.models import Evaluation
+
+    table = asyncio.run(
+        TierLocator(SurrogateBackend(seed=5), settings()).locate(PROMPT, [512, 2048])
+    )
+    _, _, _, controller, scheduler = build(SurrogateBackend(seed=6), table)
+    controller.plan = Evaluation(2, table.h, True, 100, "decode", {}, (2.0, 0.5))
+    calls = []
+    prompt_limits = []
+    scheduler.locator.backend.set_prompt_limit = lambda limit: prompt_limits.append(limit)
+
+    async def failed(point, rate, alpha):
+        calls.append(rate)
+        window = await scheduler.locator.backend.open_window(point, 1, alpha, 1, 1)
+        window.violations = window.requests
+        return window
+
+    scheduler.locator.verify = failed
+    assert asyncio.run(scheduler._verify()) is False
+    assert calls == [2.0] and prompt_limits == [None]
+    assert table.evidence["model"]["caps"][table.h.key()] == 2.0
+    assert not scheduler.verified
+    assert not controller.solver().evaluate(2.0, [(PROMPT, 64)], 1, table.h).feasible

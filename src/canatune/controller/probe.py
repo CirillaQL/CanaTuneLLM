@@ -38,6 +38,7 @@ from canatune.infrastructure.telemetry import (
     PREFILL_TIME_SUM,
     Telemetry,
     kv_capacity_tokens,
+    parse_snapshot,
     prom_value,
 )
 from canatune.proxy.proxy import Endpoint, StreamTimer, pd_transport_id
@@ -133,6 +134,25 @@ class CanaryProbe:
         self._inflight_tokens = 0
         self._ids = 0
         self.service_source = "http"  # how service_times measured prefill ("metrics" or "http")
+
+    async def quiesce(self) -> None:
+        """Cancellation closes HTTP; vLLM must also report no queued/running work."""
+        deadline = time.monotonic() + self.s.drain_timeout_s
+        async with self.client_factory() as client:
+            while True:
+                idle = True
+                for endpoint in (self.prefill, self.decode):
+                    text = await self._metrics(client, endpoint)
+                    snapshot = None if text is None else parse_snapshot(text, time.monotonic())
+                    if snapshot is None or snapshot.running is None or snapshot.waiting is None:
+                        idle = False
+                    elif snapshot.running + snapshot.waiting > 0:
+                        idle = False
+                if idle:
+                    return
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Canary vLLM work has not drained; group stays exploring")
+                await asyncio.sleep(self.s.sample_period_s)
 
     # ---- clocks and readings -------------------------------------------------------------
 
@@ -460,29 +480,32 @@ class CanaryProbe:
                 if self._record(clock, outcome):
                     violations += 1
 
-            for at, (prompt_tokens, output_tokens) in zip(arrivals, pairs):
-                while True:
-                    done = len(outcomes)
-                    if done >= self.s.abort_min_requests and violations / done > abort_above:
-                        aborted = True
+            try:
+                for at, (prompt_tokens, output_tokens) in zip(arrivals, pairs):
+                    while True:
+                        done = len(outcomes)
+                        if done >= self.s.abort_min_requests and violations / done > abort_above:
+                            aborted = True
+                            break
+                        delay = start + at - time.monotonic()
+                        if delay <= 0:
+                            break
+                        await asyncio.sleep(min(delay, 0.05))
+                    if aborted:
                         break
-                    delay = start + at - time.monotonic()
-                    if delay <= 0:
-                        break
-                    await asyncio.sleep(min(delay, 0.05))
-                if aborted:
-                    break
-                task = asyncio.create_task(one(prompt_tokens, output_tokens))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-            if tasks:
-                await asyncio.wait(tasks, timeout=self.s.drain_timeout_s)
-            for task in tasks:
-                task.cancel()
-            stop_sampling.set()
-            await sampler
-            await self._append_sample(samples)
-            tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
+                    task = asyncio.create_task(one(prompt_tokens, output_tokens))
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
+                if tasks:
+                    await asyncio.wait(tasks, timeout=self.s.drain_timeout_s)
+                await self._append_sample(samples)
+                tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
+            finally:
+                stop_sampling.set()
+                for task in tasks:
+                    task.cancel()
+                sampler.cancel()
+                await asyncio.gather(*tasks, sampler, return_exceptions=True)
         generated = _diff(tokens_before, tokens_after)
         return self._result(
             clock, "open", eq_tps, outcomes, samples, violations, aborted, generated
@@ -529,13 +552,16 @@ class CanaryProbe:
                 asyncio.create_task(worker(i, lengths[i * per_worker : (i + 1) * per_worker]))
                 for i in range(concurrency)
             ]
-            done, pending = await asyncio.wait(workers, timeout=seconds + self.s.drain_timeout_s)
-            for task in pending:
-                task.cancel()
-            stop_sampling.set()
-            await sampler
-            await self._append_sample(samples)
-            tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
+            try:
+                await asyncio.wait(workers, timeout=seconds + self.s.drain_timeout_s)
+                await self._append_sample(samples)
+                tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
+            finally:
+                stop_sampling.set()
+                for task in workers:
+                    task.cancel()
+                sampler.cancel()
+                await asyncio.gather(*workers, sampler, return_exceptions=True)
         generated = _diff(tokens_before, tokens_after)
         return self._result(
             clock, "closed", concurrency, outcomes, samples, violations, False, generated

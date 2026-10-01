@@ -8,9 +8,9 @@ latency SLO** (TTFT < 500 ms, TPOT ≤ 200 ms) by
 2. **parking idle groups** at a locked low clock instead of leaving them unlocked,
 3. running active groups at **clock tiers the Canary measured on this cluster**
    (the loaded energy valley of P; the KV-wall-limited D), and
-4. **admitting each request** only to a group whose current state is safe
-   according to an **online risk table**; requests predicted to violate the SLO
-   are rejected (HTTP 503).
+4. using **SLO risk to trigger full effort**: wake all parked groups, reclaim
+   Canary and lock MAX; serve late requests as capacity allows. HTTP 503 is
+   reserved for the service wait timeout (or the legacy rejection policy).
 
 No clock value, threshold or capacity is configured. A Canary group measures
 them online on the running cluster, so the same code runs on an unknown cluster
@@ -110,25 +110,23 @@ risk          predicted TTFT (Canary's fit, refitted online) -> slack = SLO - wa
               production's counts; a sparse bucket is bounded by the nearest
               observed bucket with less slack) <= theta
 admit         to the most loaded feasible group (concentration keeps batches large)
-overload      (no group within the risk bound after max_wait_ms)
-              reject: 503
-              serve (default): rescue to the lowest-predicted group if it still meets
-              the SLO; a doomed request waits for a rescue until its SLO deadline
-              (TTFT SLO - the Canary's idle TTFT at its length), then is served best
-              effort, first come first served, only where a fresh request keeps
-              backfill_slack_ms of slack (auto: the lowest slack with observed risk
-              <= theta / 2) and no fresh or still-savable request waits; 503 after
-              hold_max_ms (the client's timeout, a policy). Hard limits are never
-              overridden.
+overload      best_effort (default): signal SLO/TPOT risk immediately; wake all
+              groups and lock MAX, safely reclaim Canary; dispatch FIFO even late
+              while enforcing physical D/KV limits. Queue until capacity is free;
+              hold_max_ms is the service wait timeout, then HTTP 503.
+              reject / serve retain legacy rejection and rescue/backfill behavior.
 ```
 
-Rescues, backfills, holds and rejections are the pressure signal.
+Predicted and observed SLO violations and capacity waits are pressure signals.
 
 ### Solver and Controller (`domain/models.py`, `controller/tier_controller.py`)
 
 Every second, from the offered rate (Router arrivals over `load_window_s`) and the
 recent length mix, the solver evaluates every (groups, P clock, D clock) of the
-Canary's model:
+Canary's model. It fills each group up to feasible capacity before opening
+another D, matching the Router's concentration policy; D busy power is paid per
+working group. The longest offered prompt is retained in the length mix, and
+online Router predictor coefficients and slack counts feed the solver:
 
 ```text
 TTFT     the admission predictor at steady-state feature means (pending P work =
@@ -146,9 +144,10 @@ The plan is the lowest-power feasible configuration for the peak rate of the las
 `t_down_s`. It applies at once when the current configuration cannot carry the
 current rate (up); otherwise only once the same target held for `t_down_s`, with
 no pressure in that time, and when it saves more than the Canary's noise band
-(`canary.locator.eps`). Extra groups drain (the Canary first) and park; missing
-ones wake. Pressure wakes a parked group, else aborts the Canary's experiment, else
-raises a group to MAX until `t_down_s` without pressure. While clocks change the
+(`canary.locator.eps`) and amortizes the observed clock switching time. Extra groups drain (the Canary first) and park; missing
+ones wake. Pressure interrupts energy planning and enters full effort: all groups
+at MAX, including PARK and a safely reclaimed Canary. Return to energy mode
+requires `t_down_s` without pressure and a feasible working configuration. While clocks change the
 Router assumes the slower point and in-flight samples are not recorded.
 
 ### Canary scheduler (`controller/canary.py`)
@@ -172,7 +171,7 @@ in turn, no admission, no clock control) or `cantune`.
 | Online risk table keyed by clock point | `domain/risk.py` | done |
 | Telemetry: `/metrics` scraper, snapshot age | `infrastructure/telemetry.py` | done |
 | GPU agent per node: supported clocks ≥ `min_mhz`, serialized locks, NVML read-back, energy/clock/limit readings, reset on exit | `infrastructure/gpu_agent.py` | done |
-| Router: open admission at cold start; state-based admission; serve/reject overload | `controller/router.py` | done |
+| Router: state-based concentration; SLO-triggered best effort; legacy serve/reject | `controller/router.py` | done |
 | Cluster model and solver from the Canary's measurements | `domain/models.py`, `domain/calibration.py` | done; simulated, not yet on GPUs |
 | Controller: MAX cold start, solver plan with switching rules, pressure (wake / abort / MAX), drain and park | `controller/tier_controller.py` | done |
 | Tier locator | `controller/locator.py` | done; validated on a replay surrogate (tests), not yet on GPUs |

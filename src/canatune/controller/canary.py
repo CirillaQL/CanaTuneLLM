@@ -18,11 +18,11 @@ A verification is one window at the plan's point and per-group rate with the
 current length mix: a pass records the rate as confirmed, a failure caps the
 point below that rate in the model (the solver then avoids it).
 
-Stop: the locator finishes (the new table is published), or the Controller
-reports pressure it cannot relieve by waking a parked group (abort: the
-Canary locks back to H and serves; only without an experiment to abort does
-the Controller raise groups to MAX). Window results are cached in the locator,
-so an aborted run resumes where it stopped next time.
+Stop: in best-effort mode any SLO/capacity pressure reclaims Canary, including
+cold calibration. Cancel and join probes, then confirm both vLLM nodes idle before
+returning the group at MAX. A failed drain leaves it EXPLORING and is retried.
+No experiment starts while full effort is active. Legacy policies keep their
+incremental recovery. Aborted locator windows are cached for a later retry.
 """
 
 import asyncio
@@ -86,6 +86,7 @@ class CanaryScheduler:
         self.history: list[dict[str, Any]] = []
         self.verified: dict[str, float] = {}  # point -> highest per-group rate confirmed
         controller.on_pressure = self.abort
+        controller.reclaim_canary = self.reclaim
 
     @property
     def canary(self) -> Group | None:
@@ -130,6 +131,12 @@ class CanaryScheduler:
         return None
 
     def may_start(self) -> tuple[bool, str]:
+        if self.controller.router.full_effort:
+            return False, "full_effort"
+        if self.canary is not None and self.canary.state is GroupState.EXPLORING:
+            # Cold start deliberately claims the Canary before its first run.
+            if self.task is not None:
+                return False, "awaiting_drain"
         table = self.controller.tiers.table
         now = self._clock()
         if table is None:
@@ -165,7 +172,7 @@ class CanaryScheduler:
         if plan is None or not plan.feasible:
             return None
         rate, _, _ = self.controller.demand(self._clock())
-        per_group = rate / max(plan.n, 1)
+        per_group = max(plan.rates, default=rate / max(plan.n, 1))
         if per_group <= self.verified.get(plan.point.key(), 0.0):
             return None
         return plan.point, per_group
@@ -175,7 +182,10 @@ class CanaryScheduler:
     def abort(self, reason: str) -> bool:
         """Called by the Controller under pressure it cannot relieve otherwise;
         -> whether an experiment (running or about to start) was stopped."""
-        if self.controller.tiers.table is None:
+        if (
+            self.controller.tiers.table is None
+            and self.controller.router.settings.overload != "best_effort"
+        ):
             return False  # cold start: production is at MAX and admits everything
         stopped = False
         if self.running:
@@ -190,6 +200,22 @@ class CanaryScheduler:
             if canary is not None and canary.state is GroupState.DRAINING:
                 canary.state = GroupState.ACTIVE
         return stopped
+
+    async def reclaim(self) -> None:
+        """Join experiment cleanup, then confirm vLLM drained before serving."""
+        if self.running and self.task is not asyncio.current_task():
+            assert self.task is not None
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        self._pending = None
+        canary = self.canary
+        if canary is not None and canary.state is GroupState.EXPLORING:
+            if self.locator is not None:
+                quiesce = getattr(self.locator.backend, "quiesce", None)
+                if quiesce is not None:
+                    await quiesce()
+            canary.state = GroupState.ACTIVE
+            canary.effective = None  # Controller must confirm MAX before routing
 
     def request(self, kind: str, reason: str) -> tuple[bool, str]:
         """Manual start through the control API (start conditions still apply)."""
@@ -217,6 +243,13 @@ class CanaryScheduler:
         canary = self.canary
         if canary is None or self.locator is None or self.running:
             return
+        if self.task is not None and canary.state is GroupState.EXPLORING:
+            await self.reclaim()  # retry a failed drain before permitting another experiment
+            if not self.controller.router.full_effort:
+                await self.controller.set_tier(
+                    canary, Tier.H if self.controller.tiers.table is not None else Tier.MAX,
+                    "canary_drained",
+                )
         if self._pending is None:
             trig = self.trigger()
             if trig is None:
@@ -260,9 +293,9 @@ class CanaryScheduler:
         try:
             summary = self.lengths.summary()
             if kind == "verify" and table is not None:
-                await self._verify()
+                ok = await self._verify()
                 self._reference = summary
-                outcome = "verified"
+                outcome = "verified" if ok else "verification_failed"
                 return
             if kind == "recheck" and table is not None:
                 new = await self.locator.recheck(table, self._prompts())
@@ -304,14 +337,20 @@ class CanaryScheduler:
                 }
             )
             canary = self.canary
-            if canary is not None:
-                canary.state = GroupState.ACTIVE
-                if controller.tiers.table is not None:
-                    await controller.set_tier(canary, Tier.H, f"canary_{outcome}")
+            if canary is not None and not controller.router.full_effort:
+                try:
+                    await self.reclaim()
+                except Exception as error:
+                    controller.log.write({"event": "canary_drain_error", "error": repr(error)})
                 else:
-                    await controller.set_tier(canary, Tier.MAX, f"canary_{outcome}")
+                    await controller.set_tier(
+                        canary, Tier.H if (
+                            controller.tiers.table is not None and not controller.router.full_effort
+                        ) else Tier.MAX,
+                        f"canary_{outcome}",
+                    )
 
-    async def _verify(self) -> None:
+    async def _verify(self) -> bool:
         """Layer 3: the plan's point at its per-group rate, current length mix."""
         assert self.locator is not None
         controller = self.controller
@@ -319,10 +358,13 @@ class CanaryScheduler:
         if target is None:  # a length shift: re-check the current plan as it is
             plan = controller.plan
             if plan is None:
-                return
+                return False
             rate, _, _ = controller.demand(self._clock())
-            target = (plan.point, rate / max(plan.n, 1))
+            target = (plan.point, max(plan.rates, default=rate / max(plan.n, 1)))
         point, per_group = target
+        # Verification must replay all offered lengths, including prompts that
+        # calibration classified as impossible at idle; otherwise the rate is wrong.
+        self.locator.backend.set_prompt_limit(None)
         self.locator.mean_prompt = self.lengths.summary().prompt_mean
         w = await self.locator.verify(point, per_group, controller.tiers.alpha_tokens)
         ok = self.locator.meets_target(w)
@@ -339,13 +381,14 @@ class CanaryScheduler:
         )
         if ok:
             self.verified[key] = max(self.verified.get(key, 0.0), per_group)
-            return
+            return True
         model = controller.tiers.model_json()
         if model is not None:  # the point is infeasible at this rate: cap it below
             caps = model.setdefault("caps", {})
             caps[key] = min(float(caps.get(key, per_group)), per_group)
             if controller.store is not None and controller.tiers.table is not None:
                 controller.store.save(controller.tiers.table)
+        return False
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():

@@ -313,7 +313,11 @@ def create_proxy_router(
             ticket = await runtime.router.admit(tokens, exact)
             if ticket is None:
                 return JSONResponse(
-                    {"error": "rejected: no active group can serve this request within the SLO"},
+                    {"error": (
+                        "service wait timed out: no active group has capacity"
+                        if runtime.router.settings.overload == "best_effort" else
+                        "rejected: no active group can serve this request within the SLO"
+                    )},
                     status_code=503,
                     headers={"X-CanaTune-Rejected": "1"},
                 )

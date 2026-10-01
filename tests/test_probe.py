@@ -233,3 +233,59 @@ def test_closed_window_trace_is_fixed_by_concurrency_and_rep() -> None:
         return sorted(len(b["prompt"]) for port, b, _ in requests if port == 8200)[:2]
 
     assert prompts(0) == prompts(0)
+
+
+@pytest.mark.parametrize("kind", ["open", "closed"])
+def test_cancelled_window_joins_all_probe_requests_and_sampler(kind):
+    probe, _ = make_probe([], FakeAgent())
+
+    async def run():
+        started = asyncio.Event()
+        live = set()
+
+        async def blocking_request(*args):
+            task = asyncio.current_task()
+            live.add(task)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                live.remove(task)
+
+        probe.request = blocking_request
+        window = (
+            probe.open_window(ClockPoint(2520, 1500), 2000, 0, 10, 1)
+            if kind == "open" else probe.closed_window(ClockPoint(2520, 1500), 3, 10)
+        )
+        task = asyncio.create_task(window)
+        await asyncio.wait_for(started.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not live
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+    asyncio.run(run())
+
+
+def test_quiesce_requires_both_vllm_nodes_idle_and_available():
+    from dataclasses import replace
+
+    probe, _ = make_probe([], FakeAgent())
+    probe.s = replace(probe.s, drain_timeout_s=0.04, sample_period_s=0.001)
+    calls = []
+
+    async def metrics(client, endpoint):
+        calls.append(endpoint)
+        busy = len(calls) <= 2
+        return f"vllm:num_requests_running {int(busy)}\nvllm:num_requests_waiting 0\n"
+
+    probe._metrics = metrics
+    asyncio.run(probe.quiesce())
+    assert calls == [probe.prefill, probe.decode] * 2
+
+    async def unavailable(*args):
+        return None
+
+    probe._metrics = unavailable
+    with pytest.raises(TimeoutError, match="has not drained"):
+        asyncio.run(probe.quiesce())

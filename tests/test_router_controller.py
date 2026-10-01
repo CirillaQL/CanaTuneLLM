@@ -643,3 +643,115 @@ def test_controller_boosts_on_overflow_pressure() -> None:
     router.overflows["doomed"] += 3
     asyncio.run(controller.tick())
     assert any(g.tier is Tier.MAX for g in groups)
+
+
+def test_best_effort_signals_before_wait_budget_and_serves_late_requests():
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    for g in groups:
+        g.pending_ms = 4000
+    waiter = router.new_waiter()
+    assert router.step(waiter, 128, True, 0) == "wait"
+    assert router.pressure_event.is_set() and router.risk_signals == 1
+    assert router.step(waiter, 128, True, 20) == "wait"
+    assert router.risk_signals == 1
+    router.full_effort = True
+    ticket = router.step(waiter, 128, True, 1500)
+    assert ticket.overflow == "best_effort"
+    assert router.rejections == 0
+
+
+def test_best_effort_hard_limits_queue_fifo_and_cancellation_releases():
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    router.full_effort = True
+    for g in groups:
+        g.inflight_bytes = 0.6e9
+    first, second = router.new_waiter(), router.new_waiter()
+    assert router.step(first, 128, True, 1500) == "wait"
+    assert router.step(second, 128, True, 1500) == "wait"
+    groups[1].inflight_bytes = 0
+    assert router.step(second, 128, True, 1520) == "wait"
+    router._release(first)  # same cleanup used by admit() when cancelled
+    assert router.step(second, 128, True, 1540).group is groups[1]
+
+
+def test_full_effort_wakes_all_and_prevents_energy_plans_until_calm():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    activate(groups[:1])
+    router.signal_pressure("test")
+    asyncio.run(controller.tick())
+    assert router.full_effort
+    assert all(g.routable and g.tier is Tier.MAX for g in groups)
+    clock.now += 5
+    asyncio.run(controller.tick())
+    assert all(g.tier is Tier.MAX for g in groups)
+    clock.now += controller.settings.t_down_s
+    asyncio.run(controller.tick())
+    assert not router.full_effort
+    assert all(g.state is GroupState.ACTIVE and g.tier is Tier.H for g in groups)
+
+
+def test_router_pressure_wakes_controller_before_period():
+    async def run():
+        _, _, groups, _, router, controller, _ = setup(
+            table=published(), admission="slack", overload="best_effort"
+        )
+        activate(groups)
+        controller.settings = dataclasses.replace(controller.settings, period_s=30)
+        stop = asyncio.Event()
+        task = asyncio.create_task(controller.run(stop))
+        await asyncio.sleep(0.01)
+        router.signal_pressure("test")
+        for _ in range(50):
+            if router.full_effort:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, 1)
+        assert router.full_effort
+    asyncio.run(run())
+
+
+def test_best_effort_service_timeout_is_enforced_even_when_capacity_frees():
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    router.full_effort = True
+    assert router.step(router.new_waiter(), 128, True, router.settings.hold_max_ms) == "reject"
+    assert router.admitted == 0 and router.state()["queued"] == 0
+
+
+def test_decode_tpot_risk_triggers_full_effort_but_is_not_a_hard_wall():
+    table = published(model=True)
+    table.evidence["model"]["decode"] = {"1500": [250, 0]}
+    _, _, groups, _, router, _, _ = setup(
+        table=table, admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    waiter = router.new_waiter()
+    assert router.step(waiter, 128, True, 0) == "wait"
+    assert router.risk_signals == 1
+    router.full_effort = True
+    assert router.step(waiter, 128, True, 20).overflow == "best_effort"
+
+
+def test_cold_full_effort_returns_to_calibration_after_idle_cooldown():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=None, admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    router.signal_pressure("test")
+    asyncio.run(controller.tick())
+    assert router.full_effort
+    clock.now += controller.settings.t_down_s + 1
+    asyncio.run(controller.tick())
+    assert not router.full_effort
+    assert all(g.tier is Tier.MAX for g in groups)

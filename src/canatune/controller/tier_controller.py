@@ -4,10 +4,10 @@ Cold start (no tier table): every production group is active at MAX and the
 Router admits everything; the Controller does nothing else.
 
 With a table, every tick:
-* pressure (the Router rejected, held or overflowed requests): wake a parked
-  group; with none left ask the Canary to abort its experiment; else raise the
-  most loaded working group to MAX. Boosted groups return to the working point
-  after `t_down_s` without pressure.
+* best-effort pressure: an event wakes control immediately; wake all parked groups,
+  lock MAX, cancel/join the Canary experiment and confirm vLLM idle before reuse.
+  Hold full effort until t_down_s without pressure and the working point is feasible.
+  Legacy overload policies retain incremental wake/abort/boost behavior.
 * plan (the Canary's cluster model, `domain.models.Solver`): from the offered
   request rate (Router arrivals over `load_window_s`; its burst factor over
   `burst_window_s` is logged) and the length mix of recent requests, the
@@ -29,7 +29,7 @@ With a table, every tick:
 import asyncio
 import time
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -116,6 +116,10 @@ class TierController:
         self._retry: dict[str, tuple[float, float]] = {}
         # Set by the Canary scheduler: abort an experiment; -> whether one was aborted.
         self.on_pressure: Callable[[str], bool] | None = None
+        self.reclaim_canary: Callable[[], Awaitable[None]] | None = None
+        self._full_effort = False
+        self._control_lock = asyncio.Lock()
+        self._switch_s = 0.0
 
     # ---- actuation ---------------------------------------------------------------
 
@@ -131,6 +135,9 @@ class TierController:
             )
             return False
         self.log.write({"event": "clock", "endpoint": endpoint, "mhz": mhz, **result})
+        self._switch_s = max(
+            self._switch_s, float(result.get("confirm_ms") or result.get("cmd_ms") or 0) / 1000
+        )
         return bool(result.get("ok"))
 
     async def set_tier(self, group: Group, tier: Tier, reason: str) -> None:
@@ -198,7 +205,7 @@ class TierController:
         for group in self.groups:
             if group.state is not GroupState.ACTIVE:
                 continue
-            tier = Tier.H
+            tier = Tier.MAX if self._full_effort else Tier.H
             if group.effective != self.tiers.clocks(tier):
                 await self.set_tier(group, tier, f"publish:{reason}")
                 await asyncio.sleep(self.settings.stagger_s)
@@ -222,7 +229,21 @@ class TierController:
         """Solver over the published cluster model (rebuilt when a table is published
         or the Canary's verification capped a point)."""
         raw = self.tiers.model_json() if self.settings.solver else None
-        key = None if raw is None else (self.tiers.table.published_at, str(raw.get("caps")))
+        if raw is not None and raw.get("predictor_coef") is not None:
+            self.router._apply_table()
+            raw = dict(raw)
+            raw["predictor_coef"] = list(self.router.predictor.coef)
+            slack = self.router.slack.to_json()
+            counts = {k: list(v) for k, v in slack["seed"].items()}
+            for k, v in slack["counts"].items():
+                old = counts.setdefault(k, [0, 0])
+                old[0] += v[0]
+                old[1] += v[1]
+            raw["slack_counts"] = counts
+        key = None if raw is None else (
+            self.tiers.table.published_at, str(raw.get("caps")),
+            str(raw.get("predictor_coef")), str(raw.get("slack_counts")),
+        )
         if key != self._solver_key:
             self._solver_key = key
             self._solver = (
@@ -234,6 +255,9 @@ class TierController:
         """-> (offered requests/s, burst factor, recent (prompt, output) lengths)."""
         s = self.settings
         rate, _ = self.router.offered(now, s.load_window_s, s.burst_bucket_s)
+        if self.router.settings.overload == "best_effort":
+            recent, _ = self.router.offered(now, max(s.period_s, 1), max(s.period_s, 1))
+            rate = max(rate, recent)  # react to bursts before the long window fills
         _, burst = self.router.offered(now, s.burst_window_s, s.burst_bucket_s)
         lengths = self.router.lengths.pairs() if self.router.lengths is not None else []
         return rate, burst, lengths
@@ -256,7 +280,41 @@ class TierController:
     # ---- one control step -------------------------------------------------------------
 
     async def tick(self) -> None:
+        async with self._control_lock:
+            await self._tick()
+
+    async def _tick(self) -> None:
         now = self._clock()
+        if self.router.settings.overload == "best_effort":
+            new_pressure = self.router.pressure != self._rejections_seen
+            self._rejections_seen = self.router.pressure
+            pressure = new_pressure or self.router.state()["queued"]
+            if pressure:
+                self._pressure_at = now
+                await self._enter_full_effort("slo_risk_or_capacity")
+            if self._full_effort:
+                if not pressure:
+                    await self._enter_full_effort("recovery")
+                await self._log_energy(now)
+                await self._retry_locks(now)
+                if any(g.state is GroupState.EXPLORING for g in self.groups):
+                    return  # retain full effort until experiment reclaim succeeds
+                if now - self._pressure_at < self.settings.t_down_s:
+                    return  # energy plans cannot override pressure recovery
+                solver = self.solver()
+                rate, _, mix = self.demand(now)
+                if solver is not None and mix and not solver.evaluate(
+                    rate, mix, len(self.groups), self.tiers.clocks(Tier.H)
+                ).feasible:
+                    return
+                if self.tiers.table is None and any(g.n_inflight for g in self.groups):
+                    return  # resume cold calibration only once production drains
+                self._full_effort = self.router.full_effort = False
+                self._target = self._target_since = None
+                self.log.write({"event": "control_mode", "mode": "energy"})
+                for group in self.groups:
+                    if group.state is GroupState.ACTIVE and self.tiers.table is not None:
+                        await self.set_tier(group, Tier.H, "recovered")
         await self._log_energy(now)
         await self._retry_locks(now)  # also on a cold start: a group locked to MAX
         table = self.tiers.table
@@ -280,6 +338,34 @@ class TierController:
             await self._unboost(active, now)
         await self._plan(now)
         await self._finish_draining()
+
+    async def _enter_full_effort(self, reason: str) -> None:
+        if not self._full_effort:
+            self._full_effort = self.router.full_effort = True
+            self._target = self._target_since = None
+            self.log.write({"event": "control_mode", "mode": "full_effort", "reason": reason})
+            if self.on_pressure is not None:
+                self.on_pressure(reason)
+        changes = []
+        for group in self.groups:
+            if group.state is GroupState.EXPLORING:
+                continue  # experiment cleanup owns this group until it returns
+            group.state = GroupState.ACTIVE
+            if group.tier is not Tier.MAX:
+                changes.append(self.set_tier(group, Tier.MAX, reason))
+        await asyncio.gather(*changes)
+        # Wake production first: draining a cancelled experiment may take seconds.
+        if self.reclaim_canary is not None:
+            try:
+                await self.reclaim_canary()
+            except Exception as error:
+                self.log.write({"event": "canary_reclaim_error", "error": repr(error)})
+                return  # remains EXPLORING; retry on the next full-effort tick
+            for group in self.groups:
+                if group.canary and group.state is GroupState.ACTIVE and (
+                    group.tier is not Tier.MAX or group.effective is None
+                ):
+                    await self.set_tier(group, Tier.MAX, reason)
 
     async def _retry_locks(self, now: float) -> None:
         """Lock again the groups whose last lock failed (their target is unchanged)."""
@@ -341,9 +427,17 @@ class TierController:
         key = (target.n, target.point)
         if key != self._target:
             self._target, self._target_since = key, now
-        held = now - (self._target_since or now) >= s.t_down_s
+        held = now - (now if self._target_since is None else self._target_since) >= s.t_down_s
         calm = now - self._pressure_at >= s.t_down_s
         gain = current.power_w - target.power_w > s.switch_gain * current.power_w
+        gain = gain and (
+            (current.power_w - target.power_w) * s.t_down_s
+            > 2 * self._switch_s * max(current.power_w, target.power_w)
+        )
+        if not target.feasible and self.router.settings.overload == "best_effort":
+            self._pressure_at = now
+            await self._enter_full_effort("model_capacity")
+            return
         if key == (len(routable), point):
             return
         if not (up or (held and calm and gain)):
@@ -416,18 +510,30 @@ class TierController:
     async def run(self, stop: asyncio.Event) -> None:
         """Control loop; `start()` must have run (the Runtime does it)."""
         while not stop.is_set():
+            self.router.pressure_event.clear()
             try:
                 await self.tick()
             except Exception as error:  # a bad tick must not stop control
                 self.log.write({"event": "controller_error", "error": repr(error)})
             try:
-                await asyncio.wait_for(stop.wait(), timeout=self.settings.period_s)
+                stopping = asyncio.create_task(stop.wait())
+                pressure = asyncio.create_task(self.router.pressure_event.wait())
+                try:
+                    await asyncio.wait(
+                        (stopping, pressure), timeout=self.settings.period_s,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    stopping.cancel()
+                    pressure.cancel()
+                    await asyncio.gather(stopping, pressure, return_exceptions=True)
             except asyncio.TimeoutError:
                 pass
 
     def state(self) -> dict[str, Any]:
         table = self.tiers.table
         return {
+            "mode": "full_effort" if self._full_effort else "energy",
             "tiers": None if table is None else table.to_json(),
             "max_point": self.tiers.max_point.key(),
             "loads": self.loads(self._clock()),

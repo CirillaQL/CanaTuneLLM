@@ -18,7 +18,9 @@ constants from other runs):
             KV-in-flight gate (calibration), the prompt limit
 
 The solver evaluates every (groups n, P clock, D clock) for a request rate and a
-length distribution. TTFT: the predictor at the steady-state means of its features
+length distribution, packing each group up to its feasible per-group capacity
+before opening another decode group. Empty active groups pay idle power.
+TTFT: the predictor at the steady-state means of its features
 (pending P work = M/G/1 mean unfinished work lambda E[S^2] / 2(1 - rho); KV in
 flight = lambda E[L kv residence]; decoding = Little's law on T_iter) for every
 length of the mix, its violation risk from the slack-risk counts, averaged over the
@@ -189,6 +191,7 @@ class Evaluation:
     power_w: float
     binding: str  # constraint with the highest use: prefill, decode, kv, ttft, cap
     use: dict[str, float]  # each constraint's load / limit
+    rates: tuple[float, ...] = ()  # concentrated per-group request rates
 
 
 class Solver:
@@ -197,6 +200,7 @@ class Solver:
         self.groups = groups
         self._costs = model.costs()
         self._slack = None
+        self._capacities: dict[tuple, float] = {}
         if model.slack_counts:
             self._slack = SlackRisk(slack_edges(model.ttft_slo_ms))
             self._slack.set_seed(model.slack_counts)
@@ -204,14 +208,61 @@ class Solver:
     MIX_POINTS = 16  # quantile representatives of the recent length mix
 
     def _mix(self, mix: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
-        limit = self.model.prompt_limit
-        kept = sorted((p, o) for p, o in mix if limit is None or p <= limit) or sorted(mix)
+        kept = sorted(mix)  # offered long requests must not disappear from demand
         if len(kept) <= self.MIX_POINTS:
             return kept
         k = self.MIX_POINTS
-        return [kept[int((i + 0.5) * len(kept) / k)] for i in range(k)]
+        representatives = [kept[int((i + 0.5) * len(kept) / k)] for i in range(k)]
+        representatives[-1] = kept[-1]  # never lose a rare longest prompt
+        return representatives
 
     def evaluate(
+        self, rate_rps: float, mix: Sequence[tuple[int, int]], n: int, point: ClockPoint
+    ) -> Evaluation:
+        """Fill groups to measured/modelled capacity before opening another D.
+
+        Each active D pays its busy-power cost once; more tokens in its batch
+        share that cost. Keep n physical active groups, including any empty ones.
+        """
+        if n < 1 or rate_rps < 0:
+            raise ValueError("positive group count and non-negative rate required")
+        capacity = self.capacity(mix, point)
+        remaining = rate_rps
+        rates = []
+        for i in range(n):
+            rate = remaining if i == n - 1 else min(remaining, capacity)
+            rates.append(rate)
+            remaining -= rate
+        evaluations = [self._uniform(r, mix, 1, point) for r in rates]
+        use = {k: max(e.use.get(k, 0) for e in evaluations) for k in evaluations[0].use}
+        park = self.model.park_power_w
+        power = sum(e.power_w - (self.groups - 1) * park for e in evaluations)
+        power += (self.groups - n) * park
+        return Evaluation(
+            n, point, all(e.feasible for e in evaluations), power,
+            max(use, key=use.get), use, tuple(rates),
+        )
+
+    def capacity(self, mix: Sequence[tuple[int, int]], point: ClockPoint) -> float:
+        """Largest feasible per-group rate; shared by packing and Canary verify."""
+        key = (point, tuple(self._mix(mix)))
+        if key not in self._capacities:
+            lo, hi = 0.0, 1.0
+            if self._uniform(0, mix, 1, point).feasible:
+                for _ in range(30):
+                    if not self._uniform(hi, mix, 1, point).feasible:
+                        break
+                    hi *= 2
+                for _ in range(24):
+                    mid = (lo + hi) / 2
+                    if self._uniform(mid, mix, 1, point).feasible:
+                        lo = mid
+                    else:
+                        hi = mid
+            self._capacities[key] = lo
+        return self._capacities[key]
+
+    def _uniform(
         self, rate_rps: float, mix: Sequence[tuple[int, int]], n: int, point: ClockPoint
     ) -> Evaluation:
         m = self.model
@@ -246,7 +297,7 @@ class Solver:
                     x = (1.0, cost(p), pending, inflight / 1e9, running)
                     predicted = sum(c * v for c, v in zip(m.predictor_coef, x))
                     risk += self._slack.estimate(m.ttft_slo_ms - predicted).risk
-                use["prefill"] = risk / len(mix) / m.theta
+                use["prefill"] = risk / len(mix) / m.theta if m.theta > 0 else math.inf
         else:
             use["prefill"] = rho / m.rho_prefill if m.rho_prefill > 0 else math.inf
         limits = []
@@ -303,7 +354,7 @@ class Solver:
             raise ValueError("the model has no clock points")
         ok = [e for e in evals if e.feasible]
         if ok:
-            return min(ok, key=lambda e: (e.power_w, -e.n))
+            return min(ok, key=lambda e: (e.power_w, e.n))
         # Nothing feasible: the most headroom; ties (one constraint binds whatever the
         # other clock) go to more groups and higher clocks, so the answer is stable.
         return min(
