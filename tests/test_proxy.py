@@ -1,6 +1,7 @@
 """CPU-only request flow tests for the P/D proxy."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -421,3 +422,133 @@ def test_proxy_marks_non_streaming_requests_for_production_feedback() -> None:
 
     asyncio.run(run())
     assert seen == [False, True]
+
+
+CHAT_SSE = (
+    b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    b'data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n'
+    b'data: {"choices":[{"index":0,"delta":{"content":"lo"}}]}\n\n'
+    b'data: {"choices":[{"index":0,"delta":{"content":"!"},"finish_reason":"stop"}]}\n\n'
+    b'data: {"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":3}}\n\n'
+    b"data: [DONE]\n\n"
+)
+
+
+def test_chat_token_chunks_skip_the_role_announcement_and_empty_deltas() -> None:
+    from canatune.proxy.proxy import StreamTimer, is_token_chunk
+
+    assert is_token_chunk({"text": ""})  # completions: an empty text is still a token
+    assert not is_token_chunk({"delta": {"role": "assistant", "content": ""}})
+    assert is_token_chunk({"delta": {"role": "assistant", "content": "Hi"}})
+    assert is_token_chunk({"delta": {"content": ""}})
+    assert not is_token_chunk({"delta": {}, "finish_reason": "stop"})
+    assert is_token_chunk({"delta": {"tool_calls": [{"index": 0}]}})
+    timer = StreamTimer(clock=iter([1.0, 1.1, 1.2]).__next__)
+    assert timer.feed(CHAT_SSE) == 3  # role chunk and usage chunk are no tokens
+
+
+def test_chat_prompt_length_uses_the_chat_template() -> None:
+    from canatune.proxy.proxy import chat_prompt_tokens
+
+    class Tokenizer:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(self, messages, chat_template=None, **kwargs):
+            self.seen = (chat_template, kwargs["add_generation_prompt"], kwargs["tokenize"])
+            return [1] + [7] * sum(len(m["content"].split()) for m in messages) + [2]
+
+    messages = [{"role": "user", "content": "one two three"}]
+    tokenizer = Tokenizer()
+    assert chat_prompt_tokens({"messages": messages}, tokenizer, None, 4.0) == (5, True)
+    assert tokenizer.seen == (None, True, True)
+    # The template vLLM serves with is the one rendered; a request's own wins.
+    chat_prompt_tokens({"messages": messages}, tokenizer, "served", 4.0)
+    assert tokenizer.seen[0] == "served"
+    chat_prompt_tokens({"messages": messages, "chat_template": "own"}, tokenizer, "served", 4.0)
+    assert tokenizer.seen[0] == "own"
+    # No tokenizer (or no template anywhere): estimated, not exact; parts count as text.
+    parts = [{"role": "user", "content": [{"type": "text", "text": "x" * 40}]}]
+    assert chat_prompt_tokens({"messages": parts}, None, None, 4.0) == (10, False)
+    tokenizer.chat_template = None
+    assert chat_prompt_tokens({"messages": messages}, tokenizer, None, 4.0)[1] is False
+    with pytest.raises(ValueError):
+        chat_prompt_tokens({"prompt": "hi"}, tokenizer, None, 4.0)
+
+
+def test_chat_completions_go_through_p_and_d_chat_endpoints() -> None:
+    upstream = []
+    runtime_ref = {}
+
+    class SSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield CHAT_SSE
+
+    def handler(request):
+        upstream.append(request)
+        if request.url.port < 8200:
+            return httpx.Response(200, json={"choices": [{"message": {"content": "H"}}]})
+        return httpx.Response(
+            200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
+        )
+
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hello there"}],
+        "max_tokens": 3,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    async def run():
+        client, runtime = make_cantune(handler, admission="slack", overload="best_effort")
+        runtime_ref["rt"] = runtime
+        await runtime.start()
+        runtime.stop.set()
+        async with client:
+            response = await client.post("/v1/chat/completions", json=body)
+            assert response.status_code == 200
+            assert response.content == CHAT_SSE
+            record = runtime.router.log.recent[-1]
+            assert record["status"] == "ok" and record["output_tokens"] == 3
+            assert record["ttft_ms"] is not None and record["tpot_ms"] is not None
+            bad = await client.post("/v1/chat/completions", json={"model": "m", "prompt": "x"})
+            assert bad.status_code == 400
+        await asyncio.gather(*runtime.tasks, return_exceptions=True)
+
+    asyncio.run(run())
+    prefill, decode = upstream
+    assert prefill.url.path == decode.url.path == "/v1/chat/completions"
+    assert prefill.headers["X-Request-Id"] == decode.headers["X-Request-Id"]
+    sent = json.loads(prefill.read())
+    assert sent["max_tokens"] == 1 and sent["stream"] is False and "stream_options" not in sent
+    assert sent["messages"] == body["messages"]
+    assert json.loads(decode.read()) == body
+
+
+def test_baseline_serves_chat_and_models() -> None:
+    upstream = []
+
+    def handler(request):
+        upstream.append(request)
+        if request.url.path == "/v1/models":
+            if request.url.port == 8201:  # the first production D is down
+                return httpx.Response(503, json={"error": "down"})
+            return httpx.Response(200, json={"data": [{"id": "mistral"}]})
+        if request.url.port < 8200:
+            return httpx.Response(200, json={"choices": []})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    async def run():
+        async with make_client(handler) as client:
+            chat = await client.post(
+                "/v1/chat/completions",
+                json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+            )
+            assert chat.status_code == 200
+            assert chat.json() == {"choices": [{"message": {"content": "ok"}}]}
+            models = await client.get("/v1/models")
+            assert models.status_code == 200 and models.json()["data"][0]["id"] == "mistral"
+
+    asyncio.run(run())
+    assert [r.url.path for r in upstream[:2]] == ["/v1/chat/completions"] * 2
+    assert [r.url.port for r in upstream[2:]] == [8201, 8202]

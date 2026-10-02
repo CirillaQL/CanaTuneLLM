@@ -236,10 +236,11 @@ def test_locate_publishes_a_cluster_model_the_solver_can_use() -> None:
     assert high.n > low.n  # more load needs more groups
 
 
-def build(backend, table=None):
+def build(backend, table=None, solver=False):
     config = load_config()
     config["router"]["overload"] = "serve"
     config["controller"]["stagger_s"] = 0.0
+    config["controller"]["solver"] = solver  # the optional solver; off by default
     risk = RiskTable.from_config(config["risk"], identity(config))
     groups = build_groups(config)
     tiers = TierState(max_point=ClockPoint(2520, 1500), table=table)
@@ -561,7 +562,7 @@ def test_verify_uses_packed_peak_rate_and_failed_window_caps_the_point():
     table = asyncio.run(
         TierLocator(SurrogateBackend(seed=5), settings()).locate(PROMPT, [512, 2048])
     )
-    _, _, _, controller, scheduler = build(SurrogateBackend(seed=6), table)
+    _, _, _, controller, scheduler = build(SurrogateBackend(seed=6), table, solver=True)
     controller.plan = Evaluation(2, table.h, True, 100, "decode", {}, (2.0, 0.5))
     calls = []
     prompt_limits = []

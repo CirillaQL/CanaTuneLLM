@@ -74,9 +74,12 @@ def published(model: bool = False, calibrated: bool = True, **kwargs) -> TierTab
     return table
 
 
-def setup(table=None, telemetry=None, store=None, admission="cells", overload="reject"):
+def setup(
+    table=None, telemetry=None, store=None, admission="cells", overload="reject", solver=False
+):
     config = load_config()
     config["controller"]["stagger_s"] = 0.0
+    config["controller"]["solver"] = solver  # the optional solver; off by default
     config["router"]["admission"] = admission
     config["router"]["overload"] = overload
     clock = FakeClock()
@@ -252,7 +255,7 @@ def test_finish_records_only_clean_samples_and_lengths() -> None:
 
 
 def test_plan_drains_the_canary_first_then_parks_down_to_the_minimum() -> None:
-    clock, _, groups, _, router, controller, actuator = setup()
+    clock, _, groups, _, router, controller, actuator = setup(solver=True)
     asyncio.run(controller.start())
     groups[0].state = GroupState.ACTIVE  # Canary back in service
     asyncio.run(controller.publish(published(model=True), "test"))
@@ -274,7 +277,7 @@ def test_plan_drains_the_canary_first_then_parks_down_to_the_minimum() -> None:
 
 
 def test_no_scale_down_within_t_down_of_pressure() -> None:
-    clock, _, groups, _, router, controller, _ = setup(table=published(model=True))
+    clock, _, groups, _, router, controller, _ = setup(table=published(model=True), solver=True)
     activate(groups)
     controller.on_pressure = lambda reason: True
     router.rejections += 5
@@ -290,7 +293,9 @@ def test_no_scale_down_within_t_down_of_pressure() -> None:
 
 
 def test_plan_scales_up_at_once_and_down_only_after_the_dwell() -> None:
-    clock, _, groups, tiers, router, controller, _ = setup(table=published(model=True))
+    clock, _, groups, tiers, router, controller, _ = setup(
+        table=published(model=True), solver=True
+    )
     activate(groups[1:2])
     for g in groups[2:] + groups[:1]:
         g.state, g.tier, g.effective = GroupState.PARK, Tier.PARK, None
@@ -891,7 +896,7 @@ def test_stream_feedback_counts_requests_and_cancellation_cleans_it_up():
 
 def test_solver_capacity_prediction_cannot_expand_without_production_confirmation():
     _, _, groups, _, router, controller, _ = setup(
-        table=published(model=True), admission="slack", overload="best_effort"
+        table=published(model=True), admission="slack", overload="best_effort", solver=True
     )
     activate(groups[1:2])
     for _ in range(100):
@@ -1036,7 +1041,7 @@ def test_full_effort_still_enforces_kv_and_telemetry_guards(blocked):
 
 def test_repeated_prediction_warnings_do_not_starve_solver_or_restart_target_hold():
     clock, _, groups, _, router, controller, _ = setup(
-        table=published(model=True), admission="slack", overload="best_effort"
+        table=published(model=True), admission="slack", overload="best_effort", solver=True
     )
     activate(groups)
     target_since = None
@@ -1122,3 +1127,12 @@ def test_arrivals_during_slow_clock_changes_do_not_break_the_tick():
     assert not router.full_effort and controller.mode == "energy"
     rate, burst = router.offered(clock.now - 2.0, 1.0, 1.0)  # arrivals after `now`
     assert rate > 0 and burst >= 1.0
+
+
+def test_the_solver_is_off_by_default() -> None:
+    config = load_config()
+    assert ControllerSettings.from_config(config).solver is False
+    assert ControllerSettings().solver is False
+    _, _, groups, _, _, controller, _ = setup(table=published(model=True))
+    activate(groups)
+    assert controller.solver() is None  # every group stays at the Canary's H

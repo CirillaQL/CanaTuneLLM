@@ -127,6 +127,12 @@ confirm pressure before resources increase.
 
 ### Solver and Controller (`domain/models.py`, `controller/tier_controller.py`)
 
+By default (`controller.solver: false`) every active group runs at the Canary's H
+and the Controller only handles production pressure (expansion, MAX, recovery):
+on the measured L40S/L4 cluster parking and lower D clocks saved little, and a
+lower D clock raised TTFT in a way the model does not capture (jobs C and D). The
+solver below stays available with `controller.solver: true`.
+
 Every second, from the offered rate (Router arrivals over `load_window_s`) and the
 recent length mix, the solver evaluates every (groups, P clock, D clock) of the
 Canary's model. It fills each group up to feasible capacity before opening
@@ -183,7 +189,7 @@ in turn, no admission, no clock control) or `cantune`.
 
 | Component | Module | Status |
 |---|---|---|
-| Transport proxy: one-token prefill, then decode with the same KV-transfer request ID; SSE passthrough; TTFT/TPOT from the stream | `proxy/proxy.py` | done |
+| Transport proxy: one-token prefill, then decode with the same KV-transfer request ID; completions and chat completions, `/v1/models`; SSE passthrough; TTFT/TPOT from the stream | `proxy/proxy.py` | done |
 | Groups, clock points, tier table and its identity-guarded store | `domain/groups.py` | done |
 | Length statistics (probe lengths, shift detection) | `domain/load.py` | done |
 | Online risk table keyed by clock point | `domain/risk.py` | done |
@@ -286,12 +292,32 @@ curl http://127.0.0.1:8000/v1/completions \
   -d '{"model":"mistralai/Mistral-7B-v0.1","prompt":"Hello","max_tokens":16}'
 ```
 
+`POST /v1/chat/completions` works the same way (P and D receive the chat request;
+the chat template renders the prompt), and `GET /v1/models` is answered by a
+production D, so OpenAI clients and `vllm bench serve` (`openai` and `openai-chat`
+backends) can target the proxy directly:
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mistralai/Mistral-7B-v0.1","messages":[{"role":"user","content":"Hello"}],"max_tokens":16,"stream":true}'
+```
+
+A base model such as Mistral-7B-v0.1 has no chat template, and vLLM refuses chat
+requests without one: set `VLLM_CHAT_TEMPLATE` (a file or the template) for the
+launch scripts, which pass it to every P and D; the proxy renders prompts with the
+same template for their lengths.
+
 With `routing.policy: round_robin`, production requests rotate through
 `routing.production_pairs`. With `cantune`, the Router admits each request to a
-group, or answers `503` with `X-CanaTune-Rejected: 1`. Use token-id prompts for
-experiments: text prompt lengths are estimated, and those samples never enter the
-risk table. Only streaming requests yield TTFT, so only they update the table.
-Before the Canary has published tiers (cold start) every request is admitted.
+group; with the default `best_effort` overload policy a request waits only for
+physical capacity and `503` (`X-CanaTune-Rejected: 1`) means the service wait
+timed out. Prompt lengths are exact for token ids, for text through the model's
+tokenizer (`MODEL_PATH`) and for chat through the chat template; without a
+tokenizer they are estimated and those samples never enter the risk table. Only
+streaming requests yield TTFT, so only they update the table and the production
+feedback; a non-streaming request counts only while it waits at P. Before the
+Canary has published tiers (cold start) every request is admitted.
 
 An explicit `X-CanaTune-Route: canary` header selects `routing.canary_pair` and
 bypasses admission. The pair used is returned in the

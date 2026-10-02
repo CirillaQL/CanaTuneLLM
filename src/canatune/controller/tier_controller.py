@@ -62,7 +62,7 @@ class ControllerSettings:
     feedback_near_slo: float = 0.9
     confirm_s: float = 2.0
     expansion_grace_s: float = 3.0
-    solver: bool = True  # False: every group stays at the Canary's H (static comparison)
+    solver: bool = False  # True: the solver plans groups x clocks (optional, off by default)
 
     def __post_init__(self) -> None:
         durations = (self.feedback_window_s, self.confirm_s, self.expansion_grace_s)
@@ -89,7 +89,7 @@ class ControllerSettings:
             ),
             stagger_s=float(raw.get("stagger_s", 2.0)),
             energy_log_period_s=float(raw.get("energy_log_period_s", 5.0)),
-            solver=bool(raw.get("solver", True)),
+            solver=bool(raw.get("solver", False)),
             feedback_window_s=float(raw.get("feedback_window_s", 10)),
             feedback_min_samples=int(raw.get("feedback_min_samples", 5)),
             feedback_near_slo=float(raw.get("feedback_near_slo", 0.9)),

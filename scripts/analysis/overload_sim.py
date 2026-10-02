@@ -201,6 +201,9 @@ class Sim:
         )
         config["router"]["doomed"] = "dispatch" if self.policy == "serve_dispatch" else "backfill"
         config["controller"]["stagger_s"] = 0.0
+        # The solver runs whenever the table carries a cluster model; the static
+        # comparison passes a table without one (selfcal_sim.static).
+        config["controller"]["solver"] = True
         config["kv_transfer"]["kv_buffer_bytes"] = self.phys.kv_buffer_bytes
         config["kv_transfer"]["kv_bytes_per_token"] = self.phys.kv_bytes_per_token
         config["router"].update(self.router_overrides)

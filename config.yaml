@@ -82,6 +82,8 @@ proxy:
   host: 127.0.0.1
   port: 8000
   endpoint: /v1/completions
+  chat_endpoint: /v1/chat/completions   # null disables; P/D receive /v1/chat/completions
+  models_endpoint: /v1/models           # null disables; answered by a production D
   diagnostics_log: "${raw_root}/launcher/proxy_diagnostics.jsonl"
 
 routing:
@@ -104,6 +106,9 @@ router:
   d_busy_min_running: 1       # D counts as busy with >= this many running sequences
   chars_per_token: 4          # estimate for text prompts without a tokenizer (skip the tables)
   tokenizer: null             # model dir for exact prompt lengths; default MODEL_PATH
+  # Chat template for chat prompt lengths (file or template); default VLLM_CHAT_TEMPLATE,
+  # which the launch scripts also pass to vLLM, else the tokenizer's own template.
+  chat_template: null
   # slack: predict TTFT from the group's state (own prefill cost, pending P work, KV
   # in flight, requests decoding) and admit when the predicted-slack bucket's risk
   # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy).
@@ -133,7 +138,7 @@ controller:
   min_active_groups: 1
   stagger_s: 2.0              # groups move to a new tier one at a time
   energy_log_period_s: 5
-  solver: true                # false: every group at the Canary's H (static comparison)
+  solver: false               # default: every group at the Canary's H; true: the optional solver
   feedback_window_s: 10       # recent actual TTFT/TPOT, one sample per request
   feedback_min_samples: 5    # completed/streaming samples before latency confirmation
   feedback_near_slo: 0.9      # approaching SLO counts as production pressure

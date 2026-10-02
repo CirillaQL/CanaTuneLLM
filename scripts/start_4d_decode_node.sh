@@ -95,13 +95,17 @@ for index in "${!gpu_ids[@]}"; do
   kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_consumer","kv_port":%d}' "$kv_port")
   log_file="${ROLE_WORK_DIR}/logs/decode_${index}.log"
 
+  # Optional: a chat template for /v1/chat/completions (a base model has none);
+  # P and D must use the same one so both see the same prompt tokens.
+  chat_args=()
+  if [[ -n "${VLLM_CHAT_TEMPLATE:-}" ]]; then chat_args=(--chat-template "$VLLM_CHAT_TEMPLATE"); fi
   CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
     --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION:-0.82}" \
     --kv-transfer-config "$kv_config" \
     --no-enable-prefix-caching --no-enable-chunked-prefill \
-    >"$log_file" 2>&1 &
+    ${chat_args[@]+"${chat_args[@]}"} >"$log_file" 2>&1 &
   pids+=("$!")
 
   ready=0

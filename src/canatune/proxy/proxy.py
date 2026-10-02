@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -37,6 +38,14 @@ class Endpoint:
     @property
     def completions_url(self) -> str:
         return f"http://{self.http_host}:{self.http_port}/v1/completions"
+
+    @property
+    def chat_url(self) -> str:
+        return f"http://{self.http_host}:{self.http_port}/v1/chat/completions"
+
+    @property
+    def models_url(self) -> str:
+        return f"http://{self.http_host}:{self.http_port}/v1/models"
 
 
 def _mapping(value: Any, name: str) -> Mapping[str, Any]:
@@ -149,6 +158,21 @@ def pd_transport_id(value: str | None, prefill: Endpoint, decode: Endpoint) -> s
     )
 
 
+def is_token_chunk(choice: Mapping[str, Any]) -> bool:
+    """One choice chunk is one generated token, even if its text is "". Completions
+    carry `text`; chat carries a `delta`, whose first chunk only announces the role
+    and whose last may be empty (finish reason): neither is a token."""
+    if choice.get("text") is not None:
+        return True
+    delta = choice.get("delta")
+    if not isinstance(delta, Mapping):
+        return False
+    produced = [delta.get(k) for k in ("content", "reasoning_content", "tool_calls")]
+    if "role" in delta and not any(produced):
+        return False
+    return any(v is not None for v in produced)
+
+
 class StreamTimer:
     """Finds token events in a vLLM SSE stream split across arbitrary chunks and
     records when each arrives (first token -> TTFT, spacing -> TPOT)."""
@@ -179,8 +203,7 @@ class StreamTimer:
                     choices = json.loads(payload).get("choices") or []
                 except (ValueError, AttributeError):
                     continue
-                # One choice chunk is one generated token, even if its text is "".
-                if choices and choices[0].get("text") is not None:
+                if choices and is_token_chunk(choices[0]):
                     self.token_times.append(self._clock())
                     new += 1
 
@@ -208,6 +231,61 @@ def load_tokenizer(config: Mapping[str, Any]) -> Any:
         return AutoTokenizer.from_pretrained(path)
     except Exception:
         return None
+
+
+def load_chat_template(config: Mapping[str, Any]) -> str | None:
+    """The chat template vLLM serves with (VLLM_CHAT_TEMPLATE, as the launch scripts
+    pass it, or router.chat_template): a file or the template itself. None: the
+    tokenizer's own template."""
+    value = os.environ.get("VLLM_CHAT_TEMPLATE") or config.get("router", {}).get("chat_template")
+    if not value:
+        return None
+    if os.path.isfile(value):
+        with open(value, encoding="utf-8") as handle:
+            return handle.read()
+    return str(value)
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):  # content parts: only text parts count here
+        return "".join(str(part.get("text", "")) for part in content if isinstance(part, Mapping))
+    return ""
+
+
+def chat_prompt_tokens(
+    body: Mapping[str, Any], tokenizer: Any, template: str | None, chars_per_token: float
+) -> tuple[int, bool]:
+    """Prompt length of a chat request: the messages rendered with the chat template
+    (as vLLM renders them; the template adds the special tokens) and tokenized.
+    Without a tokenizer or template the text is estimated (not exact)."""
+    messages = body.get("messages")
+    if (
+        not isinstance(messages, list)
+        or not messages
+        or not all(isinstance(m, Mapping) for m in messages)
+    ):
+        raise ValueError("messages must be a nonempty list of message objects")
+    template = body.get("chat_template") or template
+    if tokenizer is not None and (template or getattr(tokenizer, "chat_template", None)):
+        try:
+            ids = tokenizer.apply_chat_template(
+                messages,
+                chat_template=template,
+                tools=body.get("tools"),
+                add_generation_prompt=body.get("add_generation_prompt", True),
+                continue_final_message=body.get("continue_final_message", False),
+                tokenize=True,
+                **(body.get("chat_template_kwargs") or {}),
+            )
+            if isinstance(ids, Mapping) or hasattr(ids, "input_ids"):
+                ids = ids["input_ids"]
+            return max(1, len(ids)), True
+        except Exception:
+            pass  # vLLM reports the error itself; estimate for the Router meanwhile
+    text = "".join(_content_text(m.get("content")) for m in messages)
+    return max(1, math.ceil(len(text) / chars_per_token)), False
 
 
 def stage_ms(arrived: float, stamps: Mapping[str, float]) -> dict[str, float | None]:
@@ -246,6 +324,11 @@ def create_proxy_router(
     path = proxy.get("endpoint")
     if not isinstance(path, str) or not path.startswith("/"):
         raise ProxyConfigError("proxy.endpoint must be an absolute URL path")
+    chat_path = proxy.get("chat_endpoint", "/v1/chat/completions")
+    models_path = proxy.get("models_endpoint", "/v1/models")
+    for name, value in (("chat_endpoint", chat_path), ("models_endpoint", models_path)):
+        if value is not None and (not isinstance(value, str) or not value.startswith("/")):
+            raise ProxyConfigError(f"proxy.{name} must be an absolute URL path or null")
     experiment = _mapping(config.get("experiment"), "experiment")
     workload = _mapping(experiment.get("workload"), "workload")
     timeout_s = workload.get("request_timeout_s", 900)
@@ -264,9 +347,14 @@ def create_proxy_router(
     chars_per_token = float(config.get("router", {}).get("chars_per_token", 4.0))
     tokenizer = load_tokenizer(config)
 
-    def count_tokens(body: Mapping[str, Any]) -> tuple[int, bool]:
+    chat_template = load_chat_template(config)
+
+    def count_tokens(body: Mapping[str, Any], kind: str) -> tuple[int, bool]:
         """Exact prompt length: token ids as given, text through the model's tokenizer
-        (special tokens included, as vLLM counts them); estimated without one."""
+        (special tokens included, as vLLM counts them), chat messages through the chat
+        template; estimated without a tokenizer."""
+        if kind == "chat":
+            return chat_prompt_tokens(body, tokenizer, chat_template, chars_per_token)
         prompt = body.get("prompt")
         if tokenizer is not None and isinstance(prompt, str):
             return max(1, len(tokenizer(prompt).input_ids)), True
@@ -282,8 +370,9 @@ def create_proxy_router(
             "production_pairs": selector.production_pairs,
         }
 
-    @router.post(path)
-    async def completions(request: Request) -> Response:
+    async def handle(request: Request, kind: str) -> Response:
+        """One request of `kind` (completions or chat): P with max_tokens 1, then the
+        same body to D, whose response is returned (streamed or not)."""
         arrived = time.monotonic()
         # Stage boundaries (monotonic) for the per-request TTFT breakdown (E0).
         stamps: dict[str, float] = {}
@@ -302,7 +391,7 @@ def create_proxy_router(
         if not isinstance(body.get("stream", False), bool):
             return JSONResponse({"error": "stream must be a boolean"}, status_code=400)
         try:
-            tokens, exact = count_tokens(body)
+            tokens, exact = count_tokens(body, kind)
         except ValueError as error:
             if runtime is not None:
                 return JSONResponse({"error": str(error)}, status_code=400)
@@ -399,7 +488,9 @@ def create_proxy_router(
                 async with factory() as client:
                     stamps["prefill_sent"] = time.monotonic()
                     prefill_response = await client.post(
-                        prefill.completions_url, json=prefill_body, headers=headers
+                        prefill.chat_url if kind == "chat" else prefill.completions_url,
+                        json=prefill_body,
+                        headers=headers,
                     )
                     stamps["prefill_done"] = time.monotonic()
                 if prefill_response.status_code == 200 and ticket is not None:
@@ -421,7 +512,10 @@ def create_proxy_router(
             clients.append(client)
             try:
                 decode_request = client.build_request(
-                    "POST", decode.completions_url, json=body, headers=headers
+                    "POST",
+                    decode.chat_url if kind == "chat" else decode.completions_url,
+                    json=body,
+                    headers=headers,
                 )
                 stamps["decode_sent"] = time.monotonic()
                 decode_response = await client.send(decode_request, stream=True)
@@ -496,5 +590,33 @@ def create_proxy_router(
                     if not c.is_closed:
                         await c.aclose()
                 finish("client_disconnected", None)  # no-op once finished
+
+    @router.post(path)
+    async def completions(request: Request) -> Response:
+        return await handle(request, "completions")
+
+    if chat_path is not None:
+
+        @router.post(chat_path)
+        async def chat_completions(request: Request) -> Response:
+            return await handle(request, "chat")
+
+    if models_path is not None:
+
+        @router.get(models_path)
+        async def models() -> Response:
+            """Every pair serves the same model: the first production D that answers."""
+            for _, decode_name in selector.production_pairs:
+                try:
+                    async with factory() as client:
+                        response = await client.get(selector.endpoints[decode_name].models_url)
+                except httpx.HTTPError:
+                    continue
+                if response.status_code == 200:
+                    return Response(
+                        content=response.content,
+                        media_type=response.headers.get("content-type", "application/json"),
+                    )
+            return JSONResponse({"error": "no decode endpoint answered"}, status_code=502)
 
     return router

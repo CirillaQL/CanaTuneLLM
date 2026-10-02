@@ -273,7 +273,7 @@ def main() -> int:
     policy = config["routing"]["policy"]
     if (mode != "baseline") != (policy == "cantune"):
         raise SystemExit(f"SMOKE_MODE={mode} does not match routing.policy={policy}")
-    if (mode == "static") == bool(config["controller"].get("solver", True)):
+    if (mode == "static") == bool(config["controller"].get("solver", False)):
         raise SystemExit(f"SMOKE_MODE={mode} needs controller.solver {mode != 'static'}")
     proxy = config["proxy"]
     host = "127.0.0.1" if proxy["host"] == "0.0.0.0" else proxy["host"]
