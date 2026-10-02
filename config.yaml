@@ -167,11 +167,12 @@ clock_control:
 # Canary (design v2 section 6): experiment scheduling, tier locator, probes.
 canary:
   tier_table_path: null       # or set CANATUNE_TIER_TABLE; keyed by config identity
-  default_lengths:            # (prompt, output) pairs until 50 real requests finished
-    - [128, 64]
-    - [512, 64]
-    - [1024, 64]
-    - [2048, 64]
+  # Cold start: until length_min_samples real requests finished, probes use these
+  # prompt lengths, each generating the service's output cap: the largest max_tokens a
+  # request may ask for (a deployment policy). The heaviest decode load, so the first H
+  # is conservative; real (prompt, output) lengths replace these afterwards.
+  max_output_tokens: 64
+  default_prompts: [128, 512, 1024, 2048]
   length_min_samples: 50
   # scheduler
   period_s: 1.0

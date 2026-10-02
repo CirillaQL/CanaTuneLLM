@@ -46,6 +46,7 @@ import httpx
 from canatune import loadgen
 from canatune.config import load_config
 from canatune.proxy.proxy import parse_endpoints, pd_transport_id
+from canatune.service import cold_start_lengths
 
 READY_TIMEOUT_S = 1800
 H_TIMEOUT_S = 90
@@ -308,7 +309,7 @@ def main() -> int:
                     return status
                 summary["published_s"] = round(time.monotonic() - started, 1)
                 summary["reached_h"] = wait_h(client, base, table)
-                pairs = [tuple(p) for p in config["canary"]["default_lengths"]]
+                pairs = cold_start_lengths(config)
                 meta, arrivals = loadgen.build_trace(
                     loadgen.parse_profile(os.environ.get("SMOKE_PROFILE", loadgen.DEFAULT_PROFILE)),
                     pairs,

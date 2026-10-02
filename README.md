@@ -46,9 +46,9 @@ offline runs.
 
 | Source | What |
 |---|---|
-| configuration | the model's `config.json` (KV bytes per token), `kv_transfer` (connector, `kv_buffer_bytes`), topology, the policy: SLOs, theta, `max_wait_ms`, `hold_max_ms`, `t_down_s` |
+| configuration | the model's `config.json` (KV bytes per token), `kv_transfer` (connector, `kv_buffer_bytes`), topology, the policy: SLOs, theta, `max_wait_ms`, `hold_max_ms`, `t_down_s`, the output cap `canary.max_output_tokens` (cold-start probes generate it: the heaviest decode load, so the first H is conservative) |
 | Canary experiments | everything else: tiers, S(L) per clock, D iteration model, power per clock vs load, capacity, the admission predictor, the slack-risk seed, the KV-in-flight gate |
-| production, online | predictor refits, slack-risk counts, offered rate and length mix for the solver |
+| production, online | predictor refits, slack-risk counts, offered rate; the (prompt, output) lengths of finished requests, which the Canary's probes replay (random tokens, `ignore_eos`) once `length_min_samples` requests finished |
 
 ### Lifecycle
 

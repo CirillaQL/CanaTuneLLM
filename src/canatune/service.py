@@ -134,6 +134,31 @@ def configured_max(config: Mapping[str, Any]) -> ClockPoint:
     )
 
 
+def cold_start_lengths(config: Mapping[str, Any]) -> list[tuple[int, int]]:
+    """(prompt, output) pairs the Canary probes with until real requests finished.
+
+    The output is the service's cap on generated tokens (`canary.max_output_tokens`,
+    the largest max_tokens a request may ask for: a deployment policy). Probing
+    with the cap is the heaviest decode load, so a cold-start H is conservative;
+    real (prompt, output) lengths replace these after `length_min_samples` requests.
+    Without the cap, the legacy `canary.default_lengths` pairs are used."""
+    raw = config.get("canary", {})
+    cap = raw.get("max_output_tokens")
+    legacy = [tuple(pair) for pair in raw.get("default_lengths") or [[512, 64]]]
+    if cap is None:
+        pairs = [(int(p), int(o)) for p, o in legacy]
+    else:
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ValueError("canary.max_output_tokens must be a positive integer")
+        prompts = raw.get("default_prompts") or [p for p, _ in legacy]
+        pairs = [(int(p), cap) for p in prompts]
+    limit = config.get("model", {}).get("max_model_len")
+    too_long = [pair for pair in pairs if limit is not None and sum(pair) > int(limit)]
+    if too_long:
+        raise ValueError(f"cold-start lengths exceed model.max_model_len {limit}: {too_long}")
+    return pairs
+
+
 def _env_override(raw: Mapping[str, Any], env: str, key: str) -> Any:
     return os.environ.get(env) or raw.get(key)
 
@@ -169,7 +194,7 @@ def build_runtime(
     except TierTableError as error:
         events.write({"event": "tier_table_ignored", "error": str(error)})
     lengths = LengthStats(
-        [tuple(pair) for pair in canary_raw.get("default_lengths", [[512, 64]])],
+        cold_start_lengths(config),
         min_samples=int(canary_raw.get("length_min_samples", 50)),
     )
 
