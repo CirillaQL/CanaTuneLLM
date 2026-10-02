@@ -321,6 +321,7 @@ def create_proxy_router(
                     status_code=503,
                     headers={"X-CanaTune-Rejected": "1"},
                 )
+            ticket.streaming = body.get("stream") is True
             stamps["admitted"] = time.monotonic()
             prefill = selector.endpoints[ticket.group.prefill]
             decode = selector.endpoints[ticket.group.decode]

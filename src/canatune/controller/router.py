@@ -177,6 +177,9 @@ class Ticket:
     first_token_at: float | None = None
     last_token_at: float | None = None
     finished: bool = False
+    # False for a non-streaming response: its first token is never observed, so once
+    # P returned it cannot show a TTFT backlog (its end-to-end time is not a TTFT).
+    streaming: bool = True
     stage: str = "prefill"  # prefill -> transfer (P returned) -> decode (first token)
     s_own_ms: float = 0.0
     features: tuple[float, ...] = ()
@@ -556,7 +559,8 @@ class CanaTuneRouter:
         buckets = max(1, int(window_s // bucket_s))
         counts = [0] * buckets
         for t in times:
-            counts[min(buckets - 1, int((now - t) // bucket_s))] += 1
+            # An arrival after `now` (a caller holding an older timestamp) is the newest.
+            counts[min(buckets - 1, max(0, int((now - t) // bucket_s)))] += 1
         rates = sorted(c / bucket_s for c in counts)
         p90 = rates[min(len(rates) - 1, int(0.9 * len(rates)))]
         return rate, max(1.0, p90 / rate)
@@ -738,6 +742,8 @@ class CanaTuneRouter:
         live_ratio = 0.0
         for ticket in self._live.values():
             if ticket.first_token_at is None:
+                if not ticket.streaming and ticket.stage != "prefill":
+                    continue  # past P without a stream: no TTFT evidence either way
                 if self._actionable_ttft(ticket.prompt_tokens):
                     age = (now - ticket.admitted_at) * 1000 + ticket.wait_ms
                     live_ratio = max(live_ratio, age / self.settings.ttft_slo_ms)

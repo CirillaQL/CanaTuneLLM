@@ -1069,3 +1069,56 @@ def test_feedback_observation_modes_do_not_block_draining_cleanup(mode):
     asyncio.run(controller.tick())
     assert controller.mode == mode
     assert groups[2].state is GroupState.PARK and groups[2].tier is Tier.PARK
+
+
+def test_a_non_streaming_request_past_prefill_is_no_ttft_backlog():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    controller.settings = dataclasses.replace(controller.settings, solver=False)
+    activate(groups)
+    plain = router.try_admit(128, True)
+    plain.streaming = False  # as the proxy marks a non-streaming response
+    router.prefill_done(plain)
+    for _ in range(6):  # a long generation: its end-to-end time is no TTFT
+        clock.now += 1
+        asyncio.run(controller.tick())
+    assert controller.mode == "energy" and not router.full_effort
+    assert controller.feedback["live_ratio"] == 0
+    router.finish(plain, status="ok", ttft_ms=None, tpot_ms=None, output_tokens=0)
+    # A streaming request still shows a missing first token, and so does a
+    # non-streaming one stuck at P.
+    for streaming in (True, False):
+        ticket = router.try_admit(128, True)
+        ticket.streaming = streaming
+        if streaming:
+            router.prefill_done(ticket)
+        clock.now += 1
+        asyncio.run(controller.tick())
+        assert controller.feedback["live_ratio"] >= 1
+        router.finish(ticket, status="ok", ttft_ms=None, tpot_ms=None, output_tokens=0)
+
+
+def test_arrivals_during_slow_clock_changes_do_not_break_the_tick():
+    clock, _, groups, _, router, controller, actuator = setup(
+        table=published(model=True), admission="slack", overload="best_effort"
+    )
+    controller.settings = dataclasses.replace(controller.settings, confirm_s=0)
+    activate(groups)
+    real = actuator.lock
+
+    async def slow(ref, mhz):  # each lock takes 0.6 s while requests keep arriving
+        clock.now += 0.6
+        router.new_waiter()
+        return await real(ref, mhz)
+
+    actuator.lock = slow
+    record_production(router)
+    asyncio.run(controller.tick())
+    asyncio.run(controller.tick())
+    assert router.full_effort
+    clock.now += controller.settings.t_down_s + controller.settings.feedback_window_s + 1
+    asyncio.run(controller.tick())  # recovery locks every group back to H, then plans
+    assert not router.full_effort and controller.mode == "energy"
+    rate, burst = router.offered(clock.now - 2.0, 1.0, 1.0)  # arrivals after `now`
+    assert rate > 0 and burst >= 1.0

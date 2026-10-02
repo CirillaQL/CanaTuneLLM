@@ -385,3 +385,39 @@ def test_cancelled_request_releases_its_reservation(stage) -> None:
         await asyncio.gather(*runtime.tasks, return_exceptions=True)
 
     asyncio.run(run())
+
+
+def test_proxy_marks_non_streaming_requests_for_production_feedback() -> None:
+    seen = []
+    runtime_ref = {}
+
+    class SSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"text":"t"}]}\n\ndata: [DONE]\n\n'
+
+    def handler(request):
+        if request.url.port >= 8200:  # decode call: the request is admitted and live
+            live = list(runtime_ref["rt"].router._live.values())
+            seen.extend(t.streaming for t in live)
+            if live and live[0].streaming:
+                return httpx.Response(
+                    200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
+                )
+        return httpx.Response(200, json={"choices": [{"text": "t"}]})
+
+    async def run():
+        client, runtime = make_cantune(handler, admission="slack", overload="best_effort")
+        runtime_ref["rt"] = runtime
+        await runtime.start()
+        runtime.stop.set()
+        async with client:
+            for stream in (False, True):
+                response = await client.post(
+                    "/v1/completions",
+                    json={"model": "m", "prompt": [5] * 64, "max_tokens": 1, "stream": stream},
+                )
+                assert response.status_code == 200
+        await asyncio.gather(*runtime.tasks, return_exceptions=True)
+
+    asyncio.run(run())
+    assert seen == [False, True]

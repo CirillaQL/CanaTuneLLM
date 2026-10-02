@@ -314,6 +314,7 @@ class TierController:
         now = self._clock()
         if self.router.settings.overload == "best_effort":
             await self._feedback_control(now)
+            now = self._clock()  # clock changes above can take seconds; arrivals went on
             await self._log_energy(now)
             await self._retry_locks(now)
             if self.tiers.table is not None:
