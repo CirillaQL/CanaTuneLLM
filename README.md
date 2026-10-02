@@ -387,6 +387,20 @@ every GPU's NVML energy counter through the node agents. The results are
 `load/requests.jsonl`, `energy.jsonl`, `timeline.jsonl` and `load_summary.json`,
 which gives per-phase outcomes, J per request and which Controller paths fired.
 
+**Benchmark with `vllm bench serve`.** `scripts/bench_production.py` starts the
+service like the smoke test (`BENCH_MODE=cantune` from a cold start, `static` from
+a stored tier table, `baseline` with `round_robin`), then runs `vllm bench serve`
+against the proxy once per request rate in `BENCH_RATES`, on a ShareGPT file
+(`BENCH_DATASET`) with a fixed seed so every mode gets the same prompts.
+`BENCH_OUTPUT_LEN` with `BENCH_IGNORE_EOS=1` (default) fixes the work per request;
+set `canary.max_output_tokens` to the same length. Every GPU's NVML energy is
+read through the node agents, and a stage's energy window is the benchmark's own
+span (its `duration`), not the dataset loading before it. Per stage the results
+are vllm's `bench.json` (`--save-detailed`, `--goodput` at the configured SLOs)
+under `stages/`, and `bench_summary.json`: goodput, TTFT/TPOT percentiles (TPOT
+as vllm defines it), energy per GPU, J per good request and per output token, and
+(cantune/static) the Controller modes during the stage.
+
 **Model measurements (E1 + E2).** `scripts/measure_model.py` starts the service
 with the `round_robin` policy and clock control, then runs `canatune.measure` on
 the Canary pair outside the control loop: a prompt-length table per P clock, idle

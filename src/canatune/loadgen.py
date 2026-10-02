@@ -157,6 +157,7 @@ def _compact_state(state: Mapping[str, Any]) -> dict[str, Any]:
             for g in router.get("groups", [])
         ],
         "loads": (state.get("controller") or {}).get("loads"),
+        "mode": (state.get("controller") or {}).get("mode"),
         "admitted": router.get("admitted"),
         "rejections": router.get("rejections"),
         "canary_running": canary.get("running"),
