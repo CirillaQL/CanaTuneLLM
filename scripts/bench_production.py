@@ -28,6 +28,8 @@ Environment: everything `canatune.controller.process_controller` needs, plus
   BENCH_TOKENIZER    tokenizer for vllm bench (default MODEL_PATH)
   BENCH_CMD          the benchmark command (default "vllm bench serve")
   BENCH_EXTRA_ARGS   more arguments for it
+  BENCH_STAGE_TIMEOUT_S  a stage taking longer is stopped and ends the run
+                     (default: 3 x BENCH_STAGE_S + 600)
   BENCH_DEADLINE_S   cantune: seconds to wait for the publish (default 3000)
 
 Exit status: 0 done, 2 no table before the deadline, 3 the service stopped early,
@@ -84,6 +86,7 @@ class BenchSettings:
     tokenizer: str | None = None
     command: tuple[str, ...] = ("vllm", "bench", "serve")
     extra_args: tuple[str, ...] = ()
+    stage_timeout_s: float | None = None
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "BenchSettings":
@@ -107,6 +110,9 @@ class BenchSettings:
             tokenizer=env.get("BENCH_TOKENIZER") or env.get("MODEL_PATH") or None,
             command=tuple(shlex.split(env.get("BENCH_CMD", "vllm bench serve"))),
             extra_args=tuple(shlex.split(env.get("BENCH_EXTRA_ARGS", ""))),
+            stage_timeout_s=(
+                float(env["BENCH_STAGE_TIMEOUT_S"]) if env.get("BENCH_STAGE_TIMEOUT_S") else None
+            ),
         )
 
     def stages(self) -> list[Stage]:
@@ -310,11 +316,18 @@ async def run_stages(
             (stage_dir / "command.txt").write_text(shlex.join(cmd) + "\n")
             log(f"{stage.name}: {stage.num_prompts} prompts at {stage.rate_rps:g} req/s")
             launched = sampler.now_s()
+            timeout = settings.stage_timeout_s or 3 * settings.stage_s + 600
             with open(stage_dir / "bench.log", "wb") as handle:
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=handle, stderr=subprocess.STDOUT
+                    *cmd, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT
                 )
-                code = await proc.wait()
+                try:
+                    code = await asyncio.wait_for(proc.wait(), timeout)
+                except asyncio.TimeoutError:  # a hung stage must not cost the next run
+                    proc.kill()
+                    await proc.wait()
+                    code = -9
+                    log(f"{stage.name}: stopped after {timeout:.0f} s")
             ended = sampler.now_s()
             path = stage_dir / "bench.json"
             result = json.loads(path.read_text()) if code == 0 and path.exists() else None

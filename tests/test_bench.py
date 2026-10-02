@@ -140,3 +140,16 @@ def test_a_failed_benchmark_stops_the_run(tmp_path) -> None:
         )
     )  # fmt: skip
     assert len(stages) == 1 and stages[0][3] == 3 and stages[0][2] is None
+
+
+def test_a_hung_benchmark_is_stopped_and_ends_the_run(tmp_path) -> None:
+    fake = tmp_path / "hang.py"
+    fake.write_text("import time; time.sleep(60)\n")
+    s = settings(BENCH_CMD=f"{sys.executable} {fake}", BENCH_GAP_S="0", BENCH_STAGE_TIMEOUT_S="0.5")
+    stages, _ = asyncio.run(
+        bench.run_stages(
+            s, base_url="u", model="m", out=tmp_path, agents=[], state_poll=False,
+            ttft_slo_ms=1000, tpot_slo_ms=200,
+        )
+    )  # fmt: skip
+    assert len(stages) == 1 and stages[0][3] == -9 and stages[0][2] is None
