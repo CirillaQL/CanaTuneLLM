@@ -99,7 +99,7 @@ routing:
 
 # Per-request admission (design v2 section 5.2).
 router:
-  theta: 0.10                 # admit only when the cell's violation risk <= theta
+  theta: 0.05                 # admit only when the cell's violation risk <= theta
   max_wait_ms: 300            # bounded wait inside the TTFT budget (covers waking a parked group)
   retry_period_ms: 20
   snapshot_max_age_s: 1.0     # older /metrics snapshots count as unknown (unsafe)

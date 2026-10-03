@@ -378,9 +378,12 @@ class CanaTuneRouter:
         """Length-model check of D for one more request: the TPOT bound with every
         sequence decoding there or on its way (requests still at P or in transfer
         decode by the time this one does) and the context tokens they hold, this
-        request at its prompt plus half the mean output; and its KV at the end of
-        its output against the KV wall. Without a fresh D snapshot it does not warn
-        (the snapshot check already blocks a stale D)."""
+        request at its prompt plus half the mean output; and the KV D will hold
+        against the KV wall: what it holds now grows by half a mean output per
+        sequence on D (on average half of each output is still to come) and by a
+        whole one per request on its way, plus this request at the end of its output.
+        Without a fresh D snapshot it does not warn (the snapshot check already
+        blocks a stale D)."""
         coef = decode_coef(table.decode_length, group.effective.decode_mhz)
         snapshot = (self.telemetry.fresh(group.decode, self.settings.snapshot_max_age_s)
                     if self.telemetry is not None else None)
@@ -396,7 +399,8 @@ class CanaTuneRouter:
             return "decode_tpot"
         wall = table.decode_kv_limit
         if table.decode_kv_tokens and wall is not None:
-            if held + tokens + output > wall * table.decode_kv_tokens:
+            growth = on_d * output / 2 + group.n_await * output
+            if held + growth + tokens + output > wall * table.decode_kv_tokens:
                 return "decode_kv"
         return None
 

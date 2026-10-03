@@ -75,9 +75,12 @@ def published(model: bool = False, calibrated: bool = True, **kwargs) -> TierTab
 
 
 def setup(
-    table=None, telemetry=None, store=None, admission="cells", overload="reject", solver=False
+    table=None, telemetry=None, store=None, admission="cells", overload="reject", solver=False,
+    theta=None,
 ):
     config = load_config()
+    if theta is not None:
+        config["router"]["theta"] = theta
     config["controller"]["stagger_s"] = 0.0
     config["controller"]["solver"] = solver  # the optional solver; off by default
     config["router"]["admission"] = admission
@@ -568,7 +571,11 @@ def test_serve_rescues_to_the_lowest_predicted_group_and_counts_pressure() -> No
 
 
 def test_serve_doomed_backfills_spare_capacity_or_dispatches_by_setting() -> None:
-    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack", overload="serve")
+    # CALIBRATION's 50 clean samples per slack bucket bound the risk below theta / 2
+    # (the backfill margin) only for theta = 0.1
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="serve", theta=0.1
+    )
     activate(groups)
     for g in groups:
         g.pending_ms = 4000.0  # SLO lost everywhere
@@ -595,7 +602,11 @@ def test_serve_doomed_backfills_spare_capacity_or_dispatches_by_setting() -> Non
 
 
 def test_serve_holds_first_come_first_served_while_every_group_is_at_a_hard_limit() -> None:
-    _, _, groups, _, router, _, _ = setup(table=published(), admission="slack", overload="serve")
+    # CALIBRATION's 50 clean samples per slack bucket bound the risk below theta / 2
+    # (the backfill margin) only for theta = 0.1
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="serve", theta=0.1
+    )
     activate(groups)
     for g in groups:
         g.inflight_bytes = 0.6e9  # KV gate: a hard limit, never overflowed
@@ -616,7 +627,11 @@ def test_serve_holds_first_come_first_served_while_every_group_is_at_a_hard_limi
 def test_doomed_waits_for_a_rescue_until_its_slo_deadline_then_best_effort() -> None:
     table = published()
     table.evidence["idle_ttft_ms"] = {"128": 150.0, "2048": 250.0}  # the Canary's idle TTFT
-    clock, _, groups, _, router, _, _ = setup(table=table, admission="slack", overload="serve")
+    # CALIBRATION's 50 clean samples per slack bucket bound the risk below theta / 2
+    # (the backfill margin) only for theta = 0.1
+    clock, _, groups, _, router, _, _ = setup(
+        table=table, admission="slack", overload="serve", theta=0.1
+    )
     activate(groups)
     assert router.deadline_ms(128) == pytest.approx(850)  # SLO - idle TTFT
     assert router.deadline_ms(1088) == pytest.approx(800)  # interpolated
@@ -1182,3 +1197,13 @@ def test_length_model_counts_requests_still_at_prefill():
     group.n_inflight = group.n_await = group.n_at_p = 24
     ticket = router.step(router.new_waiter(), 128, True, 0)
     assert ticket.overflow == "best_effort"  # 25 sequences on their way: 150 + 50 + ...
+
+
+def test_length_model_kv_wall_counts_the_growth_of_sequences_on_d():
+    # 100 sequences holding 24000 tokens: half of each mean output (64 / 2) is still to
+    # come, 3200 tokens, so 24000 + 3200 + 128 + 64 passes 0.9 x 30000 (without the
+    # growth it would not); the TPOT bound itself stays far below the SLO
+    router, group = length_router(100, 0.8)
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    assert ticket.overflow == "best_effort" and router.risk_signals == 1
+    assert ticket.snapshot["tpot_bound_ms"] < 200

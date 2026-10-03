@@ -697,6 +697,7 @@ def summarize(sim: Sim, phases: list[dict]) -> dict:
                 sum(row.get("w", 0.0) for row in sim.timeline if start <= row["t"] < end) / 1000
             )
     out["send_retries"] = sum(p.send_retries for p in sim.pairs)
+    out["preemptions"] = sum(p.preemptions for p in sim.pairs)
     if sim.router is not None:
         out["router"] = {k: v for k, v in sim.router.state().items() if k != "groups"}
     return out
@@ -906,6 +907,29 @@ def replay_trace(run_dir: Path) -> tuple[dict, list]:
     return {"phases": phases, "duration_s": phases[-1]["end_s"]}, arrivals
 
 
+def synthetic_trace(run_dir: Path, rates, stage_s: float, gap_s: float, seed: int):
+    """Poisson stages at other rates with the run's own (prompt, output) pairs."""
+    pairs = []
+    for st in json.loads((run_dir / "bench_plan.json").read_text())["stages"]:
+        path = run_dir / "stages" / st["name"] / "bench.json"
+        if path.exists():
+            b = json.loads(path.read_text())
+            pairs += [(int(i), int(o)) for i, o in zip(b["input_lens"], b["output_lens"]) if o >= 1]
+    rng = random.Random(seed)
+    rows, phases, t = [], [], 0.0
+    for k, rate in enumerate(rates):
+        name, at, start = f"s{k}_{rate:g}rps", t, t
+        while True:
+            at += rng.expovariate(rate)
+            if at >= start + stage_s:
+                break
+            rows.append((at, name, *pairs[rng.randrange(len(pairs))]))
+        phases.append({"name": name, "start_s": start, "end_s": start + stage_s})
+        t = start + stage_s + gap_s + 30.0  # the stage drains before the gap
+    arrivals = [loadgen.Arrival(i, *row) for i, row in enumerate(rows)]
+    return {"phases": phases, "duration_s": phases[-1]["end_s"]}, arrivals
+
+
 def measured_stages(run_dir: Path) -> dict:
     path = run_dir / "bench_summary.json"
     return json.loads(path.read_text())["stages"] if path.exists() else {}
@@ -916,7 +940,11 @@ def run_replay(args) -> int:
     the job), then CanaTune best effort and the baseline on the same arrivals."""
     phys = PHYSICS[args.physics]
     job = args.replay
-    meta, arrivals = replay_trace(job / "cantune")
+    if args.rates:
+        rates = [float(x) for x in args.rates.split(",")]
+        meta, arrivals = synthetic_trace(job / "cantune", rates, 180.0, 30.0, args.seed)
+    else:
+        meta, arrivals = replay_trace(job / "cantune")
     cold = [(p, args.output_cap) for p in (128, 512, 1024, 2048)]
     table, backend = run_canary(phys, cold)
     d = table.evidence.get("decode") or {}
@@ -1022,6 +1050,7 @@ def main() -> int:
     ap.add_argument("--solver", action="store_true", help="replay: controller.solver on")
     ap.add_argument("--output-cap", type=int, default=256, help="replay: canary.max_output_tokens")
     ap.add_argument("--config", action="append", default=[], help="dotted.key=value (JSON value)")
+    ap.add_argument("--rates", default=None, help="replay: Poisson stages at these req/s instead")
     args = ap.parse_args()
     for item in args.config:
         key, value = item.split("=", 1)
