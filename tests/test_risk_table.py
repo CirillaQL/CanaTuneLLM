@@ -105,3 +105,22 @@ def test_violation_rule() -> None:
     assert is_violation(500, 10, **kw) is True
     assert is_violation(10, 201, **kw) is True
     assert is_violation(None, 10, **kw) is None
+
+
+def test_a_new_slo_starts_new_risk_and_tier_tables(tmp_path) -> None:
+    from canatune.domain.groups import TierStore, TierTable, TierTableError
+
+    config = load_config()
+    old = identity(config)
+    config["experiment"]["slo"]["tpot_ms"] = 65
+    new = identity(config)
+    assert old != new and new["slo"] == {"ttft_ms": 1000.0, "tpot_ms": 65.0}
+    store = TierStore(tmp_path / "tiers.json", old)
+    store.save(TierTable(park=ClockPoint(900, 450), h=ClockPoint(1815, 1050),
+                         capacity_h=3000.0, alpha_tokens=460.0))  # fmt: skip
+    with pytest.raises(TierTableError):
+        TierStore(tmp_path / "tiers.json", new).load()
+    raw = dict(config["risk"], path=str(tmp_path / "risk.json"))
+    RiskTable.from_config(raw, old).save()
+    with pytest.raises(RiskTableError):
+        RiskTable.from_config(raw, new)

@@ -96,7 +96,10 @@ class Runtime:
 
 
 def identity(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Configuration identity of the risk and tier tables: a change starts new ones."""
+    """Configuration identity of the risk and tier tables: a change starts new ones.
+    The SLO is part of it: H, the capacities, B* / the D capacity and the recorded
+    violations are all measured against it."""
+    slo = config["experiment"]["slo"]
     return {
         "model": config["model"]["name"],
         "vllm_version": config["runtime"].get("vllm_version"),
@@ -105,6 +108,7 @@ def identity(config: Mapping[str, Any]) -> dict[str, Any]:
         "prefill_gpu": config["topology"]["prefill_nodegroup"]["gpu_type"],
         "decode_gpu": config["topology"]["decode_nodegroup"]["gpu_type"],
         "max_model_len": config["model"]["max_model_len"],
+        "slo": {"ttft_ms": float(slo["ttft_ms"]), "tpot_ms": float(slo["tpot_ms"])},
     }
 
 
