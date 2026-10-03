@@ -28,7 +28,28 @@ Physics per pair (REFERENCE values, sources in brackets):
       up to ~325 W, L4-like D up to 72 W); parked groups idle at the lowest clock
 Clock changes are instantaneous.
 
+L4_E is the hardware of jobs E-G (3 x L40S P, 3 x L4 D, Mistral-7B, vLLM 0.15.1),
+from what was measured there (simulator ground truth only; the simulated CanaTune
+still measures everything through its own Canary):
+  P   S(L) = plateau(f) + slope(f) x max(0, L - knee(f)) per P clock, P power
+      idle(f) + utilization x dynamic(f) [job E Canary: prefill_fit, power model]
+  KV  the residence (transfer + D's first step + overhead) is ~82-86 ms at every
+      prompt length [job E Canary]: a fast link and a fixed D-first overhead
+  D   iterations of alpha(f) + beta X + gamma(f) K (X running sequences, K the
+      context tokens they hold: prompt + tokens generated) [r6b decode/load/mix
+      windows, beta shared: 735 MHz 59.4 + 0.407 X + 1.30e-3 K, 1170 MHz 58.1 +
+      0.407 X + 8.4e-4 K, 2040 MHz 55.1 + 0.407 X + 7.7e-4 K, job E production
+      within 1.5 ms; 300 MHz from job E's Canary count model], per-request TPOT
+      jitter 1 ms (residual spread), KV cache 33000 tokens (vLLM) admitted on
+      current usage with preemption and recompute, D power from the job E Canary
+  proxy 92 ms + exponential(11 ms) before P in production (admission, HTTP, gap;
+      job E's TTFT p50 / p95 at 0.5 req/s); probes go direct
+
   python scripts/analysis/overload_sim.py [--calibrate] [--profile ...] [--out DIR]
+  python scripts/analysis/overload_sim.py --replay JOB/results/ID --physics l4e \
+      [--slo 1000,200] [--policies baseline,best_effort]
+  (replays the job's own `vllm bench serve` arrivals and lengths per stage and
+  prints the simulated stages next to the measured ones)
 """
 
 import argparse
@@ -36,6 +57,7 @@ import asyncio
 import heapq
 import itertools
 import json
+import random
 import statistics
 from collections import deque
 from dataclasses import dataclass, field
@@ -57,8 +79,41 @@ from canatune.domain.groups import ClockPoint, Group, GroupState, Tier, TierStat
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable
 from canatune.infrastructure.clocks import NullClockActuator
+from canatune.infrastructure.telemetry import EndpointSnapshot, Telemetry
 
 TTFT_SLO_MS, TPOT_SLO_MS = 1000.0, 200.0
+
+
+def configure_slo(ttft_ms: float, tpot_ms: float) -> None:
+    """SLO of the simulated deployment (summaries and every CanaTune config)."""
+    global TTFT_SLO_MS, TPOT_SLO_MS
+    TTFT_SLO_MS, TPOT_SLO_MS = float(ttft_ms), float(tpot_ms)
+
+
+CONFIG_OVERRIDES: dict[str, object] = {}  # dotted key -> value, for every config
+
+
+def sim_config() -> dict:
+    config = load_config()
+    config["experiment"]["slo"] = {"ttft_ms": TTFT_SLO_MS, "tpot_ms": TPOT_SLO_MS}
+    for key, value in CONFIG_OVERRIDES.items():
+        node = config
+        *path, last = key.split(".")
+        for part in path:
+            node = node.setdefault(part, {})
+        node[last] = value
+    return config
+
+
+def _interp(table: tuple, f: float, index: int) -> float:
+    """Column `index` of rows (f, ...) at clock f: linear, constant beyond the ends."""
+    rows = sorted(table)
+    if f <= rows[0][0]:
+        return rows[0][index]
+    for a, b in zip(rows, rows[1:]):
+        if f <= b[0]:
+            return a[index] + (b[index] - a[index]) * (f - a[0]) / (b[0] - a[0])
+    return rows[-1][index]
 
 
 @dataclass(frozen=True)
@@ -87,6 +142,19 @@ class Physics:
     p_dyn_w: float = 290.0
     d_idle_w: float = 16.0
     d_dyn_w: float = 56.0
+    # Table-driven variants (empty: the formulas above). Rows per clock:
+    d_model: tuple = ()  # (f, alpha ms, beta ms/sequence, gamma ms/context token)
+    p_model: tuple = ()  # (f, plateau ms, slope ms/token, knee tokens)
+    p_power_model: tuple = ()  # (f, idle W, dynamic W at full utilization)
+    d_power_model: tuple = ()
+    tpot_jitter_ms: float = 0.0  # per-request TPOT noise (sd)
+    # D admission: "reserve" (prompt + whole output must fit, the original model) or
+    # "vllm" (the prompt fits now; when growth fills the cache the latest sequence is
+    # preempted and recomputed on D when it rejoins)
+    d_admit: str = "reserve"
+    d_recompute_ms_per_token: float = 0.2
+    probe_overhead_ms: float | None = None  # Canary probes skip the proxy (None: same)
+    overhead_jitter_ms: float = 0.0  # production: + exponential(mean) before P
 
     @property
     def max_point(self) -> ClockPoint:
@@ -96,17 +164,27 @@ class Physics:
         return self.p_beta_top_ms * self.p_f_eff / min(f, self.p_f_eff)
 
     def prefill_ms(self, f: int, tokens: int) -> float:
+        if self.p_model:
+            plateau, slope, knee = (_interp(self.p_model, f, i) for i in (1, 2, 3))
+            return plateau + slope * max(0.0, tokens - knee)
         return self.p_t0_ms + self.p_beta(f) * max(tokens, self.p_lstar)
 
-    def d_iter_ms(self, f: int, running: int) -> float:
+    def d_iter_ms(self, f: int, running: int, kv_tokens: float = 0.0) -> float:
+        if self.d_model:
+            alpha, beta, gamma = (_interp(self.d_model, f, i) for i in (1, 2, 3))
+            return alpha + beta * running + gamma * kv_tokens
         stretch = max(1.0, self.d_f_knee / f)
         return self.d_alpha_ms * stretch**0.2 + self.d_delta_ms * stretch * running
 
     def p_power(self, f: int, util: float) -> float:
+        if self.p_power_model:
+            return _interp(self.p_power_model, f, 1) + util * _interp(self.p_power_model, f, 2)
         x = min(f, self.p_clocks[-1]) / self.p_clocks[-1]
         return self.p_idle_w * (0.75 + 0.25 * x) + util * self.p_dyn_w * x**2.4
 
     def d_power(self, f: int, util: float) -> float:
+        if self.d_power_model:
+            return _interp(self.d_power_model, f, 1) + util * _interp(self.d_power_model, f, 2)
         x = f / self.d_clocks[-1]
         return self.d_idle_w * (0.75 + 0.25 * x) + util * self.d_dyn_w * x**2.0
 
@@ -114,6 +192,37 @@ class Physics:
 REFERENCE = Physics()  # an example environment (what the simulated hardware is)
 MAX = REFERENCE.max_point
 LENGTHS = [(128, 64), (512, 64), (1024, 64)]  # the request length mix
+
+# The hardware of jobs E-G (sources in the module docstring).
+L4_E = Physics(
+    name="l4e",
+    link_bytes_s=60e9,  # residence barely grows with the prompt (82 -> 86 ms)
+    d_first_extra_ms=27.0,  # residence ~82 ms = transfer + one D step (~55 ms) + this
+    d_kv_tokens=33000,
+    overhead_ms=92.0,  # with the jitter: job E's TTFT p50 / p95 at 0.5 req/s
+    overhead_jitter_ms=11.0,
+    probe_overhead_ms=0.0,
+    p_clocks=(600, 840, 1080, 1320, 1560, 1800, 2040, 2280, 2520),
+    d_clocks=(300, 735, 1170, 1605, 2040),  # the Canary's coarse D points on the L4
+    p_model=(
+        (600, 50.27, 0.19526, 156),
+        (1080, 45.19, 0.09723, 38),
+        (1560, 47.99, 0.06802, 0),
+        (2040, 47.99, 0.0546, 0),
+        (2520, 47.19, 0.0546, 0),
+    ),
+    # 300 MHz: job E's Canary count model there (82.1 + 5.37 X, 3.85 x the 1170
+    # slope), split like 1170; the other rows from r6b
+    d_model=((300, 82.1, 1.57, 3.2e-3), (735, 59.39, 0.407, 1.30e-3),
+             (1170, 58.10, 0.407, 8.39e-4), (2040, 55.09, 0.407, 7.73e-4)),  # fmt: skip
+    p_power_model=((600, 58.6, 111.7), (1080, 60.3, 161.2), (1560, 61.9, 183.8),
+                   (2040, 64.2, 205.8), (2520, 75.1, 218.5)),  # fmt: skip
+    d_power_model=((300, 20.8, 24.5), (735, 21.2, 38.0), (1170, 21.9, 42.8), (1605, 24.8, 47.5),
+                   (2040, 28.5, 43.8)),  # fmt: skip
+    tpot_jitter_ms=1.0,
+    d_admit="vllm",
+)
+PHYSICS = {"reference": REFERENCE, "l4e": L4_E}
 
 
 @dataclass
@@ -134,6 +243,12 @@ class Req:
     kv: float = 0.0
     state: tuple = ()  # (at P prompts, in-flight tokens, decoding) at dispatch
     worker: int | None = None  # closed loop: the worker that sends the next one
+    jitter: float = 0.0  # TPOT noise of this request (ms)
+    x_sum: float = 0.0  # running sequences x seconds while it decoded
+    k_sum: float = 0.0  # context tokens on D x seconds while it decoded
+    t_sum: float = 0.0
+    pulled: bool = False  # KV moved from D's receive buffer into its cache
+    recompute: bool = False  # preempted: D recomputes its context when it rejoins
 
 
 @dataclass
@@ -158,6 +273,7 @@ class Pair:
     d_waiting_max: int = 0
     d_running_max: int = 0
     d_kv_max: float = 0.0
+    preemptions: int = 0
 
 
 class Sim:
@@ -171,8 +287,17 @@ class Sim:
         *,
         phys: Physics = REFERENCE,
         table: TierTable | None = None,
+        overhead_ms: float | None = None,
+        solver: bool = True,
+        lengths=LENGTHS,
+        seed: int = 0,
     ):
         self.phys = phys
+        self.overhead_ms = phys.overhead_ms if overhead_ms is None else overhead_ms
+        self.solver = solver
+        self.lengths = list(lengths)
+        self.rng = random.Random(seed)
+        self.telemetry: Telemetry | None = None
         self.router_overrides = router_overrides or {}
         self.now = 0.0
         self.events: list = []
@@ -194,7 +319,7 @@ class Sim:
     # ---- CanaTune --------------------------------------------------------------------
 
     def _cantune(self, table: TierTable) -> None:
-        config = load_config()
+        config = sim_config()
         config["router"]["admission"] = "slack"
         config["router"]["overload"] = {"reject": "reject", "best_effort": "best_effort"}.get(
             self.policy, "serve"
@@ -203,7 +328,7 @@ class Sim:
         config["controller"]["stagger_s"] = 0.0
         # The solver runs whenever the table carries a cluster model; the static
         # comparison passes a table without one (selfcal_sim.static).
-        config["controller"]["solver"] = True
+        config["controller"]["solver"] = self.solver
         config["kv_transfer"]["kv_buffer_bytes"] = self.phys.kv_buffer_bytes
         config["kv_transfer"]["kv_bytes_per_token"] = self.phys.kv_bytes_per_token
         config["router"].update(self.router_overrides)
@@ -211,10 +336,15 @@ class Sim:
         tiers = TierState(max_point=self.phys.max_point, table=table)
         risk = RiskTable.from_config(config["risk"], {"sim": True})
         clock = lambda: self.now  # noqa: E731
-        lengths = LengthStats(LENGTHS, min_samples=50)
-        self.router = CanaTuneRouter(
-            groups, risk, RouterSettings.from_config(config), tiers, clock=clock, lengths=lengths
+        lengths = LengthStats(self.lengths, min_samples=50)
+        # D's /metrics as the proxy scrapes them (running, waiting, KV usage).
+        self.telemetry = Telemetry(
+            {}, period_s=0.25, client_factory=lambda: None, clock=clock
         )
+        self.router = CanaTuneRouter(
+            groups, risk, RouterSettings.from_config(config), tiers, clock=clock,
+            lengths=lengths, telemetry=self.telemetry,
+        )  # fmt: skip
         self.controller = TierController(
             groups,
             self.router,
@@ -244,10 +374,11 @@ class Sim:
     def loop(self, end_s: float) -> None:
         if self.controller is not None:
             self.at(0.0, self.tick)
+            self.at(0.0, self.scrape)
         self.at(0.0, self.sample)
         while self.events:
             t, _, fn, args = heapq.heappop(self.events)
-            if t > end_s + 120 and fn in (self.tick, self.sample):
+            if t > end_s + 120 and fn in (self.tick, self.sample, self.scrape):
                 continue
             self.now = t
             fn(*args)
@@ -259,6 +390,20 @@ class Sim:
             if g.effective is not None:
                 p.clock = g.effective
         self.at(self.now + self.controller.settings.period_s, self.tick)
+
+    @staticmethod
+    def kv_used(pair: Pair) -> float:
+        """Context tokens D holds: prompt plus the tokens generated so far."""
+        return sum(r.prompt + r.emitted for r in pair.d_running)
+
+    def scrape(self) -> None:
+        for i, p in enumerate(self.pairs):
+            snapshot = EndpointSnapshot(
+                self.now, float(len(p.d_running)), float(len(p.d_ready)),
+                self.kv_used(p) / self.phys.d_kv_tokens, float(p.preemptions), True,
+            )  # fmt: skip
+            self.telemetry.update(f"D{i}", snapshot)
+        self.at(self.now + self.telemetry.period_s, self.scrape)
 
     def sample(self) -> None:
         row = {"t": round(self.now, 1)}
@@ -282,7 +427,9 @@ class Sim:
                 f_p, f_d = self.phys.p_clocks[0], self.phys.d_clocks[0]
             else:
                 f_p, f_d = p.clock.prefill_mhz, p.clock.decode_mhz
-            self.energy_j += self.phys.p_power(f_p, p_util) + self.phys.d_power(f_d, d_util)
+            watts = self.phys.p_power(f_p, p_util) + self.phys.d_power(f_d, d_util)
+            self.energy_j += watts
+            row["w"] = row.get("w", 0.0) + watts
         if self.router is not None:
             row["holding"] = len(self.router._holding)
         self.timeline.append(row)
@@ -292,6 +439,8 @@ class Sim:
 
     def arrive(self, r: Req) -> None:
         r.kv = r.prompt * self.phys.kv_bytes_per_token
+        if self.phys.tpot_jitter_ms:
+            r.jitter = self.rng.gauss(0.0, self.phys.tpot_jitter_ms)
         self.requests.append(r)
         if self.router is None:
             self.dispatch(r, next(self.rr))
@@ -313,7 +462,10 @@ class Sim:
         r.pair = pair
         r.state = (tuple(pair.at_p.values()), pair.inflight_tokens, pair.decoding)
         pair.at_p[r.id] = r.prompt
-        self.at(self.now + self.phys.overhead_ms / 1000.0, self.p_enqueue, r)
+        delay = self.overhead_ms
+        if self.phys.overhead_jitter_ms and self.overhead_ms > 0:
+            delay += self.rng.expovariate(1.0 / self.phys.overhead_jitter_ms)
+        self.at(self.now + delay / 1000.0, self.p_enqueue, r)
 
     # ---- P ---------------------------------------------------------------------------
 
@@ -368,14 +520,44 @@ class Sim:
 
     def d_iter(self, pair: Pair) -> None:
         joined = []
-        used = sum(r.prompt + r.output for r in pair.d_running)
         cap = self.phys.d_kv_tokens
-        while pair.d_ready and used + pair.d_ready[0].prompt + pair.d_ready[0].output <= cap:
+        vllm = self.phys.d_admit == "vllm"
+        if vllm:  # the context it holds now, within vLLM's 1 % watermark
+            used, limit = self.kv_used(pair), 0.99 * cap
+
+            def need(r):
+                return r.prompt + r.emitted
+        else:
+            used, limit = sum(r.prompt + r.output for r in pair.d_running), cap
+
+            def need(r):
+                return r.prompt + r.output
+
+        while pair.d_ready and used + need(pair.d_ready[0]) <= limit:
             r = pair.d_ready.popleft()
-            used += r.prompt + r.output
-            pair.buffer -= r.kv  # pulled into D's KV cache
+            used += need(r)
+            if not r.pulled:
+                pair.buffer -= r.kv  # pulled into D's KV cache
+                r.pulled = True
             joined.append(r)
         pair.d_running.extend(joined)
+        recompute_s = 0.0
+        if vllm:
+            # The step appends a token per sequence: preempt the latest until it fits.
+            while pair.d_running and self.kv_used(pair) + len(pair.d_running) > cap:
+                r = pair.d_running.pop()
+                if r in joined:
+                    joined.remove(r)
+                r.recompute = True
+                pair.d_ready.appendleft(r)
+                pair.preemptions += 1
+            redo = [r for r in joined if r.recompute]
+            recompute_s = sum(r.prompt + r.emitted for r in redo) * (
+                self.phys.d_recompute_ms_per_token / 1000.0
+            )
+            for r in redo:
+                r.recompute = False
+            used = self.kv_used(pair)
         pair.d_waiting_max = max(pair.d_waiting_max, len(pair.d_ready))
         pair.d_running_max = max(pair.d_running_max, len(pair.d_running))
         pair.d_kv_max = max(pair.d_kv_max, used / cap)
@@ -384,14 +566,21 @@ class Sim:
             return
         if joined:
             self.send(pair)  # buffer space for P's pending sends
-        dur = self.phys.d_iter_ms(pair.clock.decode_mhz, len(pair.d_running)) / 1000.0
+        held = self.kv_used(pair)
+        n = len(pair.d_running)
+        dur = self.phys.d_iter_ms(pair.clock.decode_mhz, n, held) / 1000.0 + recompute_s
         pair.d_busy_s += dur
-        pair.d_running_integral += dur * len(pair.d_running)
+        pair.d_running_integral += dur * n
+        for r in pair.d_running:
+            if r not in joined:  # decode steps only (the join step yields the first token)
+                r.x_sum += n * dur
+                r.k_sum += held * dur
+                r.t_sum += dur
         self.at(self.now + dur, self.d_end, pair, joined)
 
     def d_end(self, pair: Pair, joined: list) -> None:
         for r in list(pair.d_running):
-            if r in joined:
+            if r in joined and r.first is None:
                 r.first = self.now + self.phys.d_first_extra_ms / 1000.0
                 pair.inflight_tokens -= r.prompt
                 pair.decoding += 1
@@ -421,7 +610,9 @@ class Sim:
 
     @staticmethod
     def tpot(r: Req) -> float | None:
-        return None if r.output <= 1 else (r.done - r.first) * 1000.0 / (r.output - 1)
+        if r.output <= 1:
+            return None
+        return (r.done - r.first) * 1000.0 / (r.output - 1) + r.jitter
 
     def probe_sample(self, r: Req) -> ProbeSample:
         at_p, inflight, decoding = r.state
@@ -486,6 +677,25 @@ def summarize(sim: Sim, phases: list[dict]) -> dict:
             row[n]["state"] in ("active", "draining") for row in t for n in names
         )
         out[ph["name"]]["max_group_s"] = sum(row[n]["tier"] == "max" for row in t for n in names)
+        tpots = [t for t in (sim.tpot(r) for r in served) if t is not None]
+        out[ph["name"]].update(
+            {
+                "tpot_p50": pct(tpots, 0.5),
+                "tpot_p95": pct(tpots, 0.95),
+                "ttft_late": sum((r.first - r.at) * 1000 > TTFT_SLO_MS for r in served),
+                "tpot_late": sum((sim.tpot(r) or 0) > TPOT_SLO_MS for r in served),
+                "best_effort": sum(
+                    r.ticket is not None and r.ticket.overflow == "best_effort" for r in served
+                ),
+            }
+        )
+        if ph["name"] != "total" and served:
+            # Energy over the stage's own span (first arrival to last completion), as
+            # the benchmark driver measures it.
+            start, end = min(r.at for r in rows), max(r.done for r in served)
+            out[ph["name"]]["energy_kj"] = (
+                sum(row.get("w", 0.0) for row in sim.timeline if start <= row["t"] < end) / 1000
+            )
     out["send_retries"] = sum(p.send_retries for p in sim.pairs)
     if sim.router is not None:
         out["router"] = {k: v for k, v in sim.router.state().items() if k != "groups"}
@@ -499,9 +709,9 @@ class SimBackend:
 
     service_source = "metrics"
 
-    def __init__(self, phys: Physics, lengths=LENGTHS, seed: int = 7) -> None:
-        import random
+    decode_output_tokens = 256  # closed windows, as the probe
 
+    def __init__(self, phys: Physics, lengths=LENGTHS, seed: int = 7) -> None:
         self.phys = phys
         self.lengths = list(lengths)
         self.rng = random.Random(seed)
@@ -512,6 +722,19 @@ class SimBackend:
     def _pairs(self) -> list[tuple[int, int]]:
         pairs = [p for p in self.lengths if self.limit is None or p[0] <= self.limit]
         return pairs or self.lengths[:1]
+
+    def _mix(self, mix: str) -> list[int]:
+        """Prompts of a closed-window mix, as the probe: lower / upper half."""
+        prompts = sorted(p for p, _ in self._pairs())
+        if mix == "short":
+            return prompts[: (len(prompts) + 1) // 2]
+        if mix == "long":
+            return prompts[len(prompts) // 2 :]
+        return prompts
+
+    def mix_context(self, mix: str = "all") -> float:
+        prompts = self._mix(mix)
+        return sum(prompts) / len(prompts) + self.decode_output_tokens / 2
 
     async def hardware(self) -> Hardware:
         return Hardware(self.phys.p_clocks, self.phys.d_clocks)
@@ -531,7 +754,7 @@ class SimBackend:
                 self.phys.overhead_ms
                 + pre
                 + n * self.phys.kv_bytes_per_token / self.phys.link_bytes_s * 1000
-                + self.phys.d_iter_ms(clock.decode_mhz, 1)
+                + self.phys.d_iter_ms(clock.decode_mhz, 1, n)
                 + self.phys.d_first_extra_ms
             )
             out.append((n, pre, ttft))
@@ -575,6 +798,7 @@ class SimBackend:
             prefill_mhz_median=float(min(f_p, self.phys.p_f_eff)),
             prefill_limited_fraction=1.0 if f_p > self.phys.p_f_eff else 0.0,
             decode_waiting_max=float(pair.d_waiting_max),
+            decode_preemptions=float(pair.preemptions),
             decode_kv_max=pair.d_kv_max,
             decode_running_max=float(pair.d_running_max),
             samples=[s.probe_sample(r) for r in reqs],
@@ -583,11 +807,18 @@ class SimBackend:
             decode_busy_fraction=busy,
             decode_running_mean=running / busy if busy > 0 else None,
             tpot_p50_ms=tpots[len(tpots) // 2] if tpots else None,
+            decode_points=[
+                (r.x_sum / r.t_sum, r.k_sum / r.t_sum, s.tpot(r))
+                for r in reqs
+                if r.t_sum > 0 and s.tpot(r) is not None
+            ],
         )
 
-    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
-        import random
+    def _window_sim(self, clock: ClockPoint) -> "Sim":
+        return Sim(1, "baseline", clock, phys=self.phys, overhead_ms=self.phys.probe_overhead_ms,
+                   seed=self.rng.randrange(10**9))  # fmt: skip
 
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
         trace = random.Random(int(eq_tps * 10) + 17)
         pairs = self._pairs()
         mean = sum(p for p, _ in pairs) / len(pairs)
@@ -596,24 +827,24 @@ class SimBackend:
             loadgen.Arrival(i, t, "w", *pairs[trace.randrange(len(pairs))])
             for i, t in enumerate(sorted(trace.uniform(0, seconds) for _ in range(count)))
         ]
-        s = Sim(1, "baseline", clock, phys=self.phys)
+        s = self._window_sim(clock)
         s.run(arrivals, seconds)
         return self._result(s, clock, "open", eq_tps)
 
-    async def closed_window(self, clock, concurrency, seconds, rep=0):
-        import random
-
-        trace = random.Random(concurrency * 101 + rep)
-        pairs = self._pairs()
-        s = Sim(1, "baseline", clock, phys=self.phys)
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+        salt = {"all": 0, "short": 1, "long": 2}[mix]
+        trace = random.Random(concurrency * 101 + rep + 1_000_003 * salt)
+        prompts = self._mix(mix)
+        s = self._window_sim(clock)
         ids = iter(range(10**9))
         stagger = min(15.0, seconds / 3)
 
         def send(worker: int, at: float) -> None:
             if at >= seconds:
                 return
-            prompt = pairs[trace.randrange(len(pairs))][0]
-            s.at(at, s.arrive, Req(next(ids), at, "w", prompt, 256, worker=worker))
+            prompt = prompts[trace.randrange(len(prompts))]
+            out = self.decode_output_tokens
+            s.at(at, s.arrive, Req(next(ids), at, "w", prompt, out, worker=worker))
 
         s.on_done = lambda r: send(r.worker, s.now)
         for w in range(concurrency):
@@ -631,7 +862,7 @@ def run_canary(phys: Physics = REFERENCE, lengths=LENGTHS) -> tuple[TierTable, S
     backend = SimBackend(phys, lengths)
     locator = TierLocator(
         backend,
-        LocatorSettings.from_config(load_config()),
+        LocatorSettings.from_config(sim_config()),
         admission=AdmissionInputs(
             kv_bytes_per_token=phys.kv_bytes_per_token, kv_buffer_bytes=phys.kv_buffer_bytes
         ),
@@ -650,6 +881,95 @@ def trace(table: TierTable, profile: str, seed: int, lengths=LENGTHS):
         alpha=table.alpha_tokens,
         seed=seed,
     )
+
+
+def replay_trace(run_dir: Path) -> tuple[dict, list]:
+    """Arrivals and lengths of a run's `vllm bench serve` stages (bench_plan.json,
+    stages/<name>/bench.json: start_times, input_lens, output_lens), on the run's own
+    timeline (gaps included)."""
+    plan = json.loads((run_dir / "bench_plan.json").read_text())
+    stages = []
+    for st in plan["stages"]:
+        path = run_dir / "stages" / st["name"] / "bench.json"
+        if path.exists():
+            stages.append((st["name"], json.loads(path.read_text())))
+    t0 = min(min(b["start_times"]) for _, b in stages)
+    rows, phases = [], []
+    for name, b in stages:
+        starts = [t - t0 for t in b["start_times"]]
+        for at, prompt, output in zip(starts, b["input_lens"], b["output_lens"]):
+            if output >= 1:
+                rows.append((at, name, int(prompt), int(output)))
+        phases.append({"name": name, "start_s": min(starts), "end_s": max(starts)})
+    rows.sort()
+    arrivals = [loadgen.Arrival(i, *row) for i, row in enumerate(rows)]
+    return {"phases": phases, "duration_s": phases[-1]["end_s"]}, arrivals
+
+
+def measured_stages(run_dir: Path) -> dict:
+    path = run_dir / "bench_summary.json"
+    return json.loads(path.read_text())["stages"] if path.exists() else {}
+
+
+def run_replay(args) -> int:
+    """The job's benchmark on the simulated hardware: Canary (cold start lengths, as
+    the job), then CanaTune best effort and the baseline on the same arrivals."""
+    phys = PHYSICS[args.physics]
+    job = args.replay
+    meta, arrivals = replay_trace(job / "cantune")
+    cold = [(p, args.output_cap) for p in (128, 512, 1024, 2048)]
+    table, backend = run_canary(phys, cold)
+    d = table.evidence.get("decode") or {}
+    print(f"Canary: {backend.windows} windows; H {table.h.key()}, B* {table.decode_max_running},"
+          f" decode model {d.get('decode_model', 'count')}")  # fmt: skip
+    for f, coef in (table.decode_length or {}).items():
+        cap = (d.get("capacity") or {}).get(f) or {}
+        seqs = cap.get("sequences") or 0.0
+        print(f"  D {f} MHz: alpha {coef[0]:.2f} beta {coef[1]:.3f} gamma {coef[2]:.2e}"
+              f" r95 {coef[3]:.2f}; capacity {seqs:.1f} ({cap.get('limit')})")  # fmt: skip
+    results = {}
+    for policy in args.policies.split(","):
+        clocks = phys.max_point if policy == "baseline" else table.h
+        sim = Sim(args.groups, policy, clocks, phys=phys, table=None if policy == "baseline"
+                  else table, solver=args.solver, lengths=cold, seed=args.seed)  # fmt: skip
+        sim.run(arrivals, meta["duration_s"])
+        results[policy] = summarize(sim, meta["phases"])
+        if args.out is not None:
+            args.out.mkdir(parents=True, exist_ok=True)
+            (args.out / f"replay_{policy}.json").write_text(json.dumps(results[policy], indent=1))
+    measured = {"best_effort": measured_stages(job / "cantune"),
+                "baseline": measured_stages(job / "baseline")}  # fmt: skip
+    keys = ("goodput", "ttft_p50", "ttft_p95", "tpot_p50", "tpot_p95", "energy_kj")
+    real_keys = ("goodput", "ttft_p50_ms", "ttft_p95_ms", "tpot_p50_ms", "tpot_p95_ms", "energy_j")
+    print(f"SLO {TTFT_SLO_MS:.0f} / {TPOT_SLO_MS:.0f} ms; sim | measured")
+    print(f"{'stage':>11} {'policy':>11} " + " ".join(f"{k:>17s}" for k in keys) + "  warn")
+    for ph in [p["name"] for p in meta["phases"]]:
+        for policy, res in results.items():
+            row, real = res[ph], measured.get(policy, {}).get(ph, {})
+            cells = []
+            for k, rk in zip(keys, real_keys):
+                sim_v, real_v = row.get(k), real.get(rk)
+                if rk == "energy_j" and real_v is not None:
+                    real_v /= 1000
+                cells.append(f"{_num(sim_v):>8}|{_num(real_v):<8}")
+            print(f"{ph:>11} {policy:>11} " + " ".join(cells) + f"  {row.get('best_effort', 0)}")
+    if {"baseline", "best_effort"} <= set(results):
+        print("energy vs baseline (sim | measured):")
+        for ph in [p["name"] for p in meta["phases"]]:
+            sim_e = [results[k][ph].get("energy_kj") for k in ("best_effort", "baseline")]
+            real_e = [measured[k].get(ph, {}).get("energy_j") for k in ("best_effort", "baseline")]
+            print(f"  {ph:>11}  {_ratio(*sim_e)} | {_ratio(*real_e)}")
+    return 0
+
+
+def _num(v) -> str:
+    if v is None:
+        return "-"
+    return f"{v:.3f}" if isinstance(v, float) and v <= 1.0 else f"{v:.0f}"
+
+
+def _ratio(a, b) -> str:
+    return "-" if not a or not b else f"{(a / b - 1) * 100:+.1f}%"
 
 
 def calibrate(clock: ClockPoint, rates, seconds: float, seed: int) -> list[dict]:
@@ -695,7 +1015,24 @@ def main() -> int:
     ap.add_argument("--policies", default="baseline,reject,serve_dispatch,serve")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--set", action="append", default=[], help="router key=value (JSON value)")
+    ap.add_argument("--replay", type=Path, default=None, help="job results/<id> dir to replay")
+    ap.add_argument("--physics", choices=sorted(PHYSICS), default="reference")
+    ap.add_argument("--slo", default=None, help="TTFT,TPOT ms (default 1000,200)")
+    ap.add_argument("--groups", type=int, default=None, help="pairs (replay default 3)")
+    ap.add_argument("--solver", action="store_true", help="replay: controller.solver on")
+    ap.add_argument("--output-cap", type=int, default=256, help="replay: canary.max_output_tokens")
+    ap.add_argument("--config", action="append", default=[], help="dotted.key=value (JSON value)")
     args = ap.parse_args()
+    for item in args.config:
+        key, value = item.split("=", 1)
+        CONFIG_OVERRIDES[key] = json.loads(value)
+    if args.slo:
+        configure_slo(*(float(x) for x in args.slo.split(",")))
+    if args.replay is not None:
+        args.groups = args.groups or 3
+        if args.policies == "baseline,reject,serve_dispatch,serve":
+            args.policies = "baseline,best_effort"
+        return run_replay(args)
     if args.calibrate:
         for clock in (ClockPoint(REFERENCE.p_clocks[2], REFERENCE.d_clocks[2]), MAX):
             print(f"single pair at {clock.key()}:")
