@@ -1136,3 +1136,49 @@ def test_the_solver_is_off_by_default() -> None:
     _, _, groups, _, _, controller, _ = setup(table=published(model=True))
     activate(groups)
     assert controller.solver() is None  # every group stays at the Canary's H
+
+
+def length_router(running, kv_usage, coef=(50.0, 0.4, 8e-4, 2.0), n_decoding=None):
+    clock = FakeClock()
+    telemetry = Telemetry({}, period_s=1, client_factory=lambda: None, clock=clock)
+    table = published(decode_max_running=24, decode_kv_limit=0.9,
+                      decode_length={"1050": list(coef)}, decode_kv_tokens=30000)  # fmt: skip
+    _, _, groups, _, router, _, _ = setup(
+        table=table, telemetry=telemetry, admission="slack", overload="best_effort"
+    )
+    activate(groups[1:2])
+    group = groups[1]
+    group.n_inflight = group.n_decoding = running if n_decoding is None else n_decoding
+    telemetry.update(group.decode, EndpointSnapshot(clock.now, running, 0, kv_usage, 0, True))
+    return router, group
+
+
+def test_length_model_lets_short_sequences_pass_the_count_bound():
+    # 28 sequences (above B* = 24) holding 9000 tokens: 50 + 0.4 x 29 + 8e-4 x 9160 + 2
+    router, group = length_router(28, 0.3)
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    assert ticket.group is group and ticket.overflow is None and router.risk_signals == 0
+    assert ticket.snapshot["tpot_bound_ms"] == pytest.approx(70.9, abs=0.1)
+
+
+def test_length_model_warns_on_the_kv_wall_of_long_contexts():
+    # 10 sequences holding 25500 tokens: a 2048-token prompt (+64 output) passes 0.9 x 30000
+    router, group = length_router(10, 0.85)
+    ticket = router.step(router.new_waiter(), 2048, True, 0)
+    assert ticket.group is group and ticket.overflow == "best_effort"
+    assert router.risk_signals == 1
+
+
+def test_length_model_warns_when_the_tpot_bound_passes_the_slo():
+    # alpha 150 + 2 ms per sequence: 21 sequences put the bound above 200 ms
+    router, group = length_router(20, 0.1, coef=(150.0, 2.0, 1e-3, 5.0))
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    assert ticket.overflow == "best_effort" and router.risk_signals == 1
+    assert ticket.snapshot["tpot_bound_ms"] > 200
+
+
+def test_length_model_counts_requests_still_at_prefill():
+    router, group = length_router(0, 0.0, coef=(150.0, 2.0, 1e-3, 5.0))
+    group.n_inflight = group.n_await = group.n_at_p = 24
+    ticket = router.step(router.new_waiter(), 128, True, 0)
+    assert ticket.overflow == "best_effort"  # 25 sequences on their way: 150 + 50 + ...

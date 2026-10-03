@@ -98,6 +98,10 @@ class TierTable:
     decode_max_running: int | None = None  # B*: clean D concurrency (KV wall)
     decode_kv_limit: float | None = None  # admit only while D KV usage <= this
     decode_wall: bool = True  # False: D has a frequency step (reported, not used in v1)
+    # Length model per D clock: [alpha, beta, gamma, r95] (TPOT = alpha + beta X +
+    # gamma K + r95, X running sequences, K their context tokens); None: count model
+    decode_length: dict[str, list[float]] | None = None
+    decode_kv_tokens: int | None = None  # D's KV cache size in tokens
     published_at: float = 0.0  # wall time
     evidence: dict[str, Any] = field(default_factory=dict)
 

@@ -75,7 +75,7 @@ deploy ─> cold start ──────────────> publish ─> 
 | ramp | at MAX: double the load until the violation bound exceeds theta, bisect → C0; the busy clock gives the power-capped ceiling |
 | search | coarse + refine of the P clock at 0.8·C0 by measured J/request → H |
 | tables | S(L) at every coarse P clock (the solver's choices); a higher clock slower than a lower one (beyond eps) is measured again, then bounded by the lower clocks |
-| decode | J/token over the D clocks at 0.7·B* and at half that (D iteration vs running sequences); B* at the chosen and the top D clock |
+| decode | length model at the top D clock: TPOT = α + β·X + γ·K + r95 (X running sequences, K their context tokens; Ramani & Tantawi, arXiv 2609.20957) from closed windows of the short and long prompt halves at two concurrencies; a TPOT SLO that one short sequence misses is reported infeasible; the D clock by J/token at 0.7 of the capacity it implies, refitted there. `decode_model: count` keeps the B* search |
 | joint | P at H with the D ladder at 0.8·C0 |
 | fill | windows at H over loads → C_H |
 | model | from every probe and window of the run (below) |
@@ -106,7 +106,9 @@ S(L) at the group's clock), the KV bytes in flight and the requests decoding.
 
 ```text
 hard guards   fresh D telemetry, D KV usage, KV in flight <= gate x kv_buffer_bytes
-SLO warning   D concurrency exceeds measured B* (D running/queued, excludes P);
+SLO warning   length model: the TPOT bound of D with this request (sequences on D
+              or on their way, the context tokens they hold) exceeds the SLO, or
+              its KV passes the wall; count model: D concurrency exceeds B*.
               best_effort still dispatches, including at MAX. Legacy policies
               retain the B* admission ceiling.
 risk          predicted TTFT (Canary's fit, refitted online) -> slack = SLO - waited

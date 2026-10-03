@@ -36,7 +36,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from canatune.domain.admission import CostBook, PrefillCost, SlackRisk, slack_edges
+from canatune.domain.admission import CostBook, PrefillCost, SlackRisk, _solve, slack_edges
 from canatune.domain.groups import ClockPoint
 
 
@@ -84,6 +84,71 @@ def fit_decode(points: Mapping[int, Sequence[tuple[float, float]]]) -> dict[int,
             alpha = sum(y - delta * x for x, y in pts) / len(pts)
             fits[f] = [alpha, delta]
     return fits
+
+
+def fit_decode_length(points: Sequence[tuple[float, float, float]]) -> list[float] | None:
+    """(running sequences X, KV tokens they hold K, TPOT ms) per request -> [alpha,
+    beta, gamma, r95]: a decode step costs alpha plus beta per sequence plus gamma
+    per context token it reads (Ramani & Tantawi, arXiv 2609.20957, summed over the
+    batch instead of averaged over one mean request). r95 is the 95th percentile of
+    the residuals, so alpha + beta X + gamma K + r95 bounds a request's TPOT the way
+    the SLO's p95 does. A negative slope (too little spread in X or K to separate
+    them) is fixed at 0 and the other one refitted."""
+    if len(points) < 4:
+        return None
+    for cols in ((0, 1), (0,), (1,)):
+        rows = [[1.0, *(p[c] for c in cols)] for p in points]
+        n = len(rows[0])
+        ata = [[sum(r[i] * r[j] for r in rows) for j in range(n)] for i in range(n)]
+        aty = [sum(r[i] * p[2] for r, p in zip(rows, points)) for i in range(n)]
+        solution = _solve(ata, aty)
+        if solution is None or any(c < 0 for c in solution[1:]):
+            continue
+        slopes = dict(zip(cols, solution[1:]))
+        alpha, beta, gamma = solution[0], slopes.get(0, 0.0), slopes.get(1, 0.0)
+        residuals = sorted(p[2] - (alpha + beta * p[0] + gamma * p[1]) for p in points)
+        r95 = residuals[min(len(residuals) - 1, int(0.95 * (len(residuals) - 1) + 0.5))]
+        return [alpha, beta, gamma, max(0.0, r95)]
+    return None
+
+
+def decode_tpot(coef: Sequence[float], running: float, kv_tokens: float) -> float:
+    """TPOT bound (ms) of a request decoding among `running` sequences holding
+    `kv_tokens` context tokens."""
+    alpha, beta, gamma, r95 = coef
+    return alpha + beta * running + gamma * kv_tokens + r95
+
+
+def decode_capacity(
+    coef: Sequence[float],
+    context: float,
+    tpot_slo_ms: float,
+    kv_tokens: float | None = None,
+    kv_limit: float = 1.0,
+) -> dict[str, Any]:
+    """Sequences of `context` tokens each that one D holds within the TPOT SLO and
+    within kv_limit of its KV cache; `limit` names the binding one."""
+    alpha, beta, gamma, r95 = coef
+    per_sequence = beta + gamma * context
+    tpot = (tpot_slo_ms - alpha - r95) / per_sequence if per_sequence > 0 else math.inf
+    kv = kv_limit * kv_tokens / context if kv_tokens and context > 0 else math.inf
+    sequences = max(0.0, min(tpot, kv))
+    return {
+        "sequences": None if math.isinf(sequences) else sequences,
+        "tpot_sequences": None if math.isinf(tpot) else max(0.0, tpot),
+        "kv_sequences": None if math.isinf(kv) else kv,
+        "limit": "kv" if kv < tpot else "tpot",
+    }
+
+
+def decode_coef(model: Mapping[str, Sequence[float]], mhz: float) -> list[float] | None:
+    """Length-model coefficients at D clock `mhz`: those of the nearest measured
+    clock at or below it (a lower clock is never faster), else the lowest one."""
+    if not model:
+        return None
+    clocks = sorted(int(f) for f in model)
+    below = [f for f in clocks if f <= mhz]
+    return [float(c) for c in model[str(max(below) if below else clocks[0])]]
 
 
 def fit_power(

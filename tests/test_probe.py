@@ -1,6 +1,7 @@
 """CanaryProbe against mocked vLLM endpoints and a fake agent."""
 
 import asyncio
+import dataclasses
 import json
 import time
 
@@ -289,3 +290,32 @@ def test_quiesce_requires_both_vllm_nodes_idle_and_available():
     probe._metrics = unavailable
     with pytest.raises(TimeoutError, match="has not drained"):
         asyncio.run(probe.quiesce())
+
+
+def test_mixes_split_the_prompt_distribution_and_closed_windows_use_them() -> None:
+    requests: list = []
+    probe, _ = make_probe(requests, FakeAgent())  # lengths (64, 3) and (256, 5)
+    assert probe._mix_prompts("short") == [64] and probe._mix_prompts("long") == [256]
+    assert probe.mix_context("all") == pytest.approx(160 + 128)  # prompt + half of 256
+    assert probe.mix_context("long") == pytest.approx(256 + 128)
+    asyncio.run(probe.closed_window(ClockPoint(1815, 1050), 2, 0.1, mix="long"))
+    prompts = {len(body["prompt"]) for port, body, _ in requests if port == 8100}
+    assert prompts == {256}
+
+
+def test_decode_points_average_d_state_over_each_request() -> None:
+    from types import SimpleNamespace
+
+    from canatune.controller.probe import ProbeOutcome, decode_points
+
+    def snap(t, running, kv):
+        return SimpleNamespace(taken_at=t, running=running, kv_usage=kv)
+
+    snaps = [snap(0.5, 1, 0.1), snap(1.5, 3, 0.3), snap(1.5, 3, 0.3), snap(2.5, 5, 0.5)]
+    outcome = ProbeOutcome("ok", 100, 20, 10.0, 50.0, 60.0, 0, False,
+                           first_token_at=1.0, last_token_at=3.0)  # fmt: skip
+    # snapshots at 1.5 and 2.5 (the duplicate counts once): X 4, K 0.4 x 1000
+    assert decode_points([outcome], snaps, 1000) == [(4.0, 400.0, 60.0)]
+    assert decode_points([outcome], snaps, None) == []  # no KV size: no samples
+    alone = dataclasses.replace(outcome, first_token_at=2.0)
+    assert decode_points([alone], snaps, 1000) == []  # one snapshot is too few

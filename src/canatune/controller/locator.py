@@ -17,9 +17,12 @@ Procedure (design v2 §6.2):
 6. choose   H = highest clock whose energy is within (1+eps) of the minimum and
             that is not held down by power/thermal limits most of the time
 7. tables   single-request S(L) at every coarse P clock (the solver's P choices)
-8. decode   J/token over D clocks at a fixed concurrency, plus half that
-            concurrency (D iteration time against running sequences per clock);
-            B* (clean concurrency) at the chosen and the highest D clock
+8. decode   length model (default): TPOT = alpha + beta X + gamma K + r95 per D
+            clock (X running sequences, K the context tokens they hold), fitted on
+            closed windows of short and long prompts at two concurrencies each, at
+            the highest and the chosen D clock; the D clock by J/token at 0.7 of the
+            capacity it implies for the current lengths. The legacy count model
+            searches B* (clean concurrency) at the chosen and the highest D clock
 9. joint    P at H together with D at the chosen clock at 0.8*C0 (and L at
             0.3*C0): raise D a step until it holds; P and D are each measured with
             the other at its ceiling, and a slow D also delays the first token
@@ -48,12 +51,25 @@ from typing import Any, Protocol
 from canatune.domain.admission import CostBook
 from canatune.domain.calibration import calibrate_admission, fit_plateau_slope
 from canatune.domain.groups import ClockPoint, TierTable
-from canatune.domain.models import ClusterModel, fit_decode, fit_power, interpolate
+from canatune.domain.models import (
+    ClusterModel,
+    decode_capacity,
+    decode_tpot,
+    fit_decode,
+    fit_decode_length,
+    fit_power,
+    interpolate,
+)
 from canatune.infrastructure.records import JsonlLog
 
 
 class LocatorError(RuntimeError):
     """The procedure cannot produce a usable tier table."""
+
+
+class LengthFitError(LocatorError):
+    """Too few usable requests for the decode length model (no D telemetry or KV
+    size): the locator falls back to the count model."""
 
 
 # ---- measurement interface ------------------------------------------------------
@@ -91,6 +107,8 @@ class WindowResult:
     decode_busy_fraction: float | None = None  # share of samples with D running > 0
     decode_running_mean: float | None = None
     tpot_p50_ms: float | None = None
+    # (mean running sequences, mean KV tokens, TPOT ms) per request: length model
+    decode_points: list = field(default_factory=list, repr=False)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -139,9 +157,10 @@ class ProbeBackend(Protocol):
         ...
 
     async def closed_window(
-        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0
+        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0, mix: str = "all"
     ) -> WindowResult:
-        """Fixed concurrency; `rep` selects another fixed prompt trace."""
+        """Fixed concurrency; `rep` selects another fixed prompt trace, `mix` the
+        prompts ("all", or the "short" / "long" half of the distribution)."""
         ...
 
 
@@ -178,6 +197,10 @@ class LocatorSettings:
     decode_kv_limit: float = 0.90
     decode_window_s: float = 60.0  # closed windows: several requests per worker
     decode_clock_repeats: int = 2  # D clock choice: median J/token of this many windows
+    decode_model: str = "length"  # length (alpha + beta X + gamma K) or count (B* search)
+    decode_fit_fill: float = 0.6  # length fit: highest concurrency fills this much KV
+    decode_fit_max_concurrency: int = 64
+    decode_fit_min_points: int = 12  # requests per clock below which the fit is refused
     service_repeats: int = 3
     service_lengths: tuple[int, ...] = ()  # extra S(L) lengths; () = 16, 64, 256, ... up
     # to the longest probe length (the plateau and its knee need short lengths)
@@ -197,6 +220,8 @@ class LocatorSettings:
         unknown = set(raw) - known
         if unknown:
             raise ValueError(f"unknown canary.locator keys: {sorted(unknown)}")
+        if raw.get("decode_model", "length") not in ("length", "count"):
+            raise ValueError("canary.locator.decode_model must be length or count")
         return cls(**raw)
 
 
@@ -209,6 +234,17 @@ def wilson_ucb(k: int, n: int, z: float) -> float:
     centre = p + z * z / (2 * n)
     half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
     return min(1.0, (centre + half) / den)
+
+
+def _corr(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    return sxy / math.sqrt(sxx * syy) if sxx > 0 and syy > 0 else None
 
 
 def snap(grid: Sequence[int], mhz: float) -> int:
@@ -396,11 +432,18 @@ class TierLocator:
             lambda: self.backend.open_window(clock, eq_tps, alpha, seconds, 2 * self.s.theta),
         )
 
-    async def closed(self, clock: ClockPoint, concurrency: int, rep: int = 0) -> WindowResult:
-        key = ("closed", clock, concurrency, rep)
+    async def closed(
+        self, clock: ClockPoint, concurrency: int, rep: int = 0, mix: str = "all"
+    ) -> WindowResult:
+        key = ("closed", clock, concurrency, rep, mix)
+        seconds = self.s.decode_window_s
+        if mix == "all":
+            return await self._cached(
+                key, lambda: self.backend.closed_window(clock, concurrency, seconds, rep=rep)
+            )
         return await self._cached(
             key,
-            lambda: self.backend.closed_window(clock, concurrency, self.s.decode_window_s, rep=rep),
+            lambda: self.backend.closed_window(clock, concurrency, seconds, rep=rep, mix=mix),
         )
 
     async def closed_median(self, clock: ClockPoint, concurrency: int) -> WindowResult:
@@ -847,6 +890,134 @@ class TierLocator:
         return max(steady or band)
 
     async def decode(self, hw: Hardware, prefill_mhz: int) -> tuple[int, int, bool, dict]:
+        """-> (decode clock, B*, KV wall?, evidence): the length model when the
+        backend reports D's KV size and draws prompt mixes, else the count model."""
+        if self.s.decode_model == "length":
+            capacity = None
+            if hasattr(self.backend, "kv_capacity") and hasattr(self.backend, "mix_context"):
+                capacity = await self.backend.kv_capacity()
+            if capacity:
+                try:
+                    return await self.decode_length(hw, prefill_mhz, capacity)
+                except LengthFitError as error:
+                    reason = str(error)
+            else:
+                reason = "no KV capacity"
+            self.log.write({"event": "locator_decode_fallback", "reason": reason})
+        return await self.decode_count(hw, prefill_mhz)
+
+    async def fit_length(
+        self, point: ClockPoint, capacity: int, extra: Sequence[WindowResult] = ()
+    ) -> tuple[list[float], dict[str, Any]]:
+        """Length model at one D clock: closed windows of the short and the long
+        prompt half, each at a concurrency filling decode_fit_fill of the KV cache
+        and a quarter of it, plus `extra` windows at this clock. Only windows with no
+        D queue or preemption count (KV pressure, not decode work, sets TPOT there);
+        TPOT above the SLO is still valid data."""
+        windows = list(extra)
+        plan = {}
+        for mix in ("short", "long"):
+            context = self.backend.mix_context(mix)
+            high = int(self.s.decode_fit_fill * capacity / max(context, 1.0))
+            high = max(2, min(self.s.decode_fit_max_concurrency, high))
+            plan[mix] = {"context": context, "concurrency": [max(1, high // 4), high]}
+            for c in plan[mix]["concurrency"]:
+                windows.append(await self.closed(point, c, mix=mix))
+        used = [w for w in windows if w.decode_preemptions == 0 and w.decode_waiting_max == 0]
+        points = [p for w in used for p in w.decode_points]
+        coef = fit_decode_length(points) if len(points) >= self.s.decode_fit_min_points else None
+        if coef is None:
+            raise LengthFitError(
+                f"decode length model at {point.decode_mhz} MHz: {len(points)} usable requests"
+            )
+        xs = [p[0] for p in points]
+        ks = [p[1] for p in points]
+        evidence = {
+            "coef": coef,
+            "points": len(points),
+            "windows": len(used),
+            "plan": plan,
+            "running": [min(xs), max(xs)],
+            "kv_tokens": [min(ks), max(ks)],
+            "corr_running_kv": _corr(xs, ks),
+        }
+        return coef, evidence
+
+    async def decode_length(
+        self, hw: Hardware, prefill_mhz: int, capacity: int
+    ) -> tuple[int, int, bool, dict]:
+        """-> (decode clock, sequences at the current lengths, KV-limited?, evidence).
+
+        The model is fitted at the highest D clock, which also tells whether the
+        TPOT SLO is feasible at all (one short sequence alone must meet it). The D
+        clock is chosen by J/token at decode_load_fraction of the capacity the model
+        implies for the current mean context, and the model is fitted again there.
+        The published B* is that capacity at the chosen clock (legacy policies and
+        the solver read it); production uses the model itself."""
+        top_d = hw.decode_clocks[-1]
+        slo = self.s.tpot_slo_ms
+        self._phase("decode_model")
+        top_point = ClockPoint(prefill_mhz, top_d)
+        coef_top, fit_top = await self.fit_length(top_point, capacity)
+        context = self.backend.mix_context("all")
+        shortest = self.backend.mix_context("short")
+        alone = decode_tpot(coef_top, 1, shortest)
+        if alone > slo:
+            raise LocatorError(
+                f"TPOT SLO {slo:.0f} ms is infeasible: one sequence of {shortest:.0f} context "
+                f"tokens needs {alone:.1f} ms at the highest D clock ({top_d} MHz)"
+            )
+        cap_top = decode_capacity(coef_top, context, slo, capacity, self.s.decode_kv_limit)
+        x_top = cap_top["sequences"] or self.s.decode_fit_max_concurrency
+
+        self._phase("decode_clock")
+        load = max(1, round(self.s.decode_load_fraction * x_top))
+        per_clock: dict[int, WindowResult] = {}
+        for f in spread(hw.decode_clocks, hw.decode_clocks[0], top_d, self.s.coarse_points):
+            w = await self.closed_median(ClockPoint(prefill_mhz, f), load)
+            per_clock[f] = w
+            if not self.decode_clean(w):
+                break  # lower D clocks only get slower
+        ok = {
+            f: w.decode_j_per_token
+            for f, w in per_clock.items()
+            if w.decode_j_per_token is not None and self.decode_clean(w)
+        }
+        if not ok:
+            raise LocatorError("no decode clock is clean at 0.7 of the modelled capacity")
+        emin = min(ok.values())
+        f_d = max(f for f, e in ok.items() if e <= (1 + self.s.eps) * emin)
+
+        self._phase("decode_verify")
+        model = {str(top_d): coef_top}
+        fits = {str(top_d): fit_top}
+        if f_d != top_d:
+            point = ClockPoint(prefill_mhz, f_d)
+            repeats = [
+                await self.closed(point, load, rep) for rep in range(self.s.decode_clock_repeats)
+            ]
+            model[str(f_d)], fits[str(f_d)] = await self.fit_length(point, capacity, repeats)
+        cap = decode_capacity(model[str(f_d)], context, slo, capacity, self.s.decode_kv_limit)
+        sequences = max(1, int(cap["sequences"] or self.s.decode_fit_max_concurrency))
+        evidence = {
+            "decode_model": "length",
+            "length_model": model,
+            "length_fit": fits,
+            "context_tokens": context,
+            "capacity": {str(top_d): cap_top, str(f_d): cap},
+            "decode_load_concurrency": load,
+            "decode_j_per_token": ok,
+            "b_star_concurrency": {str(f_d): sequences},
+            "b_star_running": sequences,
+            "kv_wall": cap["limit"] == "kv",
+            "kv_capacity_tokens": capacity,
+            "decode_window_s": self.s.decode_window_s,
+            "decode_clock_repeats": self.s.decode_clock_repeats,
+        }
+        self.log.write({"event": "locator_decode_model", **evidence})
+        return f_d, sequences, cap["limit"] == "kv", evidence
+
+    async def decode_count(self, hw: Hardware, prefill_mhz: int) -> tuple[int, int, bool, dict]:
         """-> (decode clock, B*, KV wall?, evidence).
 
         P runs at its ceiling so it does not limit D concurrency. B* is searched at
@@ -1077,6 +1248,8 @@ class TierLocator:
             decode_max_running=b_star,
             decode_kv_limit=self.s.decode_kv_limit,
             decode_wall=wall,
+            decode_length=d_evidence.get("length_model"),
+            decode_kv_tokens=d_evidence.get("kv_capacity_tokens"),
             published_at=time.time(),
             evidence=dict(self.run.evidence),
         )

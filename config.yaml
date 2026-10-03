@@ -197,7 +197,11 @@ canary:
     limited_fraction_max: 0.3 # skip clocks power/thermal-limited > 30 % of busy time
     decode_probe_concurrency: 16
     decode_start_concurrency: 8
-    decode_load_fraction: 0.7 # choose the D clock at 0.7 B*
+    decode_load_fraction: 0.7 # choose the D clock at 0.7 of D's capacity (B*)
+    decode_model: length      # length: TPOT = alpha + beta X + gamma K per D clock
+                              # (X sequences, K their context tokens); count: B* search
+    decode_fit_fill: 0.6      # length fit: highest window concurrency fills 60 % of KV
+    decode_fit_max_concurrency: 64
     decode_wall_tolerance: 0.25
     decode_kv_limit: 0.90
     decode_window_s: 60       # closed windows: several requests per worker (r4 used 20 s)

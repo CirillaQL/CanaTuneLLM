@@ -8,6 +8,7 @@ power cap at ~2040 MHz, busy and idle power as measured), M/D/1 queueing plus a
 """
 
 import asyncio
+import dataclasses
 import math
 import random
 
@@ -580,3 +581,93 @@ def test_verify_uses_packed_peak_rate_and_failed_window_caps_the_point():
     assert table.evidence["model"]["caps"][table.h.key()] == 2.0
     assert not scheduler.verified
     assert not controller.solver().evaluate(2.0, [(PROMPT, 64)], 1, table.h).feasible
+
+
+class LengthBackend(SurrogateBackend):
+    """Surrogate D with a length model: TPOT = alpha(f) + beta X + gamma(f) K, a KV
+    cache of 33648 tokens; probe prompts give 300 (short), 1000 (all) and 1700
+    (long) context tokens per sequence."""
+
+    KV = 33648
+    CONTEXT = {"all": 1000.0, "short": 300.0, "long": 1700.0}
+
+    async def kv_capacity(self):
+        return self.KV
+
+    def mix_context(self, mix="all"):
+        return self.CONTEXT[mix]
+
+    @staticmethod
+    def tpot(f, x, k):
+        return 55 * (1050 / f) ** 0.15 + 0.4 * x + 8e-4 * (1050 / f) ** 0.3 * k
+
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+        w = await super().closed_window(clock, concurrency, seconds, rep)
+        f, context = clock.decode_mhz, self.CONTEXT[mix]
+        full = concurrency * context > 0.95 * self.KV
+        points = []
+        for _ in range(max(6, 3 * concurrency)):
+            x = concurrency * (1 + self.rng.uniform(-0.1, 0.1))
+            k = x * context * (1 + self.rng.uniform(-0.2, 0.2))
+            points.append((x, k, self.tpot(f, x, k) * (1 + self.rng.gauss(0, 0.01))))
+        tpots = sorted(p[2] for p in points)
+        return dataclasses.replace(
+            w,
+            tpot_p95_ms=tpots[int(0.95 * (len(tpots) - 1))] * (1.6 if full else 1.0),
+            tpot_p50_ms=tpots[len(tpots) // 2],
+            decode_preemptions=5.0 if full else 0.0,
+            decode_waiting_max=3.0 if full else 0.0,
+            decode_points=points,
+        )
+
+
+def test_length_model_is_fitted_at_the_top_and_the_chosen_d_clock() -> None:
+    backend = LengthBackend(seed=3)
+    table = asyncio.run(TierLocator(backend, settings()).locate(PROMPT, [128, 512, 1024, 2048]))
+    d = table.evidence["decode"]
+    assert d["decode_model"] == "length" and table.decode_kv_tokens == LengthBackend.KV
+    f_d = next(iter(d["b_star_concurrency"]))  # the chosen D clock
+    assert set(table.decode_length) == {"1500", f_d}
+    alpha, beta, gamma, r95 = table.decode_length["1500"]
+    assert alpha == pytest.approx(55 * (1050 / 1500) ** 0.15, rel=0.05)
+    assert beta == pytest.approx(0.4, rel=0.25)
+    assert gamma == pytest.approx(8e-4 * (1050 / 1500) ** 0.3, rel=0.15)
+    # 200 ms TPOT: the KV wall binds at 1000 context tokens (0.9 x 33648 / 1000 = 30)
+    assert table.decode_wall and table.decode_max_running == 30
+    assert d["capacity"][f_d]["limit"] == "kv"
+
+
+def test_tight_tpot_slo_makes_the_model_tpot_bound() -> None:
+    backend = LengthBackend(seed=4)
+    locator = TierLocator(backend, settings(tpot_slo_ms=80.0))
+    table = asyncio.run(locator.locate(PROMPT, [128, 512, 1024, 2048]))
+    d = table.evidence["decode"]
+    f_d = next(iter(d["b_star_concurrency"]))
+    assert not table.decode_wall and d["capacity"][f_d]["limit"] == "tpot"
+    assert table.decode_max_running < 30
+
+
+def test_infeasible_tpot_slo_is_reported_as_such() -> None:
+    locator = TierLocator(LengthBackend(seed=5), settings(tpot_slo_ms=50.0))
+    with pytest.raises(LocatorError, match="infeasible"):
+        asyncio.run(locator.locate(PROMPT, [128, 512, 1024, 2048]))
+
+
+def test_count_model_remains_selectable() -> None:
+    backend = LengthBackend(seed=6)
+    table = asyncio.run(
+        TierLocator(backend, settings(decode_model="count")).locate(PROMPT, [128, 512, 1024])
+    )
+    assert table.decode_length is None and "decode_model" not in table.evidence["decode"]
+
+
+def test_length_model_without_d_telemetry_falls_back_to_the_count_model() -> None:
+    class NoTelemetry(LengthBackend):
+        async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+            w = await super().closed_window(clock, concurrency, seconds, rep, mix)
+            return dataclasses.replace(w, decode_points=[])
+
+    table = asyncio.run(
+        TierLocator(NoTelemetry(seed=7), settings()).locate(PROMPT, [128, 512, 1024, 2048])
+    )
+    assert table.decode_length is None and table.decode_max_running > 0

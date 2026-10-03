@@ -13,8 +13,9 @@ With a published table, for each routable group the Router checks
   violation risk of that predicted slack; `cells` (v1) looks up the risk table
   cell (clock point, queue, prompt bucket, D busy),
 and admits to the most loaded feasible group (concentration keeps batches large).
-B* is a clean-window SLO bound, not a hardware concurrency limit: best-effort
-uses it only to warn, counting D work rather than requests still pre-filling.
+D's SLO bound is the Canary's length model (TPOT = alpha + beta X + gamma K + r95
+over the sequences on D and the context tokens they hold, plus the KV wall); the
+count bound B* remains for tables without it. Best-effort uses either only to warn.
 Legacy reject/serve policies retain their original calibrated admission ceiling.
 With `best_effort` (default), prediction warns but does not force a clock change.
 Actual production feedback confirms pressure, measured capacity guides expansion,
@@ -49,7 +50,7 @@ from canatune.domain.admission import (
 )
 from canatune.domain.groups import Group, TierState
 from canatune.domain.load import LengthStats
-from canatune.domain.models import interpolate
+from canatune.domain.models import decode_coef, decode_tpot, interpolate
 from canatune.domain.risk import Cell, RiskEstimate, RiskTable, is_violation
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import Telemetry
@@ -237,6 +238,9 @@ class CanaTuneRouter:
         self._applied_key: object = None
         self._costs = self._cost_book(None)
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
+        self._tpot_by_group: dict[str, float] = {}  # length-model TPOT bound per group
+        self._output_mean_at: float | None = None
+        self._output_mean_cached = 0.0
         self.full_effort = False
         self.pressure_event = asyncio.Event()
         self.risk_signals = 0
@@ -359,6 +363,43 @@ class CanaTuneRouter:
                 return busy, "decode_kv_wall"
         return busy, None
 
+    def _output_mean(self) -> float:
+        """Mean output tokens of recent production requests (the Canary's default
+        lengths before there are enough), refreshed at most once a second."""
+        now = self._clock()
+        if self.lengths is None:
+            return 0.0
+        if self._output_mean_at is None or now - self._output_mean_at >= 1.0:
+            self._output_mean_cached = self.lengths.summary().output_mean
+            self._output_mean_at = now
+        return self._output_mean_cached
+
+    def _decode_risk(self, group: Group, tokens: int, table: Any) -> str | None:
+        """Length-model check of D for one more request: the TPOT bound with every
+        sequence decoding there or on its way (requests still at P or in transfer
+        decode by the time this one does) and the context tokens they hold, this
+        request at its prompt plus half the mean output; and its KV at the end of
+        its output against the KV wall. Without a fresh D snapshot it does not warn
+        (the snapshot check already blocks a stale D)."""
+        coef = decode_coef(table.decode_length, group.effective.decode_mhz)
+        snapshot = (self.telemetry.fresh(group.decode, self.settings.snapshot_max_age_s)
+                    if self.telemetry is not None else None)
+        if coef is None or snapshot is None or snapshot.kv_usage is None:
+            return None
+        output = self._output_mean()
+        on_d = (snapshot.running or 0.0) + (snapshot.waiting or 0.0)
+        running = max(group.n_decoding, on_d) + group.n_await + 1
+        held = snapshot.kv_usage * (table.decode_kv_tokens or 0) + group.t_await
+        tpot = decode_tpot(coef, running, held + tokens + output / 2)
+        self._tpot_by_group[group.name] = tpot
+        if tpot > self.settings.tpot_slo_ms:
+            return "decode_tpot"
+        wall = table.decode_kv_limit
+        if table.decode_kv_tokens and wall is not None:
+            if held + tokens + output > wall * table.decode_kv_tokens:
+                return "decode_kv"
+        return None
+
     def candidates(
         self, tokens: int, waited_ms: float = 0.0
     ) -> list[tuple[Group, Cell, RiskEstimate | None, bool]]:
@@ -367,6 +408,7 @@ class CanaTuneRouter:
         is what remains of the TTFT budget after `waited_ms` and the prediction."""
         out = []
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
+        self._tpot_by_group: dict[str, float] = {}
         self._within_limits: list[tuple[Group, Cell, bool]] = []
         for group in self.groups:
             if not group.routable:
@@ -388,7 +430,12 @@ class CanaTuneRouter:
                 continue
             self._within_limits.append((group, cell, d_busy))
             tier_table = self.tiers.table
-            if (self.settings.overload == "best_effort" and tier_table is not None
+            length_model = tier_table is not None and bool(tier_table.decode_length)
+            if self.settings.overload == "best_effort" and length_model:
+                if self._decode_risk(group, tokens, tier_table) is not None:
+                    self._slack_by_group[group.name] = (x, predicted, None)
+                    continue  # warn, but remains eligible for best-effort dispatch
+            elif (self.settings.overload == "best_effort" and tier_table is not None
                     and tier_table.decode_max_running is not None):
                 # P requests are not running D sequences. Telemetry covers D's
                 # own queue; stage reservations cover unobserved running work.
@@ -400,7 +447,7 @@ class CanaTuneRouter:
                     self._slack_by_group[group.name] = (x, predicted, None)
                     continue  # warn, but remains eligible for best-effort dispatch
             model = self.tiers.model_json()
-            if model and self.settings.overload == "best_effort":
+            if model and self.settings.overload == "best_effort" and not length_model:
                 decode = model.get("decode") or {}
                 f = group.effective.decode_mhz
                 alpha = interpolate({int(k): v[0] for k, v in decode.items()}, f) or 0
@@ -512,6 +559,8 @@ class CanaTuneRouter:
                 "inflight_mb": round(group.inflight_bytes / 1e6, 1),
                 "n_decoding": group.n_decoding,
                 "predicted_ms": None if predicted is None else round(predicted, 1),
+                "tpot_bound_ms": (None if group.name not in self._tpot_by_group
+                                  else round(self._tpot_by_group[group.name], 1)),
             },
             s_own_ms=s_own,
             features=tuple(x),

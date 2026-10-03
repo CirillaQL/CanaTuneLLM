@@ -68,6 +68,8 @@ class ProbeOutcome:
     at_prefill: tuple[int, ...] = ()  # prompt lengths of probes still at P
     inflight_tokens: int = 0  # prompt tokens between P's return and first token
     decoding_at_send: int = 0
+    first_token_at: float | None = None  # monotonic, for D's state while it decoded
+    last_token_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,7 @@ class CanaryProbe:
         self._at_prefill: dict[int, int] = {}  # probe id -> prompt tokens
         self._inflight_tokens = 0
         self._ids = 0
+        self._kv_tokens: int | None = None  # D's KV cache size (closed windows read it)
         self.service_source = "http"  # how service_times measured prefill ("metrics" or "http")
 
     async def quiesce(self) -> None:
@@ -304,6 +307,8 @@ class CanaryProbe:
             at_prefill,
             inflight,
             decoding_now,
+            timer.token_times[0] if timer.token_times else None,
+            timer.token_times[-1] if timer.token_times else None,
         )
         return outcome
 
@@ -324,6 +329,25 @@ class CanaryProbe:
     def set_prompt_limit(self, max_prompt: int | None) -> float:
         self.prompt_limit = max_prompt
         return self.lengths.mean_prompt(max_prompt)
+
+    def _mix_prompts(self, mix: str) -> list[int]:
+        """Prompt lengths of a closed-window mix: "all" the current distribution,
+        "short" / "long" its lower and upper half by prompt length (the length model
+        needs windows whose context per sequence differs at the same concurrency)."""
+        prompts = sorted(p for p, _ in self.lengths.pairs_upto(self.prompt_limit))
+        if mix == "all":
+            return prompts
+        if mix == "short":
+            return prompts[: (len(prompts) + 1) // 2]
+        if mix == "long":
+            return prompts[len(prompts) // 2 :]
+        raise ValueError(f"unknown prompt mix {mix!r}")
+
+    def mix_context(self, mix: str = "all") -> float:
+        """Mean context (tokens) a closed-window sequence of this mix holds while it
+        decodes: its prompt plus half of the fixed output."""
+        prompts = self._mix_prompts(mix)
+        return sum(prompts) / len(prompts) + self.s.decode_output_tokens / 2
 
     async def service_times(
         self, clock: ClockPoint, prompts: Sequence[int]
@@ -419,6 +443,7 @@ class CanaryProbe:
                 0.0, (decode_snaps[-1].preemptions_total or 0.0) - decode_snaps[0].preemptions_total
             )
         tokens = sum(o.output_tokens for o in ok)
+        points = decode_points(ok, decode_snaps, self._kv_tokens)
         if decode_tokens is not None and decode_tokens > 0:
             tokens = decode_tokens  # D's own count (includes tokens of cut-off requests)
         return WindowResult(
@@ -445,6 +470,7 @@ class CanaryProbe:
             decode_busy_fraction=sum(x > 0 for x in running) / len(running) if running else None,
             decode_running_mean=sum(running) / len(running) if running else None,
             tpot_p50_ms=tpots[len(tpots) // 2] if tpots else None,
+            decode_points=points,
         )
 
     async def open_window(
@@ -512,18 +538,21 @@ class CanaryProbe:
         )
 
     async def closed_window(
-        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0
+        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0, mix: str = "all"
     ) -> WindowResult:
         """`concurrency` workers loop over requests until `seconds` pass. Starts are
         spread over decode_stagger_s so D reaches a steady mix rather than one wave;
-        prompt lengths come from a trace fixed by (concurrency, rep), so every clock
-        decodes the same work."""
+        prompt lengths come from a trace fixed by (concurrency, rep, mix), so every
+        clock decodes the same work."""
         await self.lock(clock)
+        if self._kv_tokens is None:
+            self._kv_tokens = await self.kv_capacity()
         outcomes: list[ProbeOutcome] = []
         stop_sampling = asyncio.Event()
         samples: list = []
         violations = 0
-        trace = random.Random(self.s.seed * 7_919 + concurrency * 101 + rep)
+        salt = {"all": 0, "short": 1, "long": 2}[mix]
+        trace = random.Random(self.s.seed * 7_919 + concurrency * 101 + rep + 1_000_003 * salt)
         stagger = min(self.s.decode_stagger_s, seconds / 3)
         async with self.client_factory() as client:
             tokens_before = await self._counter(client, self.decode, GENERATION_TOKENS)
@@ -548,6 +577,9 @@ class CanaryProbe:
                 p
                 for p, _ in self.lengths.sample(trace, concurrency * per_worker, self.prompt_limit)
             ]
+            if mix != "all":  # the same count, drawn from one half of the distribution
+                pool = self._mix_prompts(mix)
+                lengths = [pool[trace.randrange(len(pool))] for _ in lengths]
             workers = [
                 asyncio.create_task(worker(i, lengths[i * per_worker : (i + 1) * per_worker]))
                 for i in range(concurrency)
@@ -566,6 +598,32 @@ class CanaryProbe:
         return self._result(
             clock, "closed", concurrency, outcomes, samples, violations, False, generated
         )
+
+
+def decode_points(
+    outcomes: Sequence[ProbeOutcome], snapshots: Sequence[Any], kv_tokens: int | None
+) -> list[tuple[float, float, float]]:
+    """(mean running sequences, mean KV tokens held, TPOT ms) on D over each
+    request's own decode interval: the length model's samples. Needs D's KV size
+    and at least two distinct D snapshots inside the interval."""
+    if not kv_tokens:
+        return []
+    seen: dict[float, Any] = {}
+    for snap in snapshots:
+        if snap.running is not None and snap.kv_usage is not None:
+            seen[snap.taken_at] = snap
+    ordered = sorted(seen.items())
+    points = []
+    for o in outcomes:
+        if o.tpot_ms is None or o.first_token_at is None or o.last_token_at is None:
+            continue
+        inside = [s for t, s in ordered if o.first_token_at <= t <= o.last_token_at]
+        if len(inside) < 2:
+            continue
+        running = sum(s.running for s in inside) / len(inside)
+        kv = sum(s.kv_usage for s in inside) / len(inside) * kv_tokens
+        points.append((running, kv, o.tpot_ms))
+    return points
 
 
 def _diff(before: float | None, after: float | None) -> float | None:
