@@ -957,14 +957,24 @@ def replay_trace(run_dir: Path) -> tuple[dict, list]:
     return {"phases": phases, "duration_s": phases[-1]["end_s"]}, arrivals
 
 
-def synthetic_trace(run_dir: Path, rates, stage_s: float, gap_s: float, seed: int):
-    """Poisson stages at other rates with the run's own (prompt, output) pairs."""
+def run_pairs(run_dir: Path) -> list[tuple[int, int]]:
+    """(prompt, output) tokens of a run's benchmark requests."""
     pairs = []
     for st in json.loads((run_dir / "bench_plan.json").read_text())["stages"]:
         path = run_dir / "stages" / st["name"] / "bench.json"
         if path.exists():
             b = json.loads(path.read_text())
             pairs += [(int(i), int(o)) for i, o in zip(b["input_lens"], b["output_lens"]) if o >= 1]
+    return pairs
+
+
+def synthetic_trace(run_dir: Path, rates, stage_s: float, gap_s: float, seed: int):
+    """Poisson stages at other rates with the run's own (prompt, output) pairs."""
+    return pairs_trace(run_pairs(run_dir), rates, stage_s, gap_s, seed)
+
+
+def pairs_trace(pairs, rates, stage_s: float, gap_s: float, seed: int):
+    """Poisson stages at `rates`, (prompt, output) drawn from `pairs`."""
     rng = random.Random(seed)
     rows, phases, t = [], [], 0.0
     for k, rate in enumerate(rates):
@@ -980,6 +990,66 @@ def synthetic_trace(run_dir: Path, rates, stage_s: float, gap_s: float, seed: in
     return {"phases": phases, "duration_s": phases[-1]["end_s"]}, arrivals
 
 
+# ---- BurstGPT (Azure OpenAI traces: timestamp, model, request / response tokens) ----
+
+
+def burstgpt_rows(paths, model: str, max_len: int):
+    """-> (timestamps s, prompt tokens, output tokens) of the requests that returned
+    tokens and fit max_len, for model "GPT-4", "ChatGPT" or "all"; also the dropped
+    share (too long). Parts 1, 2, ... share one clock (part 2 continues part 1)."""
+    import csv
+
+    import numpy as np
+
+    t, prompt, output = [], [], []
+    long = kept = 0
+    for path in paths:
+        with open(path, newline="") as handle:
+            for row in csv.DictReader(handle):
+                ts = float(row["Timestamp"])
+                if model != "all" and row["Model"] != model:
+                    continue
+                n_in, n_out = int(row["Request tokens"]), int(row["Response tokens"])
+                if n_out <= 0:
+                    continue
+                if n_in + n_out > max_len:
+                    long += 1
+                    continue
+                kept += 1
+                t.append(ts)
+                prompt.append(n_in)
+                output.append(n_out)
+    order = np.argsort(np.array(t), kind="stable")
+    return (np.array(t)[order], np.array(prompt)[order], np.array(output)[order],
+            long / max(long + kept, 1))  # fmt: skip
+
+
+def burstgpt_window_trace(t, prompt, output, hours: float, rate: float | None, segment_s: float):
+    """The busiest `hours` of the trace, replayed with its own arrival times, time
+    compressed to a mean `rate` (None: real time); phases of `segment_s` simulated
+    seconds."""
+    import numpy as np
+
+    span = hours * 3600.0
+    starts = np.arange(t.min(), t.max() - span + 1, 600.0)  # 10-minute steps
+    counts = np.searchsorted(t, starts + span) - np.searchsorted(t, starts)
+    s0 = float(starts[int(np.argmax(counts))])
+    sel = (t >= s0) & (t < s0 + span)
+    natural = sel.sum() / span
+    speed = 1.0 if rate is None else rate / natural
+    at = (t[sel] - s0) / speed
+    dur = span / speed
+    n_seg = max(1, int(np.ceil(dur / segment_s)))
+    phases = [{"name": f"w{k:02d}", "start_s": k * segment_s,
+               "end_s": min(dur, (k + 1) * segment_s)} for k in range(n_seg)]  # fmt: skip
+    rows = [(float(a), phases[min(int(a // segment_s), n_seg - 1)]["name"], int(p), int(o))
+            for a, p, o in zip(at, prompt[sel], output[sel])]  # fmt: skip
+    arrivals = [loadgen.Arrival(i, *row) for i, row in enumerate(rows)]
+    info = {"window_start_s": s0, "requests": int(sel.sum()), "natural_rps": float(natural),
+            "speed": float(speed), "duration_s": float(dur)}  # fmt: skip
+    return {"phases": phases, "duration_s": dur, "window": info}, arrivals
+
+
 def measured_stages(run_dir: Path) -> dict:
     path = run_dir / "bench_summary.json"
     return json.loads(path.read_text())["stages"] if path.exists() else {}
@@ -990,7 +1060,23 @@ def run_replay(args) -> int:
     the job), then CanaTune best effort and the baseline on the same arrivals."""
     phys = PHYSICS[args.physics]
     job = args.replay
-    if args.rates:
+    if args.burstgpt:
+        t, prompt, output, dropped = burstgpt_rows(
+            [Path(p) for p in args.burstgpt.split(",")], args.bgpt_model, args.max_len
+        )
+        print(f"BurstGPT {args.bgpt_model}: {len(t)} requests (dropped {dropped:.2%} longer"
+              f" than {args.max_len}); prompt mean {prompt.mean():.0f},"
+              f" output mean {output.mean():.0f}")  # fmt: skip
+        if args.bgpt_hours:
+            meta, arrivals = burstgpt_window_trace(
+                t, prompt, output, args.bgpt_hours, args.bgpt_rate, args.segment_s
+            )
+            print(f"window: {meta['window']}")
+        else:
+            rates = [float(x) for x in (args.rates or "1,2,4").split(",")]
+            meta, arrivals = pairs_trace(list(zip(prompt.tolist(), output.tolist())), rates,
+                                         180.0, 30.0, args.seed)  # fmt: skip
+    elif args.rates:
         rates = [float(x) for x in args.rates.split(",")]
         meta, arrivals = synthetic_trace(job / "cantune", rates, 180.0, 30.0, args.seed)
     else:
@@ -1015,8 +1101,8 @@ def run_replay(args) -> int:
         if args.out is not None:
             args.out.mkdir(parents=True, exist_ok=True)
             (args.out / f"replay_{policy}.json").write_text(json.dumps(results[policy], indent=1))
-    measured = {"best_effort": measured_stages(job / "cantune"),
-                "baseline": measured_stages(job / "baseline")}  # fmt: skip
+    measured = {} if job is None else {"best_effort": measured_stages(job / "cantune"),
+                                       "baseline": measured_stages(job / "baseline")}  # fmt: skip
     keys = ("goodput", "ttft_p50", "ttft_p95", "tpot_p50", "tpot_p95", "energy_kj")
     real_keys = ("goodput", "ttft_p50_ms", "ttft_p95_ms", "tpot_p50_ms", "tpot_p95_ms", "energy_j")
     print(f"SLO {TTFT_SLO_MS:.0f} / {TPOT_SLO_MS:.0f} ms; sim | measured")
@@ -1035,8 +1121,16 @@ def run_replay(args) -> int:
         print("energy vs baseline (sim | measured):")
         for ph in [p["name"] for p in meta["phases"]]:
             sim_e = [results[k][ph].get("energy_kj") for k in ("best_effort", "baseline")]
-            real_e = [measured[k].get(ph, {}).get("energy_j") for k in ("best_effort", "baseline")]
+            real_e = [measured.get(k, {}).get(ph, {}).get("energy_j")
+                      for k in ("best_effort", "baseline")]  # fmt: skip
             print(f"  {ph:>11}  {_ratio(*sim_e)} | {_ratio(*real_e)}")
+        totals = {k: sum(results[k][p["name"]].get("energy_kj") or 0 for p in meta["phases"])
+                  for k in ("best_effort", "baseline")}  # fmt: skip
+        good = {k: results[k]["total"]["goodput"] for k in ("best_effort", "baseline")}
+        modes = [(c["t"], c["mode"], c.get("reason"))
+                 for c in results["best_effort"].get("control", [])]  # fmt: skip
+        print(f"total: energy {_ratio(totals['best_effort'], totals['baseline'])}, goodput"
+              f" {good['best_effort']:.3f} vs {good['baseline']:.3f}; Controller: {modes[:12]}")
     return 0
 
 
@@ -1101,13 +1195,21 @@ def main() -> int:
     ap.add_argument("--output-cap", type=int, default=256, help="replay: canary.max_output_tokens")
     ap.add_argument("--config", action="append", default=[], help="dotted.key=value (JSON value)")
     ap.add_argument("--rates", default=None, help="replay: Poisson stages at these req/s instead")
+    ap.add_argument("--burstgpt", default=None, help="BurstGPT CSV(s), comma separated, in order")
+    ap.add_argument("--bgpt-model", default="GPT-4", choices=("GPT-4", "ChatGPT", "all"))
+    ap.add_argument("--bgpt-hours", type=float, default=None,
+                    help="replay the busiest window of this many hours (else Poisson --rates)")
+    ap.add_argument("--bgpt-rate", type=float, default=None,
+                    help="window: compress time to this mean req/s (default: real time)")
+    ap.add_argument("--segment-s", type=float, default=120.0, help="window: phase length")
+    ap.add_argument("--max-len", type=int, default=4096, help="model max length (prompt+output)")
     args = ap.parse_args()
     for item in args.config:
         key, value = item.split("=", 1)
         CONFIG_OVERRIDES[key] = json.loads(value)
     if args.slo:
         configure_slo(*(float(x) for x in args.slo.split(",")))
-    if args.replay is not None:
+    if args.replay is not None or args.burstgpt:
         args.groups = args.groups or 3
         if args.policies == "baseline,reject,serve_dispatch,serve":
             args.policies = "baseline,best_effort"
