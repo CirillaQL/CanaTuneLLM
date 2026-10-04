@@ -92,6 +92,7 @@ class RouterSettings:
     # concentrate: the busiest safe P).
     pairing: str = "fixed"
     kv_growth: bool = True  # KV-wall check counts the growth of sequences (ablation: False)
+    d_balance_modes: tuple[str, ...] = ("confirming", "expanding", "full_effort")
     d_choice: str = "concentrate"
     p_choice: str = "balance"
 
@@ -122,6 +123,7 @@ class RouterSettings:
             backfill_slack_ms=_auto_ms(raw, "backfill_slack_ms"),
             pairing=_choice(raw, "pairing", ("fixed", "dynamic"), "fixed"),
             kv_growth=bool(raw.get("kv_growth", True)),
+            d_balance_modes=_modes(raw),
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
         )
@@ -129,6 +131,14 @@ class RouterSettings:
 
 def _admission(raw: Mapping[str, Any]) -> str:
     return _choice(raw, "admission", ("slack", "cells"), "slack")
+
+
+def _modes(raw: Mapping[str, Any]) -> tuple[str, ...]:
+    known = ("energy", "warning", "confirming", "expanding", "full_effort")
+    value = raw.get("d_balance_modes", ["confirming", "expanding", "full_effort"])
+    if not isinstance(value, (list, tuple)) or any(m not in known for m in value):
+        raise RouterConfigError(f"router.d_balance_modes must be a list of {', '.join(known)}")
+    return tuple(value)
 
 
 def _auto_ms(raw: Mapping[str, Any], key: str) -> float | None:
@@ -278,6 +288,10 @@ class CanaTuneRouter:
         self._output_mean_at: float | None = None
         self._output_mean_cached = 0.0
         self.full_effort = False
+        # The Controller's mode: dynamic pairing balances D once production pressure
+        # is being confirmed or answered (d_balance_modes), concentration then makes
+        # hot spots rather than saving energy.
+        self.control_mode = "energy"
         self.pressure_event = asyncio.Event()
         self.risk_signals = 0
         self._signalled: set[int] = set()
@@ -558,7 +572,8 @@ class CanaTuneRouter:
             return min(feasible, key=lambda item: (d_load(item[0].d), item[0].p.pending_ms,
                                                    item[0].p.n_at_p, item[0].canary))
         ds = {id(item[0].d): item[0].d for item in feasible}.values()
-        if self.settings.d_choice == "concentrate":
+        balance_d = self.control_mode in self.settings.d_balance_modes
+        if self.settings.d_choice == "concentrate" and not balance_d:
             # The most loaded D among the safe ones; production before Canary.
             d = max(ds, key=lambda g: (d_load(g), not g.canary, -index(g)))
         else:

@@ -1254,3 +1254,19 @@ def test_dynamic_pairing_skips_a_group_the_canary_explores():
     ticket = router.try_admit(128, True)
     assert ticket.group is busy and ticket.dgroup is busy
     assert all(idle not in (r.p, r.d) for r in router.routes())
+
+
+def test_dynamic_pairing_balances_d_once_pressure_is_confirmed():
+    router, busy, idle = dynamic_router()
+    router.control_mode = "full_effort"  # set by the Controller with its mode
+    ticket = router.try_admit(128, True)
+    assert ticket.dgroup is idle and ticket.group is idle  # hot spot avoided on both sides
+    router, busy, idle = dynamic_router()
+    router.control_mode = "warning"  # a prediction alone keeps concentrating
+    assert router.try_admit(128, True).dgroup is busy
+
+
+def test_controller_mode_reaches_the_router():
+    _, _, _, _, router, controller, _ = setup(table=published())
+    controller._mode("confirming", "test")
+    assert router.control_mode == "confirming"

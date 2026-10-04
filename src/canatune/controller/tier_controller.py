@@ -349,7 +349,7 @@ class TierController:
     def _mode(self, mode: str, reason: str) -> None:
         if self.mode != mode:
             previous = self.mode
-            self.mode = mode
+            self.mode = self.router.control_mode = mode
             if mode in ("expanding", "full_effort") or previous in ("expanding", "full_effort"):
                 self._target = self._target_since = None  # resources changed, target must re-settle
             self.log.write({"event": "control_mode", "mode": mode, "reason": reason})
