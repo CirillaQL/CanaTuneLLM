@@ -153,3 +153,61 @@ def test_a_hung_benchmark_is_stopped_and_ends_the_run(tmp_path) -> None:
         )
     )  # fmt: skip
     assert len(stages) == 1 and stages[0][3] == -9 and stages[0][2] is None
+
+
+def test_workloads_run_in_turn_with_their_own_datasets_and_rates(tmp_path) -> None:
+    workloads = json.dumps([
+        {"name": "sharegpt", "dataset": "/d/sg.json", "rates": "1,2"},
+        {"name": "burstgpt", "dataset": "/d/bg.jsonl", "dataset_name": "custom",
+         "rates": [0.5], "ignore_eos": True, "output_len": None},
+    ])  # fmt: skip
+    s = bench.BenchSettings.from_env({
+        "BENCH_WORKLOADS": workloads, "BENCH_OUTPUT_LEN": "256", "BENCH_IGNORE_EOS": "0",
+        "BENCH_STAGE_S": "10", "MODEL_PATH": "/m", "BENCH_SCORE_SLOS": "600:65,1000:100",
+    })  # fmt: skip
+    assert [(st.name, st.num_prompts) for st in s.stages()] == [
+        ("sharegpt_r0_1rps", 10), ("sharegpt_r1_2rps", 20), ("burstgpt_r0_0.5rps", 5)
+    ]  # fmt: skip
+    assert s.score_slos == ((600.0, 65.0), (1000.0, 100.0))
+    (sg, stage), (bg, bstage) = s.plan()[0], s.plan()[2]
+    kw = dict(base_url="u", model="m", result_dir=Path("/r"), ttft_slo_ms=600, tpot_slo_ms=65)
+    cmd = " ".join(bench.bench_command(sg, stage, **kw))
+    assert "--dataset-name sharegpt --dataset-path /d/sg.json" in cmd
+    assert "--sharegpt-output-len 256" in cmd and "--ignore-eos" not in cmd
+    cmd = bench.bench_command(bg, bstage, **kw)
+    joined = " ".join(cmd)
+    assert "--dataset-name custom --dataset-path /d/bg.jsonl" in joined
+    assert "--custom-output-len -1" in joined and "--sharegpt-output-len" not in joined
+    assert {"--ignore-eos", "--skip-chat-template", "--disable-shuffle"} <= set(cmd)
+    with pytest.raises(SystemExit):
+        bench.BenchSettings.from_env({"BENCH_WORKLOADS": '[{"name": "a"}]'})
+    with pytest.raises(SystemExit):
+        bench.BenchSettings.from_env({})
+
+
+def test_a_failed_stage_skips_only_the_rest_of_its_workload(tmp_path) -> None:
+    fake = tmp_path / "fake_bench.py"
+    fake.write_text(FAKE_BENCH.replace("args = sys.argv[1:]",
+                    "args = sys.argv[1:]\nif 'bad' in args: sys.exit(3)"))  # fmt: skip
+    workloads = json.dumps([
+        {"name": "a", "dataset": "bad", "rates": "1,2"},
+        {"name": "b", "dataset": "good", "rates": "1"},
+    ])  # fmt: skip
+    s = bench.BenchSettings.from_env({
+        "BENCH_WORKLOADS": workloads, "BENCH_CMD": f"{sys.executable} {fake}",
+        "BENCH_STAGE_S": "4", "BENCH_GAP_S": "0", "BENCH_SCORE_SLOS": "1000:100,200:50",
+    })  # fmt: skip
+    stages, finished = asyncio.run(
+        bench.run_stages(
+            s, base_url="u", model="m", out=tmp_path, agents=[], state_poll=False,
+            ttft_slo_ms=1000, tpot_slo_ms=200,
+        )
+    )  # fmt: skip
+    assert [(st.name, code) for st, _, _, code in stages] == [("a_r0_1rps", 3), ("b_r0_1rps", 0)]
+    summary = bench.summarize(
+        tmp_path, stages, finished, {}, ttft_slo_ms=1000, tpot_slo_ms=200,
+        score_slos=s.score_slos,
+    )  # fmt: skip
+    b = summary["stages"]["b_r0_1rps"]
+    assert b["workload"] == "b" and b["good"] == 3
+    assert b["by_slo"]["1000/100"]["good"] == 3 and b["by_slo"]["200/50"]["good"] == 0

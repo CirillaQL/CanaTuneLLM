@@ -8,7 +8,8 @@ The service starts as in smoke_production.py (BENCH_MODE):
             no calibration
   baseline  the `round_robin` policy, clocks left to the driver
 Then `vllm bench serve` runs once per request rate (BENCH_RATES) against the proxy,
-with the same dataset sample (fixed seed) in every mode, while the node agents'
+with the same dataset sample (fixed seed) in every mode (BENCH_WORKLOADS: several
+datasets in turn, each with its own rates, in one service lifetime), while the node agents'
 NVML energy counters of every GPU and (cantune/static) the service state are read
 every second. A stage's energy window is the benchmark itself: from its first
 request to its end (vllm's `duration`), not the dataset loading before it.
@@ -16,7 +17,10 @@ request to its end (vllm's `duration`), not the dataset loading before it.
 Environment: everything `canatune.controller.process_controller` needs, plus
   BENCH_OUT          directory for the results (required)
   BENCH_MODE         cantune | static | baseline
-  BENCH_DATASET      the ShareGPT json (required)
+  BENCH_DATASET      the dataset file (required unless BENCH_WORKLOADS)
+  BENCH_DATASET_NAME sharegpt (default) or custom (jsonl of prompt + output_tokens, as
+                     make_burstgpt_dataset.py writes: output lengths from the file, no
+                     chat template)
   BENCH_RATES        request rates in req/s, comma separated (default 1,2,4)
   BENCH_STAGE_S      seconds of arrivals per rate: num_prompts = rate x this (default 180)
   BENCH_GAP_S        idle seconds after each stage (default 30)
@@ -31,6 +35,12 @@ Environment: everything `canatune.controller.process_controller` needs, plus
   BENCH_STAGE_TIMEOUT_S  a stage taking longer is stopped and ends the run
                      (default: 3 x BENCH_STAGE_S + 600)
   BENCH_DEADLINE_S   cantune: seconds to wait for the publish (default 3000)
+  BENCH_WORKLOADS    JSON list of workloads run in turn, each {"name", "dataset", and
+                     optionally "dataset_name", "rates", "output_len", "ignore_eos"},
+                     the rest from the variables above; stages are named <name>_r<i>_..
+                     and a failed stage skips the rest of its workload only
+  BENCH_SCORE_SLOS   more SLOs to score every stage against, "ttft:tpot,..." in ms
+                     (by_slo in the summary; e.g. one baseline run for several SLOs)
 
 Exit status: 0 done, 2 no table before the deadline, 3 the service stopped early,
 4 the service never became ready, 5 calibration kept failing, 6 a benchmark failed.
@@ -46,7 +56,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +80,7 @@ class Stage:
     name: str
     rate_rps: float
     num_prompts: int
+    workload: str = ""
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,10 @@ class BenchSettings:
     command: tuple[str, ...] = ("vllm", "bench", "serve")
     extra_args: tuple[str, ...] = ()
     stage_timeout_s: float | None = None
+    dataset_name: str = "sharegpt"
+    name: str = ""
+    workloads: tuple["BenchSettings", ...] = ()
+    score_slos: tuple[tuple[float, float], ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "BenchSettings":
@@ -97,8 +112,8 @@ class BenchSettings:
         if endpoint not in ("/v1/completions", "/v1/chat/completions"):
             raise SystemExit("BENCH_ENDPOINT must be /v1/completions or /v1/chat/completions")
         output = env.get("BENCH_OUTPUT_LEN")
-        return cls(
-            dataset=env["BENCH_DATASET"],
+        base = cls(
+            dataset=env.get("BENCH_DATASET", ""),
             rates=rates,
             stage_s=float(env.get("BENCH_STAGE_S", "180")),
             gap_s=float(env.get("BENCH_GAP_S", "30")),
@@ -113,13 +128,55 @@ class BenchSettings:
             stage_timeout_s=(
                 float(env["BENCH_STAGE_TIMEOUT_S"]) if env.get("BENCH_STAGE_TIMEOUT_S") else None
             ),
+            dataset_name=env.get("BENCH_DATASET_NAME", "sharegpt"),
+            score_slos=tuple(
+                (float(t), float(p))
+                for t, p in (x.split(":") for x in env.get("BENCH_SCORE_SLOS", "").split(",") if x)
+            ),
         )
+        workloads = tuple(
+            replace(base, **_workload_fields(w))
+            for w in json.loads(env.get("BENCH_WORKLOADS") or "[]")
+        )
+        if len({w.name for w in workloads}) != len(workloads):
+            raise SystemExit("BENCH_WORKLOADS names must be distinct")
+        for w in (*workloads, base):
+            if w.dataset_name not in ("sharegpt", "custom"):
+                raise SystemExit("the dataset name must be sharegpt or custom")
+        if not workloads and not base.dataset:
+            raise SystemExit("BENCH_DATASET or BENCH_WORKLOADS is required")
+        return replace(base, workloads=workloads)
+
+    def plan(self) -> list[tuple["BenchSettings", Stage]]:
+        """-> (the workload's settings, stage) in run order."""
+        return [
+            (w, Stage(f"{w.name}_r{i}_{rate:g}rps" if w.name else f"r{i}_{rate:g}rps", rate,
+                      max(1, round(rate * w.stage_s)), w.name))
+            for w in (self.workloads or (self,))
+            for i, rate in enumerate(w.rates)
+        ]  # fmt: skip
 
     def stages(self) -> list[Stage]:
-        return [
-            Stage(f"r{i}_{rate:g}rps", rate, max(1, round(rate * self.stage_s)))
-            for i, rate in enumerate(self.rates)
-        ]
+        return [stage for _, stage in self.plan()]
+
+
+def _workload_fields(item: Mapping[str, Any]) -> dict[str, Any]:
+    if not item.get("name") or not item.get("dataset"):
+        raise SystemExit("every BENCH_WORKLOADS entry needs a name and a dataset")
+    fields: dict[str, Any] = {"name": str(item["name"]), "dataset": str(item["dataset"])}
+    if "dataset_name" in item:
+        fields["dataset_name"] = str(item["dataset_name"])
+    if "rates" in item:
+        rates = item["rates"]
+        rates = rates.split(",") if isinstance(rates, str) else rates
+        fields["rates"] = tuple(float(r) for r in rates)
+        if not fields["rates"] or any(r <= 0 for r in fields["rates"]):
+            raise SystemExit("workload rates must be positive request rates")
+    if "output_len" in item:
+        fields["output_len"] = int(item["output_len"]) if item["output_len"] else None
+    if "ignore_eos" in item:
+        fields["ignore_eos"] = bool(item["ignore_eos"])
+    return fields
 
 
 def bench_command(
@@ -141,7 +198,7 @@ def bench_command(
         "--base-url", base_url,
         "--endpoint", settings.endpoint,
         "--model", model,
-        "--dataset-name", "sharegpt",
+        "--dataset-name", settings.dataset_name,
         "--dataset-path", settings.dataset,
         "--num-prompts", str(stage.num_prompts),
         "--request-rate", f"{stage.rate_rps:g}",
@@ -158,7 +215,10 @@ def bench_command(
     ]  # fmt: skip
     if settings.tokenizer:
         cmd += ["--tokenizer", settings.tokenizer]
-    if settings.output_len is not None:
+    if settings.dataset_name == "custom":  # output lengths from the file, prompts as they are
+        cmd += ["--custom-output-len", str(settings.output_len or -1)]
+        cmd += ["--skip-chat-template", "--disable-shuffle"]
+    elif settings.output_len is not None:
         cmd += ["--sharegpt-output-len", str(settings.output_len)]
     if settings.ignore_eos:
         cmd.append("--ignore-eos")
@@ -218,6 +278,7 @@ def stage_summary(
     *,
     ttft_slo_ms: float,
     tpot_slo_ms: float,
+    score_slos: Sequence[tuple[float, float]] = (),
 ) -> dict[str, Any]:
     start, end = window
     per_gpu = {
@@ -226,6 +287,7 @@ def stage_summary(
     known = [e for e in per_gpu.values() if e is not None]
     energy = sum(known) if known and len(known) == len(per_gpu) else None
     out: dict[str, Any] = {
+        "workload": stage.workload or None,
         "rate_rps": stage.rate_rps,
         "num_prompts": stage.num_prompts,
         "window_s": [round(start, 2), round(end, 2)],
@@ -257,6 +319,8 @@ def stage_summary(
             ),
         }
     )
+    if score_slos:
+        out["by_slo"] = {f"{t:g}/{p:g}": request_outcomes(result, t, p) for t, p in score_slos}
     return out
 
 
@@ -304,19 +368,21 @@ async def run_stages(
 ) -> tuple[list[tuple[Stage, tuple[float, float], dict | None, int]], float]:
     """-> per stage (stage, energy window, vllm result or None, exit code), and the
     end of the run on the sampler's clock."""
-    done = []
+    done, failed = [], set()
     async with Sampler(base_url, agents, out, state_poll) as sampler:
-        for stage in settings.stages():
+        for workload, stage in settings.plan():
+            if stage.workload in failed:
+                continue
             stage_dir = out / "stages" / stage.name
             stage_dir.mkdir(parents=True, exist_ok=True)
             cmd = bench_command(
-                settings, stage, base_url=base_url, model=model, result_dir=stage_dir,
+                workload, stage, base_url=base_url, model=model, result_dir=stage_dir,
                 ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
             )  # fmt: skip
             (stage_dir / "command.txt").write_text(shlex.join(cmd) + "\n")
             log(f"{stage.name}: {stage.num_prompts} prompts at {stage.rate_rps:g} req/s")
             launched = sampler.now_s()
-            timeout = settings.stage_timeout_s or 3 * settings.stage_s + 600
+            timeout = workload.stage_timeout_s or 3 * workload.stage_s + 600
             with open(stage_dir / "bench.log", "wb") as handle:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, stdin=subprocess.DEVNULL, stdout=handle, stderr=subprocess.STDOUT
@@ -336,8 +402,8 @@ async def run_stages(
             start = max(launched, ended - duration) if duration > 0 else launched
             done.append((stage, (start, ended), result, code))
             log(f"{stage.name}: exit {code}, {duration:.0f} s of load")
-            if code != 0:
-                break
+            if code != 0:  # the rest of this workload is skipped, the next one runs
+                failed.add(stage.workload)
             if settings.gap_s > 0:
                 await asyncio.sleep(settings.gap_s)
         finished = sampler.now_s()
@@ -352,6 +418,7 @@ def summarize(
     *,
     ttft_slo_ms: float,
     tpot_slo_ms: float,
+    score_slos: Sequence[tuple[float, float]] = (),
 ) -> dict[str, Any]:
     series = loadgen.energy_series(loadgen._read_jsonl(out / "energy.jsonl"))
     timeline = loadgen._read_jsonl(out / "timeline.jsonl")
@@ -359,7 +426,7 @@ def summarize(
     for stage, window, bench, code in stages:
         summary = stage_summary(
             stage, window, bench, series, gpu_names, timeline,
-            ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
+            ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms, score_slos=score_slos,
         )  # fmt: skip
         summary["exit"] = code
         result["stages"][stage.name] = summary
@@ -385,11 +452,13 @@ def main() -> int:
     policy = config["routing"]["policy"]
     if (mode != "baseline") != (policy == "cantune"):
         raise SystemExit(f"BENCH_MODE={mode} does not match routing.policy={policy}")
-    if not Path(settings.dataset).is_file():
-        raise SystemExit(f"BENCH_DATASET {settings.dataset} is not a file")
+    for workload in settings.workloads or (settings,):
+        if not Path(workload.dataset).is_file():
+            raise SystemExit(f"dataset {workload.dataset} is not a file")
     cap = config.get("canary", {}).get("max_output_tokens")
-    if mode == "cantune" and settings.output_len and cap and settings.output_len > cap:
-        log(f"warning: output length {settings.output_len} exceeds the Canary's cap {cap}")
+    for workload in settings.workloads or (settings,):
+        if mode == "cantune" and workload.output_len and cap and workload.output_len > cap:
+            log(f"warning: output length {workload.output_len} exceeds the Canary's cap {cap}")
     proxy = config["proxy"]
     host = "127.0.0.1" if proxy["host"] == "0.0.0.0" else proxy["host"]
     base = f"http://{host}:{proxy['port']}"
@@ -398,8 +467,9 @@ def main() -> int:
     agents, gpu_names = smoke.agents_and_names(config)
     (out / "bench_plan.json").write_text(
         json.dumps(
-            {"mode": mode, "stages": [s.__dict__ for s in settings.stages()],
-             **{k: v for k, v in settings.__dict__.items() if k != "rates"}},
+            {"mode": mode, "slo": [ttft_slo, tpot_slo],
+             "stages": [s.__dict__ for s in settings.stages()],
+             **{k: v for k, v in asdict(settings).items() if k != "rates"}},
             indent=2, default=list,
         ) + "\n"
     )  # fmt: skip
@@ -447,8 +517,9 @@ def main() -> int:
                 )
             )  # fmt: skip
             result = summarize(
-                out, stages, finished, gpu_names, ttft_slo_ms=ttft_slo, tpot_slo_ms=tpot_slo
-            )
+                out, stages, finished, gpu_names, ttft_slo_ms=ttft_slo, tpot_slo_ms=tpot_slo,
+                score_slos=settings.score_slos,
+            )  # fmt: skip
             (out / "bench_summary.json").write_text(json.dumps(result, indent=2) + "\n")
             for name, s in result["stages"].items():
                 log(
@@ -458,7 +529,7 @@ def main() -> int:
                     f"modes={s['modes']}"
                 )
             smoke.save_service_state(client, base, out, config)
-            if all(code == 0 for *_, code in stages) and len(stages) == len(settings.rates):
+            if all(code == 0 for *_, code in stages) and len(stages) == len(settings.stages()):
                 status = 0
             return status
     except Exception as error:
