@@ -152,6 +152,14 @@ controller:
   feedback_near_slo: 0.9      # approaching SLO counts as production pressure
   confirm_s: 2                # pressure must persist; severe unfinished waits also use this
   expansion_grace_s: 3        # observe production after expansion before considering MAX
+  full_effort_routing: baseline  # full effort routes like the default system (round robin
+                              # over the fixed pairs, hard limits only); cantune: keep CanaTune's
+  confirm_window_s: 10        # pressure is also confirmed when present in confirm_fraction
+  confirm_fraction: 0.6       # of the ticks of this window (latency flickers at the threshold)
+  d_trigger_count: 5          # D capacity trigger: this many "no D safe for one more request"
+  d_trigger_window_s: 3       # marks (one per 0.2 s) within this window -> full effort at once
+  full_effort_min_s: 30       # leave full effort only after this long in it, quiet for t_down_s,
+  exit_rate_fraction: 0.8     # and with the offered rate below 0.8 x the rate it was entered at
 
 # Online risk table R(clock point, N_await, L_in, D busy) (design v2 section 4.1).
 # Starts empty on a new cluster; production runs at MAX and admits everything

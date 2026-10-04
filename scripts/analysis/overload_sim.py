@@ -358,6 +358,14 @@ class Sim:
             groups, risk, RouterSettings.from_config(config), tiers, clock=clock,
             lengths=lengths, telemetry=self.telemetry,
         )  # fmt: skip
+        self.control_log: list[dict] = []
+        sim = self
+
+        class _Log:  # the Controller's mode changes, with simulated time
+            def write(self, record: dict) -> None:
+                if record.get("event") == "control_mode":
+                    sim.control_log.append({"t": round(sim.now, 1), **record})
+
         self.controller = TierController(
             groups,
             self.router,
@@ -366,6 +374,7 @@ class Sim:
             {},
             tiers,
             clock=clock,
+            log=_Log(),
         )
         self.groups = {g.name: g for g in groups}
         for g, p in zip(groups, self.pairs):
@@ -727,6 +736,7 @@ def summarize(sim: Sim, phases: list[dict]) -> dict:
                 out[ph["name"]][name] = sum(row.get(key, 0.0) for row in span) / 1000
     out["send_retries"] = sum(p.send_retries for p in sim.pairs)
     out["preemptions"] = sum(p.preemptions for p in sim.pairs)
+    out["control"] = getattr(sim, "control_log", [])
     if sim.router is not None:
         out["router"] = {k: v for k, v in sim.router.state().items() if k != "groups"}
     return out

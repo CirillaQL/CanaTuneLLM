@@ -292,6 +292,11 @@ class CanaTuneRouter:
         # is being confirmed or answered (d_balance_modes), concentration then makes
         # hot spots rather than saving energy.
         self.control_mode = "energy"
+        # Baseline mode (set by the Controller under confirmed pressure or exhausted
+        # D capacity): round robin over the fixed pairs, hard limits only.
+        self.baseline_mode = False
+        self._rr = 0
+        self.d_exhausted: deque[float] = deque()  # marks: no D safe for one more request
         self.pressure_event = asyncio.Event()
         self.risk_signals = 0
         self._signalled: set[int] = set()
@@ -479,8 +484,11 @@ class CanaTuneRouter:
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
         self._tpot_by_group: dict[str, float] = {}
         self._within_limits: list[tuple[Route, Cell, bool]] = []
+        self._d_unsafe: set[str] = set()  # route keys whose D fails the length model
         decode_checked: dict[str, tuple[bool, str | None, bool, str | None]] = {}
-        for route in self.routes():
+        d_safe = False
+        routes = self.routes()
+        for route in routes:
             group, dg, key = route.p, route.d, route.key
             assert group.effective is not None and dg.effective is not None
             clock = (group.effective if group is dg
@@ -503,12 +511,16 @@ class CanaTuneRouter:
                     risk = self._decode_risk(dg, tokens, tier_table)
                 decode_checked[dg.name] = (d_busy, blocked, kv, risk)
             d_busy, blocked, kv_blocked, decode_risk = decode_checked[dg.name]
+            if blocked is None and not kv_blocked and decode_risk is None:
+                d_safe = True
             if blocked is not None:
                 continue
             cell = self.table.cell(clock, dg.n_await, tokens, d_busy)
             if kv_blocked:
                 continue
             self._within_limits.append((route, cell, d_busy))
+            if decode_risk is not None:
+                self._d_unsafe.add(key)
             tier_table = self.tiers.table
             length_model = tier_table is not None and bool(tier_table.decode_length)
             if self.settings.overload == "best_effort" and length_model:
@@ -546,7 +558,22 @@ class CanaTuneRouter:
             self._slack_by_group[key] = (x, predicted, None)
             if estimate.risk <= self.settings.theta:
                 out.append((route, cell, estimate, d_busy))
+        if routes and not self.open_admission and not d_safe:
+            self._note_d_exhausted()
         return out
+
+    def _note_d_exhausted(self) -> None:
+        """No D could take one more request within the length model and the KV wall
+        (counting growth): one mark per 0.2 s, the Controller's D capacity trigger."""
+        now = self._clock()
+        if self.d_exhausted and now - self.d_exhausted[-1] < 0.2:
+            return
+        self.d_exhausted.append(now)
+
+    def d_exhausted_count(self, now: float, window_s: float) -> int:
+        while self.d_exhausted and self.d_exhausted[0] < now - max(window_s, 60.0):
+            self.d_exhausted.popleft()
+        return sum(t >= now - window_s for t in self.d_exhausted)
 
     def _choose(
         self, feasible: list[tuple[Route, Cell, RiskEstimate | None, bool]]
@@ -615,10 +642,12 @@ class CanaTuneRouter:
             ranked = []
             for route, cell, d_busy in self._within_limits:
                 predicted = self._slack_by_group[route.key][1]
-                order = (predicted, route.canary, self.groups.index(route.p),
-                         self.groups.index(route.d))  # fmt: skip
+                # A D the length model still allows first (the lowest predicted TTFT
+                # alone sent requests into a D whose KV was already full: job J).
+                order = (route.key in self._d_unsafe, predicted, route.canary,
+                         self.groups.index(route.p), self.groups.index(route.d))  # fmt: skip
                 ranked.append((*order, route, cell, d_busy))
-            predicted, _, _, _, route, cell, d_busy = min(ranked, key=lambda r: r[:4])
+            _, predicted, _, _, _, route, cell, d_busy = min(ranked, key=lambda r: r[:5])
             slack = self._slack_by_group[route.key][2]
             if best_effort:
                 kind = "best_effort"
@@ -643,6 +672,43 @@ class CanaTuneRouter:
             samples = 0 if slack is None else slack.samples
             feasible = [(route, cell, RiskEstimate(risk, f"overflow_{kind}", samples), d_busy)]
         route, cell, estimate, d_busy = self._choose(feasible)
+        return self._issue(route, cell, estimate, d_busy, tokens, exact, waited_ms, kind)
+
+    def _admit_baseline(self, tokens: int, exact: bool, waited_ms: float) -> Ticket | None:
+        """Baseline mode (high load): what the default system does, round robin over
+        the fixed pairs, keeping only the hard limits (fresh D telemetry, D KV wall,
+        KV in flight). No risk, length model or concentration decides here."""
+        n = len(self.groups)
+        for k in range(n):
+            group = self.groups[(self._rr + k) % n]
+            if not group.routable:
+                continue
+            d_busy, blocked = self._decode_state(group)
+            if blocked is not None or self._kv_blocked(group, tokens):
+                continue
+            self._rr = (self.groups.index(group) + 1) % n
+            assert group.effective is not None
+            route = Route(group, group)
+            cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
+            s_own = self.prefill_cost(group.effective.prefill_mhz)(tokens)
+            x, predicted = self._predict(group, s_own)
+            self._slack_by_group = {route.key: (x, predicted, None)}
+            self._tpot_by_group = {}
+            return self._issue(route, cell, None, d_busy, tokens, exact, waited_ms, None)
+        return None
+
+    def _issue(
+        self,
+        route: Route,
+        cell: Cell,
+        estimate: RiskEstimate | None,
+        d_busy: bool,
+        tokens: int,
+        exact: bool,
+        waited_ms: float,
+        kind: str | None,
+    ) -> Ticket:
+        """Reserve the route for one request and return its ticket."""
         group, dg = route.p, route.d
         now = self._clock()
         x, predicted, _ = self._slack_by_group.get(route.key, ((), None, None))
@@ -689,6 +755,8 @@ class CanaTuneRouter:
         if kind is not None:
             self.overflows[kind] += 1  # a doomed request counts once, when it leaves
             ticket.snapshot["overflow"] = kind
+        if self.baseline_mode:
+            ticket.snapshot["routing"] = "baseline"
         group.n_at_p += 1
         group.pending_ms += s_own
         dg.n_await += 1
@@ -745,6 +813,13 @@ class CanaTuneRouter:
             if waiter not in self._queue:
                 self._queue.append(waiter)
                 self._waiting_since[waiter] = self._clock() - waited_ms / 1000
+            if self.baseline_mode:
+                if self._queue[0] == waiter:  # FIFO, as in every mode
+                    ticket = self._admit_baseline(tokens, exact, waited_ms)
+                    if ticket is not None:
+                        self._release(waiter)
+                        return ticket
+                return "wait"
             feasible = self.candidates(tokens, waited_ms)
             if not feasible and waiter not in self._signalled:
                 self._signalled.add(waiter)

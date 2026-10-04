@@ -1270,3 +1270,88 @@ def test_controller_mode_reaches_the_router():
     _, _, _, _, router, controller, _ = setup(table=published())
     controller._mode("confirming", "test")
     assert router.control_mode == "confirming"
+
+
+def test_baseline_mode_round_robins_fixed_pairs_within_hard_limits():
+    router, busy, idle = dynamic_router()  # dynamic pairing is ignored in baseline mode
+    router.baseline_mode = True
+    other = router.groups[3]
+    activate([other])
+    tickets = [router.step(router.new_waiter(), 128, True, 0) for _ in range(4)]
+    # round robin over the fixed pairs: no concentration, no cross pairing
+    assert [t.group.name for t in tickets] == ["G1", "G2", "G3", "G1"]
+    assert all(t.decode_group is None and t.snapshot["routing"] == "baseline" for t in tickets)
+    idle.inflight_bytes = 1e12  # KV-in-flight hard limit: skipped, not routed to
+    names = [router.step(router.new_waiter(), 128, True, 0).group.name for _ in range(2)]
+    assert "G2" not in names
+
+
+def test_no_safe_d_marks_decode_capacity_exhaustion():
+    router, group = length_router(10, 0.85)  # every D past the KV wall for this prompt
+    clock = router._clock
+    for _ in range(3):
+        router.candidates(2048)
+    assert router.d_exhausted_count(clock(), 3.0) == 1  # one mark per 0.2 s
+    clock.now += 0.3
+    router.candidates(2048)
+    assert router.d_exhausted_count(clock(), 3.0) == 2
+
+
+def test_decode_capacity_trigger_enters_baseline_full_effort_and_exit_needs_lower_rate():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    for _ in range(50):
+        router.new_waiter()  # 5 req/s offered over the 10 s window
+    for k in range(5):
+        router.d_exhausted.append(clock.now - 0.5 * k)
+    asyncio.run(controller.tick())
+    assert router.full_effort and router.baseline_mode
+    assert all(g.tier is Tier.MAX for g in groups)
+    clock.now += 31  # quiet and dwell passed, but the same load is still offered
+    for _ in range(50):
+        router.arrivals.append(clock.now - 0.1)
+    asyncio.run(controller.tick())
+    assert router.full_effort
+    clock.now += 11  # the offered rate fell to 0
+    asyncio.run(controller.tick())
+    assert not router.full_effort and not router.baseline_mode
+
+
+def test_flickering_pressure_is_confirmed_by_its_share_of_the_window():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    controller.settings = dataclasses.replace(controller.settings, confirm_s=100)
+    feedback = iter([True, False, True, True, False, True, True, True, False, True] * 2)
+
+    def fake(*args, **kwargs):
+        p = next(feedback)
+        return {"pressure": p, "severe": False, "samples": 10, "near_fraction": 0.0,
+                "live_ratio": 0.0, "wait_ratio": 0.0}  # fmt: skip
+
+    router.production_feedback = fake
+    for _ in range(10):
+        asyncio.run(controller.tick())
+        clock.now += 1
+    assert router.full_effort  # 7 of 10 ticks with pressure, never 100 s in a row
+
+
+def test_best_effort_fallback_prefers_a_d_the_length_model_allows():
+    clock = FakeClock()
+    telemetry = Telemetry({}, period_s=1, client_factory=lambda: None, clock=clock)
+    table = published(decode_kv_limit=0.9, decode_length={"1050": [50.0, 0.4, 8e-4, 2.0]},
+                      decode_kv_tokens=30000)  # fmt: skip
+    _, _, groups, _, router, _, _ = setup(
+        table=table, telemetry=telemetry, admission="slack", overload="best_effort"
+    )
+    full, free = groups[1], groups[2]
+    activate([full, free])
+    telemetry.update(full.decode, EndpointSnapshot(clock.now, 10, 0, 0.85, 0, True))
+    telemetry.update(free.decode, EndpointSnapshot(clock.now, 0, 0, 0.0, 0, True))
+    free.pending_ms = 2000.0  # P2 far behind: its TTFT risk fails, P1's is lower
+    ticket = router.step(router.new_waiter(), 2048, True, 0)
+    # no route is feasible; best effort takes D2 (KV room) over D1 (past its KV wall)
+    assert ticket.overflow == "best_effort" and ticket.dgroup is free

@@ -63,6 +63,21 @@ class ControllerSettings:
     confirm_s: float = 2.0
     expansion_grace_s: float = 3.0
     solver: bool = False  # True: the solver plans groups x clocks (optional, off by default)
+    # High load: full effort routes like the default system (baseline) or keeps
+    # CanaTune's routing (cantune).
+    full_effort_routing: str = "baseline"
+    # Pressure is also confirmed when present in confirm_fraction of the ticks of the
+    # last confirm_window_s (production latency flickers around the threshold).
+    confirm_window_s: float = 10.0
+    confirm_fraction: float = 0.6
+    # D capacity trigger: d_trigger_count marks of "no D safe for one more request"
+    # within d_trigger_window_s enter full effort at once.
+    d_trigger_count: int = 5
+    d_trigger_window_s: float = 3.0
+    # Leaving full effort also needs this long in it and the offered rate below
+    # exit_rate_fraction of the rate it was entered at.
+    full_effort_min_s: float = 30.0
+    exit_rate_fraction: float = 0.8
 
     def __post_init__(self) -> None:
         durations = (self.feedback_window_s, self.confirm_s, self.expansion_grace_s)
@@ -71,6 +86,11 @@ class ControllerSettings:
                 or not 0 < self.feedback_near_slo <= 1
                 or self.confirm_s < 0 or self.expansion_grace_s < 0):
             raise ControllerConfigError("invalid production feedback settings")
+        if (self.full_effort_routing not in ("baseline", "cantune")
+                or not self.confirm_window_s > 0 or not 0 < self.confirm_fraction <= 1
+                or self.d_trigger_count < 1 or not self.d_trigger_window_s > 0
+                or self.full_effort_min_s < 0 or not 0 < self.exit_rate_fraction <= 1):
+            raise ControllerConfigError("invalid high-load settings")
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControllerSettings":
@@ -95,6 +115,13 @@ class ControllerSettings:
             feedback_near_slo=float(raw.get("feedback_near_slo", 0.9)),
             confirm_s=float(raw.get("confirm_s", 2)),
             expansion_grace_s=float(raw.get("expansion_grace_s", 3)),
+            full_effort_routing=str(raw.get("full_effort_routing", "baseline")),
+            confirm_window_s=float(raw.get("confirm_window_s", 10)),
+            confirm_fraction=float(raw.get("confirm_fraction", 0.6)),
+            d_trigger_count=int(raw.get("d_trigger_count", 5)),
+            d_trigger_window_s=float(raw.get("d_trigger_window_s", 3)),
+            full_effort_min_s=float(raw.get("full_effort_min_s", 30)),
+            exit_rate_fraction=float(raw.get("exit_rate_fraction", 0.8)),
         )
 
 
@@ -147,6 +174,9 @@ class TierController:
         self._severe_since: float | None = None
         self._expanded_at: float | None = None
         self.feedback: dict[str, Any] = {}
+        self._pressure_ticks: deque[tuple[float, bool]] = deque()
+        self._full_effort_since = float("-inf")
+        self._full_effort_rate = 0.0
 
     # ---- actuation ---------------------------------------------------------------
 
@@ -375,22 +405,39 @@ class TierController:
                 self._mode("confirming", "production_latency")
         else:
             self._confirm_since = None
+        self._pressure_ticks.append((now, bool(f["pressure"])))
+        while self._pressure_ticks and self._pressure_ticks[0][0] < now - s.confirm_window_s:
+            self._pressure_ticks.popleft()
+        ticks = [p for _, p in self._pressure_ticks]
+        mostly = (len(ticks) >= max(3, int(0.5 * s.confirm_window_s / s.period_s))
+                  and sum(ticks) >= s.confirm_fraction * len(ticks))
+        d_exhausted = (self.router.d_exhausted_count(now, s.d_trigger_window_s)
+                       >= s.d_trigger_count)
         if f["severe"]:
             if self._severe_since is None:
                 self._severe_since = now
         else:
             self._severe_since = None
-        confirmed = self._confirm_since is not None and now - self._confirm_since >= s.confirm_s
+        confirmed = (self._confirm_since is not None and now - self._confirm_since >= s.confirm_s
+                     ) or mostly
         emergency = self._severe_since is not None and now - self._severe_since >= s.confirm_s
+        if d_exhausted:
+            self._pressure_at = now
         if self._full_effort:
             await self._enter_full_effort("reclaim_retry")
             if f["pressure"] or now - self._pressure_at < s.t_down_s:
                 return
+            if now - self._full_effort_since < s.full_effort_min_s:
+                return
+            rate, _ = self.router.offered(now, s.load_window_s, s.burst_bucket_s)
+            if rate > s.exit_rate_fraction * self._full_effort_rate:
+                return  # the load that needed it is still offered
             if any(g.state is GroupState.EXPLORING for g in self.groups):
                 return
             if self.tiers.table is None and any(g.n_inflight for g in self.groups):
                 return
             self._full_effort = self.router.full_effort = False
+            self.router.baseline_mode = False
             self._expanded_at = None
             for group in self.groups:
                 if group.state is GroupState.ACTIVE and self.tiers.table is not None:
@@ -399,6 +446,9 @@ class TierController:
             return
         if emergency:
             await self._enter_full_effort("severe_production_backlog")
+            return
+        if d_exhausted:
+            await self._enter_full_effort("decode_capacity_exhausted")
             return
         if self.mode == "expanding":
             assert self._expanded_at is not None
@@ -461,6 +511,12 @@ class TierController:
         self._mode("full_effort", reason)
         if not self._full_effort:
             self._full_effort = self.router.full_effort = True
+            self.router.baseline_mode = self.settings.full_effort_routing == "baseline"
+            now = self._clock()
+            self._full_effort_since = now
+            self._full_effort_rate, _ = self.router.offered(
+                now, self.settings.load_window_s, self.settings.burst_bucket_s
+            )
             self._target = self._target_since = None
             self.log.write({"event": "control_mode", "mode": "full_effort", "reason": reason})
             if self.on_pressure is not None:
