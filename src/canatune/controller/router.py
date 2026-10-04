@@ -92,6 +92,10 @@ class RouterSettings:
     # concentrate: the busiest safe P).
     pairing: str = "fixed"
     kv_growth: bool = True  # KV-wall check counts the growth of sequences (ablation: False)
+    # True: a D whose projected KV (with growth) passes the wall takes no request at
+    # all (it waits, then hold_max_ms); False: that only warns, best effort may use it.
+    kv_projection_hard: bool = False
+    kv_projection_limit: float | None = None  # projected-KV wall; None: the table's KV limit
     d_balance_modes: tuple[str, ...] = ("confirming", "expanding", "full_effort")
     d_choice: str = "concentrate"
     p_choice: str = "balance"
@@ -123,6 +127,9 @@ class RouterSettings:
             backfill_slack_ms=_auto_ms(raw, "backfill_slack_ms"),
             pairing=_choice(raw, "pairing", ("fixed", "dynamic"), "fixed"),
             kv_growth=bool(raw.get("kv_growth", True)),
+            kv_projection_hard=bool(raw.get("kv_projection_hard", False)),
+            kv_projection_limit=(None if raw.get("kv_projection_limit") is None
+                                 else float(raw["kv_projection_limit"])),
             d_balance_modes=_modes(raw),
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
@@ -454,14 +461,29 @@ class CanaTuneRouter:
         held = snapshot.kv_usage * (table.decode_kv_tokens or 0) + group.t_await
         tpot = decode_tpot(coef, running, held + tokens + output / 2)
         self._tpot_by_group[group.name] = tpot
+        if self._kv_projected_over(group, tokens, table, snapshot):
+            return "decode_kv"
         if tpot > self.settings.tpot_slo_ms:
             return "decode_tpot"
-        wall = table.decode_kv_limit
-        if table.decode_kv_tokens and wall is not None:
-            growth = on_d * output / 2 + group.n_await * output if self.settings.kv_growth else 0.0
-            if held + growth + tokens + output > wall * table.decode_kv_tokens:
-                return "decode_kv"
         return None
+
+    def _kv_projected_over(self, group: Group, tokens: int, table: Any, snapshot: Any) -> bool:
+        """The KV D will hold passes the wall: what it holds now (and the prompts on
+        their way) grows by half a mean output per sequence on D and a whole one per
+        request on its way, plus this request at the end of its output. A request
+        alone on an empty D always fits (a long prompt must not wait for nothing)."""
+        wall = self.settings.kv_projection_limit or table.decode_kv_limit
+        if not table.decode_kv_tokens or wall is None or snapshot is None:
+            return False
+        if snapshot.kv_usage is None:
+            return False
+        on_d = (snapshot.running or 0.0) + (snapshot.waiting or 0.0)
+        if on_d == 0 and group.n_await == 0 and group.n_decoding == 0:
+            return False
+        output = self._output_mean()
+        held = snapshot.kv_usage * table.decode_kv_tokens + group.t_await
+        growth = on_d * output / 2 + group.n_await * output if self.settings.kv_growth else 0.0
+        return held + growth + tokens + output > wall * table.decode_kv_tokens
 
     def routes(self) -> list[Route]:
         """(P, D) choices: each routable group alone, or with dynamic pairing every P
@@ -515,6 +537,8 @@ class CanaTuneRouter:
                 d_safe = True
             if blocked is not None:
                 continue
+            if decode_risk == "decode_kv" and self.settings.kv_projection_hard:
+                continue  # hard: the request waits rather than overfill this D
             cell = self.table.cell(clock, dg.n_await, tokens, d_busy)
             if kv_blocked:
                 continue
@@ -686,6 +710,12 @@ class CanaTuneRouter:
             d_busy, blocked = self._decode_state(group)
             if blocked is not None or self._kv_blocked(group, tokens):
                 continue
+            table = self.tiers.table
+            if (self.settings.kv_projection_hard and table is not None
+                    and self.telemetry is not None):
+                snapshot = self.telemetry.fresh(group.decode, self.settings.snapshot_max_age_s)
+                if self._kv_projected_over(group, tokens, table, snapshot):
+                    continue
             self._rr = (self.groups.index(group) + 1) % n
             assert group.effective is not None
             route = Route(group, group)

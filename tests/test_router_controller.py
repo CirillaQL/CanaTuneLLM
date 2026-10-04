@@ -1355,3 +1355,11 @@ def test_best_effort_fallback_prefers_a_d_the_length_model_allows():
     ticket = router.step(router.new_waiter(), 2048, True, 0)
     # no route is feasible; best effort takes D2 (KV room) over D1 (past its KV wall)
     assert ticket.overflow == "best_effort" and ticket.dgroup is free
+
+
+def test_hard_projected_kv_makes_requests_wait_instead_of_overfilling_d():
+    router, group = length_router(10, 0.85)  # past the KV wall for a 2048-token prompt
+    router.settings = dataclasses.replace(router.settings, kv_projection_hard=True)
+    assert router.step(router.new_waiter(), 2048, True, 0) == "wait"
+    router, group = length_router(10, 0.85)  # default: warn, then best effort
+    assert router.step(router.new_waiter(), 2048, True, 0).overflow == "best_effort"

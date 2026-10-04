@@ -438,6 +438,7 @@ class Sim:
                 "buffer_mb": round(p.buffer / 1e6),
                 "running": len(p.d_running),
                 "p_queue": len(p.p_queue),
+                "kv": round(self.kv_used(p) / self.phys.d_kv_tokens, 3),
             }
             # Energy of the last second: utilization at the current clocks; parked
             # groups idle at the lowest clocks.
@@ -715,6 +716,9 @@ def summarize(sim: Sim, phases: list[dict]) -> dict:
             row[n]["state"] in ("active", "draining") for row in t for n in names
         )
         out[ph["name"]]["max_group_s"] = sum(row[n]["tier"] == "max" for row in t for n in names)
+        kvs = [row[n].get("kv", 0.0) for row in t for n in names]
+        out[ph["name"]]["kv_max"] = max(kvs, default=0.0)
+        out[ph["name"]]["kv_full_s"] = sum(k >= 0.98 for k in kvs)  # D-seconds near full
         tpots = [t for t in (sim.tpot(r) for r in served) if t is not None]
         out[ph["name"]].update(
             {
