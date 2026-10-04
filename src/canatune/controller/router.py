@@ -470,15 +470,16 @@ class CanaTuneRouter:
     def _kv_projected_over(self, group: Group, tokens: int, table: Any, snapshot: Any) -> bool:
         """The KV D will hold passes the wall: what it holds now (and the prompts on
         their way) grows by half a mean output per sequence on D and a whole one per
-        request on its way, plus this request at the end of its output. A request
-        alone on an empty D always fits (a long prompt must not wait for nothing)."""
+        request on its way, plus this request at the end of its output. With the hard
+        limit a request alone on an empty D always fits (it must not wait for nothing)."""
         wall = self.settings.kv_projection_limit or table.decode_kv_limit
         if not table.decode_kv_tokens or wall is None or snapshot is None:
             return False
         if snapshot.kv_usage is None:
             return False
         on_d = (snapshot.running or 0.0) + (snapshot.waiting or 0.0)
-        if on_d == 0 and group.n_await == 0 and group.n_decoding == 0:
+        empty = on_d == 0 and group.n_await == 0 and group.n_decoding == 0
+        if empty and self.settings.kv_projection_hard:
             return False
         output = self._output_mean()
         held = snapshot.kv_usage * table.decode_kv_tokens + group.t_await

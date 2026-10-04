@@ -129,6 +129,8 @@ router:
   d_choice: concentrate
   p_choice: balance
   d_balance_modes: [confirming, expanding, full_effort]  # dynamic: D balanced under pressure
+  kv_projection_hard: false   # true: a D whose projected KV passes the wall takes no request
+                              # (requests wait); false: it only warns (default strategy)
 
 telemetry:
   enabled: true
