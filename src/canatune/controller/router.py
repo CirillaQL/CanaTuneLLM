@@ -91,6 +91,7 @@ class RouterSettings:
     # least), then P (balance: the lowest predicted TTFT; same: the D's own P if safe;
     # concentrate: the busiest safe P).
     pairing: str = "fixed"
+    kv_growth: bool = True  # KV-wall check counts the growth of sequences (ablation: False)
     d_choice: str = "concentrate"
     p_choice: str = "balance"
 
@@ -120,6 +121,7 @@ class RouterSettings:
             doomed=_choice(raw, "doomed", ("backfill", "dispatch"), "backfill"),
             backfill_slack_ms=_auto_ms(raw, "backfill_slack_ms"),
             pairing=_choice(raw, "pairing", ("fixed", "dynamic"), "fixed"),
+            kv_growth=bool(raw.get("kv_growth", True)),
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
         )
@@ -437,7 +439,7 @@ class CanaTuneRouter:
             return "decode_tpot"
         wall = table.decode_kv_limit
         if table.decode_kv_tokens and wall is not None:
-            growth = on_d * output / 2 + group.n_await * output
+            growth = on_d * output / 2 + group.n_await * output if self.settings.kv_growth else 0.0
             if held + growth + tokens + output > wall * table.decode_kv_tokens:
                 return "decode_kv"
         return None
