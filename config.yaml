@@ -121,6 +121,13 @@ router:
   doomed: backfill
   backfill_slack_ms: auto     # auto: lowest slack with observed risk <= theta / 2
   hold_max_ms: 30000          # policy: the client's timeout, then 503
+  # P/D pairing: fixed (P_i -> D_i) or dynamic (any P with any D, per request; the
+  # KV connector routes by the addresses in the request id). Dynamic picks the D
+  # first (d_choice: concentrate | balance), then the P (p_choice: balance = lowest
+  # predicted TTFT, concentrate = busiest safe P, same = the D's own P).
+  pairing: fixed
+  d_choice: concentrate
+  p_choice: balance
 
 telemetry:
   enabled: true

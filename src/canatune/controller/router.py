@@ -48,7 +48,7 @@ from canatune.domain.admission import (
     kv_bytes_from_model_dir,
     slack_edges,
 )
-from canatune.domain.groups import Group, TierState
+from canatune.domain.groups import ClockPoint, Group, TierState
 from canatune.domain.load import LengthStats
 from canatune.domain.models import decode_coef, decode_tpot, interpolate
 from canatune.domain.risk import Cell, RiskEstimate, RiskTable, is_violation
@@ -86,6 +86,13 @@ class RouterSettings:
     backfill_slack_ms: float | None = None  # backfill only where a fresh request keeps this
     # slack; None (auto): the lowest slack whose observed risk is <= theta / 2
     hold_max_ms: float = 30000.0  # serve: client timeout (policy): 503 after this long
+    # Pairing: fixed (P_i -> D_i) or dynamic (any P with any D, chosen per request).
+    # Dynamic: D first (concentrate: the most loaded D in the safe set; balance: the
+    # least), then P (balance: the lowest predicted TTFT; same: the D's own P if safe;
+    # concentrate: the busiest safe P).
+    pairing: str = "fixed"
+    d_choice: str = "concentrate"
+    p_choice: str = "balance"
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "RouterSettings":
@@ -112,6 +119,9 @@ class RouterSettings:
             hold_max_ms=_positive(raw, "hold_max_ms", 30000),
             doomed=_choice(raw, "doomed", ("backfill", "dispatch"), "backfill"),
             backfill_slack_ms=_auto_ms(raw, "backfill_slack_ms"),
+            pairing=_choice(raw, "pairing", ("fixed", "dynamic"), "fixed"),
+            d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
+            p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
         )
 
 
@@ -161,9 +171,26 @@ def prompt_tokens(body: Mapping[str, Any], chars_per_token: float) -> tuple[int,
     raise ValueError("prompt must be a string or a list of token ids")
 
 
+@dataclass(frozen=True, eq=False)
+class Route:
+    """The P of one group and the D of another (the same group when fixed)."""
+
+    p: Group
+    d: Group
+
+    @property
+    def key(self) -> str:
+        return self.p.name if self.p is self.d else f"{self.p.name}>{self.d.name}"
+
+    @property
+    def canary(self) -> bool:
+        return self.p.canary or self.d.canary
+
+
 @dataclass
 class Ticket:
-    """One admitted request: its reservation and the admission snapshot."""
+    """One admitted request: its reservation and the admission snapshot. `group`
+    owns its P; `decode_group` owns its D when that is another group's."""
 
     id: int
     group: Group
@@ -187,6 +214,13 @@ class Ticket:
     predicted_ms: float | None = None
     overflow: str | None = None  # serve: "rescue", "doomed" or "backfill" (late, spare slot)
     slack_ms: float | None = None  # SLO - waited - predicted, at admission
+    decode_group: Group | None = None  # dynamic pairing: the group whose D serves it
+    decode_epoch: int = 0
+
+    @property
+    def dgroup(self) -> Group:
+        """The group whose D serves this request."""
+        return self.group if self.decode_group is None else self.decode_group
 
 
 class CanaTuneRouter:
@@ -318,10 +352,12 @@ class CanaTuneRouter:
         safe = self.slack.safe_slack(s.theta / 2)
         return max(0.0, safe) if safe is not None else self.slack.edges[-1]
 
-    def _predict(self, group: Group, s_own_ms: float) -> tuple[tuple[float, ...], float]:
-        x = self.predictor.features(
-            s_own_ms, group.pending_ms, group.inflight_bytes, group.n_decoding
-        )
+    def _predict(
+        self, group: Group, s_own_ms: float, decode: Group | None = None
+    ) -> tuple[tuple[float, ...], float]:
+        """TTFT from P's pending work and D's KV in flight and decoding requests."""
+        d = group if decode is None else decode
+        x = self.predictor.features(s_own_ms, group.pending_ms, d.inflight_bytes, d.n_decoding)
         return x, self.predictor.predict(x)
 
     def _kv_blocked(self, group: Group, tokens: int = 0) -> bool:
@@ -340,7 +376,7 @@ class CanaTuneRouter:
 
     def _decode_state(self, group: Group) -> tuple[bool, str | None]:
         """(D busy, reason D cannot take one more request or None)."""
-        decoding = group.n_inflight - group.n_await
+        decoding = group.n_decoding
         running = waiting = 0.0
         kv = None
         if self.telemetry is not None:
@@ -356,7 +392,9 @@ class CanaTuneRouter:
                 and self.settings.overload != "best_effort"):
             # Legacy policies retain the calibrated admission ceiling. In best
             # effort B* is an SLO warning, not the hardware's concurrency limit.
-            if max(running + waiting, group.n_inflight) + 1 > table.decode_max_running:
+            if max(running + waiting, group.n_await + group.n_decoding) + 1 > (
+                table.decode_max_running
+            ):
                 return busy, "decode_concurrency_wall"
         if table is not None and table.decode_kv_limit is not None and kv is not None:
             if kv > table.decode_kv_limit:
@@ -404,73 +442,138 @@ class CanaTuneRouter:
                 return "decode_kv"
         return None
 
+    def routes(self) -> list[Route]:
+        """(P, D) choices: each routable group alone, or with dynamic pairing every P
+        of a routable group with every D of one (a group being parked, woken or
+        explored by the Canary takes part in neither role)."""
+        active = [g for g in self.groups if g.routable]
+        if self.settings.pairing == "fixed":
+            return [Route(g, g) for g in active]
+        return [Route(p, d) for d in active for p in active]
+
     def candidates(
         self, tokens: int, waited_ms: float = 0.0
-    ) -> list[tuple[Group, Cell, RiskEstimate | None, bool]]:
-        """Groups that may take this request now, with their risk cell (the slack
-        estimate, when that decided, is kept in self._slack_by_group). The slack
-        is what remains of the TTFT budget after `waited_ms` and the prediction."""
+    ) -> list[tuple[Route, Cell, RiskEstimate | None, bool]]:
+        """Routes that may take this request now, with their risk cell (the slack
+        estimate, when that decided, is kept in self._slack_by_group by route key).
+        The slack is what remains of the TTFT budget after `waited_ms` and the
+        prediction. P-side state comes from the route's P group, D-side state
+        (telemetry, KV in flight, the length model) from its D group."""
         out = []
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
         self._tpot_by_group: dict[str, float] = {}
-        self._within_limits: list[tuple[Group, Cell, bool]] = []
-        for group in self.groups:
-            if not group.routable:
-                continue
-            assert group.effective is not None
+        self._within_limits: list[tuple[Route, Cell, bool]] = []
+        decode_checked: dict[str, tuple[bool, str | None, bool, str | None]] = {}
+        for route in self.routes():
+            group, dg, key = route.p, route.d, route.key
+            assert group.effective is not None and dg.effective is not None
+            clock = (group.effective if group is dg
+                     else ClockPoint(group.effective.prefill_mhz, dg.effective.decode_mhz))
             s_own = self.prefill_cost(group.effective.prefill_mhz)(tokens)
-            x, predicted = self._predict(group, s_own)
+            x, predicted = self._predict(group, s_own, dg)
             if self.open_admission:
-                d_busy = group.n_inflight > group.n_await
-                cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
-                self._slack_by_group[group.name] = (x, predicted, None)
-                out.append((group, cell, None, d_busy))
+                d_busy = dg.n_decoding > 0
+                cell = self.table.cell(clock, dg.n_await, tokens, d_busy)
+                self._slack_by_group[key] = (x, predicted, None)
+                out.append((route, cell, None, d_busy))
                 continue
-            d_busy, blocked = self._decode_state(group)
+            if dg.name not in decode_checked:  # D-side checks once per D
+                d_busy, blocked = self._decode_state(dg)
+                kv = self._kv_blocked(dg, tokens) and self.settings.admission == "slack"
+                tier_table = self.tiers.table
+                risk = None
+                if (self.settings.overload == "best_effort" and tier_table is not None
+                        and tier_table.decode_length and blocked is None):
+                    risk = self._decode_risk(dg, tokens, tier_table)
+                decode_checked[dg.name] = (d_busy, blocked, kv, risk)
+            d_busy, blocked, kv_blocked, decode_risk = decode_checked[dg.name]
             if blocked is not None:
                 continue
-            cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
-            if self._kv_blocked(group, tokens) and self.settings.admission == "slack":
+            cell = self.table.cell(clock, dg.n_await, tokens, d_busy)
+            if kv_blocked:
                 continue
-            self._within_limits.append((group, cell, d_busy))
+            self._within_limits.append((route, cell, d_busy))
             tier_table = self.tiers.table
             length_model = tier_table is not None and bool(tier_table.decode_length)
             if self.settings.overload == "best_effort" and length_model:
-                if self._decode_risk(group, tokens, tier_table) is not None:
-                    self._slack_by_group[group.name] = (x, predicted, None)
+                if decode_risk is not None:
+                    self._slack_by_group[key] = (x, predicted, None)
                     continue  # warn, but remains eligible for best-effort dispatch
             elif (self.settings.overload == "best_effort" and tier_table is not None
                     and tier_table.decode_max_running is not None):
                 # P requests are not running D sequences. Telemetry covers D's
                 # own queue; stage reservations cover unobserved running work.
-                snapshot = (self.telemetry.fresh(group.decode, self.settings.snapshot_max_age_s)
+                snapshot = (self.telemetry.fresh(dg.decode, self.settings.snapshot_max_age_s)
                             if self.telemetry is not None else None)
-                d_load = max(group.n_decoding, (snapshot.running or 0) + (snapshot.waiting or 0)
+                d_load = max(dg.n_decoding, (snapshot.running or 0) + (snapshot.waiting or 0)
                              if snapshot is not None else 0)
                 if d_load + 1 > tier_table.decode_max_running:
-                    self._slack_by_group[group.name] = (x, predicted, None)
+                    self._slack_by_group[key] = (x, predicted, None)
                     continue  # warn, but remains eligible for best-effort dispatch
             model = self.tiers.model_json()
             if model and self.settings.overload == "best_effort" and not length_model:
                 decode = model.get("decode") or {}
-                f = group.effective.decode_mhz
+                f = dg.effective.decode_mhz
                 alpha = interpolate({int(k): v[0] for k, v in decode.items()}, f) or 0
                 delta = interpolate({int(k): v[1] for k, v in decode.items()}, f) or 0
-                if alpha + delta * (group.n_inflight + 1) > self.settings.tpot_slo_ms:
-                    self._slack_by_group[group.name] = (x, predicted, None)
+                if alpha + delta * (dg.n_await + dg.n_decoding + 1) > self.settings.tpot_slo_ms:
+                    self._slack_by_group[key] = (x, predicted, None)
                     continue  # TPOT risk requests resources, not a hard rejection
             if self.settings.admission == "slack":
                 slack = self.slack.estimate(self.settings.ttft_slo_ms - waited_ms - predicted)
-                self._slack_by_group[group.name] = (x, predicted, slack)
+                self._slack_by_group[key] = (x, predicted, slack)
                 if slack.risk <= self.settings.theta:
                     estimate = RiskEstimate(slack.risk, f"slack_{slack.source}", slack.samples)
-                    out.append((group, cell, estimate, d_busy))
+                    out.append((route, cell, estimate, d_busy))
                 continue
-            estimate = self.table.lookup(group.effective, group.n_await, tokens, d_busy)
-            self._slack_by_group[group.name] = (x, predicted, None)
+            estimate = self.table.lookup(clock, dg.n_await, tokens, d_busy)
+            self._slack_by_group[key] = (x, predicted, None)
             if estimate.risk <= self.settings.theta:
-                out.append((group, cell, estimate, d_busy))
+                out.append((route, cell, estimate, d_busy))
         return out
+
+    def _choose(
+        self, feasible: list[tuple[Route, Cell, RiskEstimate | None, bool]]
+    ) -> tuple[Route, Cell, RiskEstimate | None, bool]:
+        index = self.groups.index
+        if self.settings.pairing == "fixed":
+            if self.open_admission:
+                # Spread: least outstanding prompt work first, production before Canary.
+                return min(feasible, key=lambda item: (
+                    item[0].p.t_await, item[0].p.n_inflight, item[0].p.canary))  # fmt: skip
+            # Most loaded feasible group; production before Canary on ties.
+            return max(feasible, key=lambda item: (
+                item[0].p.n_inflight, not item[0].p.canary, -index(item[0].p)))  # fmt: skip
+
+        def d_load(g: Group) -> int:
+            return g.n_await + g.n_decoding  # requests D serves or will serve
+
+        def predicted(item) -> float:
+            entry = self._slack_by_group.get(item[0].key)
+            return float("inf") if entry is None else entry[1]
+
+        if self.open_admission:
+            return min(feasible, key=lambda item: (d_load(item[0].d), item[0].p.pending_ms,
+                                                   item[0].p.n_at_p, item[0].canary))
+        ds = {id(item[0].d): item[0].d for item in feasible}.values()
+        if self.settings.d_choice == "concentrate":
+            # The most loaded D among the safe ones; production before Canary.
+            d = max(ds, key=lambda g: (d_load(g), not g.canary, -index(g)))
+        else:
+            d = min(ds, key=lambda g: (d_load(g), g.canary, index(g)))
+        options = [item for item in feasible if item[0].d is d]
+        if self.settings.p_choice == "same":
+            own = [item for item in options if item[0].p is d]
+            if own:
+                return own[0]
+        if self.settings.p_choice == "concentrate":
+            # The busiest safe P (larger prefill batches), production before Canary.
+            return max(options, key=lambda item: (
+                item[0].p.n_at_p, item[0].p.pending_ms, not item[0].p.canary,
+                -index(item[0].p)))  # fmt: skip
+        # P balance: the lowest predicted TTFT (P's pending work), then least queued.
+        return min(options, key=lambda item: (
+            predicted(item), item[0].p.n_at_p, item[0].p.canary, index(item[0].p)))  # fmt: skip
 
     def try_admit(
         self,
@@ -493,12 +596,13 @@ class CanaTuneRouter:
             if not (rescue or best_effort) or not self._within_limits:
                 return None
             ranked = []
-            for group, cell, d_busy in self._within_limits:
-                predicted = self._slack_by_group[group.name][1]
-                order = (predicted, group.canary, self.groups.index(group))
-                ranked.append((*order, group, cell, d_busy))
-            predicted, _, _, group, cell, d_busy = min(ranked, key=lambda r: r[:3])
-            slack = self._slack_by_group[group.name][2]
+            for route, cell, d_busy in self._within_limits:
+                predicted = self._slack_by_group[route.key][1]
+                order = (predicted, route.canary, self.groups.index(route.p),
+                         self.groups.index(route.d))  # fmt: skip
+                ranked.append((*order, route, cell, d_busy))
+            predicted, _, _, _, route, cell, d_busy = min(ranked, key=lambda r: r[:4])
+            slack = self._slack_by_group[route.key][2]
             if best_effort:
                 kind = "best_effort"
             elif waited_ms + predicted <= self.settings.ttft_slo_ms:
@@ -514,36 +618,25 @@ class CanaTuneRouter:
                 if not spare:
                     return None
                 kind = "backfill"
-                group, cell, _, d_busy = min(
-                    spare, key=lambda item: self._slack_by_group[item[0].name][1]
+                route, cell, _, d_busy = min(
+                    spare, key=lambda item: self._slack_by_group[item[0].key][1]
                 )
-                slack = self._slack_by_group[group.name][2]
+                slack = self._slack_by_group[route.key][2]
             risk = 1.0 if slack is None else slack.risk
             samples = 0 if slack is None else slack.samples
-            feasible = [(group, cell, RiskEstimate(risk, f"overflow_{kind}", samples), d_busy)]
-        if self.open_admission:
-            # Spread: least outstanding prompt work first, production before Canary.
-            group, cell, estimate, d_busy = min(
-                feasible, key=lambda item: (item[0].t_await, item[0].n_inflight, item[0].canary)
-            )
-        else:
-            # Most loaded feasible group; production before Canary on ties.
-            group, cell, estimate, d_busy = max(
-                feasible,
-                key=lambda item: (
-                    item[0].n_inflight,
-                    not item[0].canary,
-                    -self.groups.index(item[0]),
-                ),
-            )
+            feasible = [(route, cell, RiskEstimate(risk, f"overflow_{kind}", samples), d_busy)]
+        route, cell, estimate, d_busy = self._choose(feasible)
+        group, dg = route.p, route.d
         now = self._clock()
-        x, predicted, _ = self._slack_by_group.get(group.name, ((), None, None))
+        x, predicted, _ = self._slack_by_group.get(route.key, ((), None, None))
         s_own = self.prefill_cost(None if group.effective is None else group.effective.prefill_mhz)(
             tokens
         )
         ticket = Ticket(
             id=next(self._ids),
             group=group,
+            decode_group=None if dg is group else dg,
+            decode_epoch=self.clock_epochs.get(dg.name, 0),
             cell=cell,
             estimate=estimate,
             prompt_tokens=tokens,
@@ -552,19 +645,21 @@ class CanaTuneRouter:
             wait_ms=waited_ms,
             clock_epoch=self.clock_epochs.get(group.name, 0),
             snapshot={
-                "n_await": group.n_await,
-                "t_await": group.t_await,
+                "decode_group": dg.name,
+                "n_await": dg.n_await,
+                "t_await": dg.t_await,
                 "n_inflight": group.n_inflight,
                 "d_busy": d_busy,
                 "tier": group.tier.value,
-                "clock": None if group.effective is None else group.effective.key(),
+                "clock": None if group.effective is None or dg.effective is None
+                else ClockPoint(group.effective.prefill_mhz, dg.effective.decode_mhz).key(),
                 "open_admission": self.open_admission,
                 "pending_ms": round(group.pending_ms, 1),
-                "inflight_mb": round(group.inflight_bytes / 1e6, 1),
-                "n_decoding": group.n_decoding,
+                "inflight_mb": round(dg.inflight_bytes / 1e6, 1),
+                "n_decoding": dg.n_decoding,
                 "predicted_ms": None if predicted is None else round(predicted, 1),
-                "tpot_bound_ms": (None if group.name not in self._tpot_by_group
-                                  else round(self._tpot_by_group[group.name], 1)),
+                "tpot_bound_ms": (None if dg.name not in self._tpot_by_group
+                                  else round(self._tpot_by_group[dg.name], 1)),
             },
             s_own_ms=s_own,
             features=tuple(x),
@@ -579,9 +674,11 @@ class CanaTuneRouter:
             ticket.snapshot["overflow"] = kind
         group.n_at_p += 1
         group.pending_ms += s_own
-        group.n_await += 1
-        group.t_await += tokens
+        dg.n_await += 1
+        dg.t_await += tokens
         group.n_inflight += 1
+        if dg is not group:
+            dg.n_inflight += 1
         group.record_admission(now, tokens, self.settings.load_window_s)
         self.admitted += 1
         if self.settings.overload == "best_effort":
@@ -719,14 +816,14 @@ class CanaTuneRouter:
         return ticket.prompt_tokens * self.settings.kv_bytes_per_token
 
     def _leave_stage(self, ticket: Ticket) -> None:
-        group = ticket.group
+        group, dg = ticket.group, ticket.dgroup
         if ticket.stage == "prefill":
             group.n_at_p -= 1
             group.pending_ms = max(0.0, group.pending_ms - ticket.s_own_ms)
         elif ticket.stage == "transfer":
-            group.inflight_bytes = max(0.0, group.inflight_bytes - self._kv_bytes(ticket))
+            dg.inflight_bytes = max(0.0, dg.inflight_bytes - self._kv_bytes(ticket))
         elif ticket.stage == "decode":
-            group.n_decoding -= 1
+            dg.n_decoding -= 1
 
     def prefill_done(self, ticket: Ticket) -> None:
         """P returned: its KV now travels to (or waits in the buffer of) the D."""
@@ -734,18 +831,18 @@ class CanaTuneRouter:
             return
         self._leave_stage(ticket)
         ticket.stage = "transfer"
-        ticket.group.inflight_bytes += self._kv_bytes(ticket)
+        ticket.dgroup.inflight_bytes += self._kv_bytes(ticket)
 
     def first_token(self, ticket: Ticket) -> None:
         if ticket.first_token_at is not None or ticket.finished:
             return
         ticket.first_token_at = self._clock()
         ticket.last_token_at = ticket.first_token_at
-        ticket.group.n_await -= 1
-        ticket.group.t_await -= ticket.prompt_tokens
+        ticket.dgroup.n_await -= 1
+        ticket.dgroup.t_await -= ticket.prompt_tokens
         self._leave_stage(ticket)
         ticket.stage = "decode"
-        ticket.group.n_decoding += 1
+        ticket.dgroup.n_decoding += 1
 
     def _actionable_ttft(self, tokens: int) -> bool:
         """Do not scale the cluster for prompts already impossible at idle/MAX."""
@@ -830,11 +927,13 @@ class CanaTuneRouter:
         if ticket.finished:
             return
         if ticket.first_token_at is None:
-            ticket.group.n_await -= 1
-            ticket.group.t_await -= ticket.prompt_tokens
+            ticket.dgroup.n_await -= 1
+            ticket.dgroup.t_await -= ticket.prompt_tokens
         self._leave_stage(ticket)
         ticket.stage = "done"
         ticket.group.n_inflight -= 1
+        if ticket.decode_group is not None:
+            ticket.decode_group.n_inflight -= 1
         ticket.finished = True
         self._live.pop(ticket.id, None)
         if status == "ok":
@@ -860,7 +959,8 @@ class CanaTuneRouter:
             skip = "ttft_unknown"
         elif not ticket.prompt_exact:
             skip = "prompt_length_estimated"
-        elif self.clock_epochs.get(ticket.group.name, 0) != ticket.clock_epoch:
+        elif (self.clock_epochs.get(ticket.group.name, 0) != ticket.clock_epoch
+              or self.clock_epochs.get(ticket.dgroup.name, 0) != ticket.decode_epoch):
             skip = "clock_changed"
         if skip is None:
             self.table.record(ticket.cell, bool(violated))
@@ -879,7 +979,7 @@ class CanaTuneRouter:
                 "id": ticket.id,
                 "group": ticket.group.name,
                 "prefill": ticket.group.prefill,
-                "decode": ticket.group.decode,
+                "decode": ticket.dgroup.decode,
                 "cell": ticket.cell.key(),
                 "risk": None if ticket.estimate is None else ticket.estimate.risk,
                 "risk_source": None if ticket.estimate is None else ticket.estimate.source,

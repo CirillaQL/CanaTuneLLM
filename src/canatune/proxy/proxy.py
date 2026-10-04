@@ -413,7 +413,7 @@ def create_proxy_router(
             ticket.streaming = body.get("stream") is True
             stamps["admitted"] = time.monotonic()
             prefill = selector.endpoints[ticket.group.prefill]
-            decode = selector.endpoints[ticket.group.decode]
+            decode = selector.endpoints[ticket.dgroup.decode]
         else:
             # Explicit Canary probes bypass admission: they are experiments.
             prefill, decode = await selector.choose(canary=route == "canary")

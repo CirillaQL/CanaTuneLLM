@@ -1207,3 +1207,50 @@ def test_length_model_kv_wall_counts_the_growth_of_sequences_on_d():
     ticket = router.step(router.new_waiter(), 128, True, 0)
     assert ticket.overflow == "best_effort" and router.risk_signals == 1
     assert ticket.snapshot["tpot_bound_ms"] < 200
+
+
+def dynamic_router(**router_keys):
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    router.settings = dataclasses.replace(router.settings, pairing="dynamic", **router_keys)
+    activate(groups[1:3])
+    busy, idle = groups[1], groups[2]
+    busy.n_decoding = busy.n_inflight = 10  # D1 decodes ten requests
+    busy.pending_ms, busy.n_at_p = 300.0, 3  # and P1 has prompts queued
+    return router, busy, idle
+
+
+def test_dynamic_pairing_concentrates_d_and_balances_p():
+    router, busy, idle = dynamic_router()
+    ticket = router.try_admit(128, True)
+    # D: the most loaded safe D (D1); P: the lowest predicted TTFT (P2, nothing queued)
+    assert ticket.group is idle and ticket.dgroup is busy
+    assert ticket.snapshot["decode_group"] == busy.name
+    assert (idle.n_at_p, idle.n_inflight, busy.n_await, busy.n_inflight) == (1, 1, 1, 11)
+    router.prefill_done(ticket)
+    assert idle.n_at_p == 0 and busy.inflight_bytes > 0 and idle.inflight_bytes == 0
+    router.first_token(ticket)
+    assert busy.n_await == 0 and busy.n_decoding == 11 and busy.inflight_bytes == 0
+    router.finish(ticket, status="ok", ttft_ms=300.0, tpot_ms=60.0, output_tokens=8)
+    assert (idle.n_inflight, busy.n_inflight, busy.n_decoding) == (0, 10, 10)
+
+
+def test_dynamic_pairing_choices_are_configurable():
+    router, busy, idle = dynamic_router(p_choice="same")
+    ticket = router.try_admit(128, True)
+    assert ticket.group is busy and ticket.decode_group is None  # D1 with its own P1
+    router, busy, idle = dynamic_router(d_choice="balance")
+    ticket = router.try_admit(128, True)
+    assert ticket.dgroup is idle and ticket.group is idle  # the idle D, then its idle P
+    router, busy, idle = dynamic_router(p_choice="concentrate")
+    ticket = router.try_admit(128, True)
+    assert ticket.group is busy and ticket.dgroup is busy  # the busiest safe P (batching)
+
+
+def test_dynamic_pairing_skips_a_group_the_canary_explores():
+    router, busy, idle = dynamic_router()
+    idle.state = GroupState.EXPLORING
+    ticket = router.try_admit(128, True)
+    assert ticket.group is busy and ticket.dgroup is busy
+    assert all(idle not in (r.p, r.d) for r in router.routes())

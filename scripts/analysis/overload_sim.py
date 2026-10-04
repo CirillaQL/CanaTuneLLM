@@ -60,7 +60,7 @@ import json
 import random
 import statistics
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from canatune import loadgen
@@ -68,6 +68,7 @@ from canatune.config import load_config
 from canatune.controller.locator import (
     AdmissionInputs,
     Hardware,
+    LocatorError,
     LocatorSettings,
     TierLocator,
     WindowResult,
@@ -203,6 +204,7 @@ L4_E = Physics(
     overhead_jitter_ms=11.0,
     probe_overhead_ms=0.0,
     p_clocks=(600, 840, 1080, 1320, 1560, 1800, 2040, 2280, 2520),
+    p_f_eff=2520,  # no power cap under load [job E/F Canary: f_eff 2520]
     d_clocks=(300, 735, 1170, 1605, 2040),  # the Canary's coarse D points on the L4
     p_model=(
         (600, 50.27, 0.19526, 156),
@@ -222,7 +224,16 @@ L4_E = Physics(
     tpot_jitter_ms=1.0,
     d_admit="vllm",
 )
-PHYSICS = {"reference": REFERENCE, "l4e": L4_E}
+# The same cluster with D measured in situ: the Canary fits of job G (and, nearly
+# identical, H) at the two clocks production uses, from 336 / 219 probe requests
+# over 1.5-44 sequences and 1.8k-26k context tokens (corr 0.51 / 0.77).
+L4_G = replace(
+    L4_E,
+    name="l4g",
+    d_model=((300, 82.1, 1.57, 3.2e-3), (735, 59.39, 0.407, 1.30e-3),
+             (1170, 57.73, 0.192, 1.007e-3), (2040, 56.16, 0.272, 7.11e-4)),  # fmt: skip
+)
+PHYSICS = {"reference": REFERENCE, "l4e": L4_E, "l4g": L4_G}
 
 
 @dataclass
@@ -234,7 +245,8 @@ class Req:
     output: int
     waiter: int = 0
     ticket: Ticket | None = None
-    pair: "Pair | None" = None
+    pair: "Pair | None" = None  # its P (and D with fixed pairing)
+    d_pair: "Pair | None" = None  # its D
     first: float | None = None
     done: float | None = None
     emitted: int = 0
@@ -264,6 +276,7 @@ class Pair:
     d_running: list = field(default_factory=list)
     d_looping: bool = False
     send_retries: int = 0
+    retry_scheduled: bool = False
     at_p: dict = field(default_factory=dict)  # request id -> prompt (dispatch .. P done)
     inflight_tokens: int = 0  # P done .. first token
     decoding: int = 0
@@ -427,9 +440,11 @@ class Sim:
                 f_p, f_d = self.phys.p_clocks[0], self.phys.d_clocks[0]
             else:
                 f_p, f_d = p.clock.prefill_mhz, p.clock.decode_mhz
-            watts = self.phys.p_power(f_p, p_util) + self.phys.d_power(f_d, d_util)
-            self.energy_j += watts
-            row["w"] = row.get("w", 0.0) + watts
+            p_w, d_w = self.phys.p_power(f_p, p_util), self.phys.d_power(f_d, d_util)
+            self.energy_j += p_w + d_w
+            row["w"] = row.get("w", 0.0) + p_w + d_w
+            row["wp"] = row.get("wp", 0.0) + p_w
+            row["wd"] = row.get("wd", 0.0) + d_w
         if self.router is not None:
             row["holding"] = len(self.router._holding)
         self.timeline.append(row)
@@ -452,15 +467,17 @@ class Sim:
         result = self.router.step(r.waiter, r.prompt, True, (self.now - r.at) * 1000.0)
         if isinstance(result, Ticket):
             r.ticket = result
-            self.dispatch(r, next(p for p in self.pairs if p.name == result.group.name))
+            by_name = {p.name: p for p in self.pairs}
+            self.dispatch(r, by_name[result.group.name], by_name[result.dgroup.name])
         elif result == "reject":
             r.status = "rejected"
         else:
             self.at(self.now + self.router.settings.retry_period_ms / 1000.0, self.retry, r)
 
-    def dispatch(self, r: Req, pair: Pair) -> None:
+    def dispatch(self, r: Req, pair: Pair, d_pair: Pair | None = None) -> None:
         r.pair = pair
-        r.state = (tuple(pair.at_p.values()), pair.inflight_tokens, pair.decoding)
+        r.d_pair = pair if d_pair is None else d_pair
+        r.state = (tuple(pair.at_p.values()), pair.inflight_tokens, r.d_pair.decoding)
         pair.at_p[r.id] = r.prompt
         delay = self.overhead_ms
         if self.phys.overhead_jitter_ms and self.overhead_ms > 0:
@@ -497,26 +514,36 @@ class Sim:
                 self.router.prefill_done(r.ticket)
         self.send(pair)
 
-    def send(self, pair: Pair) -> None:
-        while pair.unsent and pair.buffer + pair.unsent[0].kv <= self.phys.kv_buffer_bytes:
+    def send(self, pair: Pair, retry: bool = False) -> None:
+        """P sends finished KV in order over its link into each request's D receive
+        buffer; a full buffer at the head blocks P (it retries and starts nothing)."""
+        if retry:
+            pair.retry_scheduled = False
+        while pair.unsent:
+            dest = pair.unsent[0].d_pair
+            if dest.buffer + pair.unsent[0].kv > self.phys.kv_buffer_bytes:
+                break
             r = pair.unsent.popleft()
-            pair.buffer += r.kv
+            dest.buffer += r.kv
             start = max(self.now, pair.link_free)
             pair.link_free = start + r.kv / self.phys.link_bytes_s
             self.at(pair.link_free, self.kv_arrived, r)
         if pair.unsent:  # buffer full: P retries the send and starts nothing else
-            pair.send_retries += 1
-            self.at(self.now + self.phys.send_retry_s, self.send, pair)
+            if not pair.retry_scheduled:
+                pair.send_retries += 1
+                pair.retry_scheduled = True
+                self.at(self.now + self.phys.send_retry_s, self.send, pair, True)
         else:
             self.p_start(pair)
 
     # ---- D ---------------------------------------------------------------------------
 
     def kv_arrived(self, r: Req) -> None:
-        r.pair.d_ready.append(r)
-        if not r.pair.d_looping:
-            r.pair.d_looping = True
-            self.d_iter(r.pair)
+        d = r.d_pair
+        d.d_ready.append(r)
+        if not d.d_looping:
+            d.d_looping = True
+            self.d_iter(d)
 
     def d_iter(self, pair: Pair) -> None:
         joined = []
@@ -565,7 +592,9 @@ class Sim:
             pair.d_looping = False
             return
         if joined:
-            self.send(pair)  # buffer space for P's pending sends
+            for p in self.pairs:  # buffer space for the P's pending sends to this D
+                if p.unsent and p.unsent[0].d_pair is pair:
+                    self.send(p)
         held = self.kv_used(pair)
         n = len(pair.d_running)
         dur = self.phys.d_iter_ms(pair.clock.decode_mhz, n, held) / 1000.0 + recompute_s
@@ -582,7 +611,7 @@ class Sim:
         for r in list(pair.d_running):
             if r in joined and r.first is None:
                 r.first = self.now + self.phys.d_first_extra_ms / 1000.0
-                pair.inflight_tokens -= r.prompt
+                r.pair.inflight_tokens -= r.prompt
                 pair.decoding += 1
                 if r.ticket is not None:
                     self.router.first_token(r.ticket)
@@ -693,9 +722,9 @@ def summarize(sim: Sim, phases: list[dict]) -> dict:
             # Energy over the stage's own span (first arrival to last completion), as
             # the benchmark driver measures it.
             start, end = min(r.at for r in rows), max(r.done for r in served)
-            out[ph["name"]]["energy_kj"] = (
-                sum(row.get("w", 0.0) for row in sim.timeline if start <= row["t"] < end) / 1000
-            )
+            span = [row for row in sim.timeline if start <= row["t"] < end]
+            for key, name in (("w", "energy_kj"), ("wp", "p_energy_kj"), ("wd", "d_energy_kj")):
+                out[ph["name"]][name] = sum(row.get(key, 0.0) for row in span) / 1000
     out["send_retries"] = sum(p.send_retries for p in sim.pairs)
     out["preemptions"] = sum(p.preemptions for p in sim.pairs)
     if sim.router is not None:
@@ -712,8 +741,9 @@ class SimBackend:
 
     decode_output_tokens = 256  # closed windows, as the probe
 
-    def __init__(self, phys: Physics, lengths=LENGTHS, seed: int = 7) -> None:
+    def __init__(self, phys: Physics, lengths=LENGTHS, seed: int = 7, salt: int = 0) -> None:
         self.phys = phys
+        self.salt = salt  # another attempt draws other window traces
         self.lengths = list(lengths)
         self.rng = random.Random(seed)
         self.limit: int | None = None
@@ -820,7 +850,7 @@ class SimBackend:
                    seed=self.rng.randrange(10**9))  # fmt: skip
 
     async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
-        trace = random.Random(int(eq_tps * 10) + 17)
+        trace = random.Random(int(eq_tps * 10) + 17 + 1_000_003 * self.salt)
         pairs = self._pairs()
         mean = sum(p for p, _ in pairs) / len(pairs)
         count = max(1, round(eq_tps / (mean + alpha) * seconds))
@@ -834,7 +864,7 @@ class SimBackend:
 
     async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
         salt = {"all": 0, "short": 1, "long": 2}[mix]
-        trace = random.Random(concurrency * 101 + rep + 1_000_003 * salt)
+        trace = random.Random(concurrency * 101 + rep + 1_000_003 * salt + 7_919 * self.salt)
         prompts = self._mix(mix)
         s = self._window_sim(clock)
         ids = iter(range(10**9))
@@ -860,17 +890,23 @@ class SimBackend:
 def run_canary(phys: Physics = REFERENCE, lengths=LENGTHS) -> tuple[TierTable, SimBackend]:
     """The real tier locator on the simulated pair; deployment inputs only: the KV
     geometry and kv_buffer_size (what config.yaml and the model's config.json give)."""
-    backend = SimBackend(phys, lengths)
-    locator = TierLocator(
-        backend,
-        LocatorSettings.from_config(sim_config()),
-        admission=AdmissionInputs(
-            kv_bytes_per_token=phys.kv_bytes_per_token, kv_buffer_bytes=phys.kv_buffer_bytes
-        ),
-    )
     prompts = sorted({p for p, _ in lengths})
-    table = asyncio.run(locator.locate(sum(prompts) / len(prompts), prompts))
-    return table, backend
+    for attempt in range(3):  # as the service: a failed calibration runs again
+        backend = SimBackend(phys, lengths, seed=7 + attempt, salt=attempt)
+        locator = TierLocator(
+            backend,
+            LocatorSettings.from_config(sim_config()),
+            admission=AdmissionInputs(
+                kv_bytes_per_token=phys.kv_bytes_per_token, kv_buffer_bytes=phys.kv_buffer_bytes
+            ),
+        )
+        try:
+            table = asyncio.run(locator.locate(sum(prompts) / len(prompts), prompts))
+        except LocatorError as error:
+            print(f"Canary attempt {attempt + 1} failed: {error}")
+            continue
+        return table, backend
+    raise LocatorError("calibration failed (3 attempts)")
 
 
 def trace(table: TierTable, profile: str, seed: int, lengths=LENGTHS):
