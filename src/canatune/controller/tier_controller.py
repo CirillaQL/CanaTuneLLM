@@ -382,7 +382,12 @@ class TierController:
             self.mode = self.router.control_mode = mode
             if mode in ("expanding", "full_effort") or previous in ("expanding", "full_effort"):
                 self._target = self._target_since = None  # resources changed, target must re-settle
-            self.log.write({"event": "control_mode", "mode": mode, "reason": reason})
+            record: dict[str, Any] = {"event": "control_mode", "mode": mode, "reason": reason}
+            if mode in ("confirming", "full_effort") and self.feedback:
+                # which production signal it was (diagnosis of real runs)
+                record["feedback"] = {k: round(v, 3) if isinstance(v, float) else v
+                                      for k, v in self.feedback.items()}
+            self.log.write(record)
 
     async def _feedback_control(self, now: float) -> None:
         s = self.settings

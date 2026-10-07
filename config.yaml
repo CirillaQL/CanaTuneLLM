@@ -131,6 +131,14 @@ router:
   d_balance_modes: [confirming, expanding, full_effort]  # dynamic: D balanced under pressure
   kv_projection_hard: false   # true: a D whose projected KV passes the wall takes no request
                               # (requests wait); false: it only warns (default strategy)
+  # Production TPOT feedback. window: per D, the 95th percentile of the token gaps of the
+  # last 5 s against the TPOT SLO; one live gap counts only from 5 x the SLO (a hung
+  # stream) and is never severe. gap (legacy): any request's latest gap >= 0.9 x SLO.
+  tpot_feedback: window
+  tpot_window_s: 5
+  tpot_window_quantile: 0.95
+  tpot_window_min_gaps: 50
+  tpot_stall_factor: 5
 
 telemetry:
   enabled: true

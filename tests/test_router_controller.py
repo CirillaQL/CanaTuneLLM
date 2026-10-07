@@ -76,11 +76,12 @@ def published(model: bool = False, calibrated: bool = True, **kwargs) -> TierTab
 
 def setup(
     table=None, telemetry=None, store=None, admission="cells", overload="reject", solver=False,
-    theta=None,
+    theta=None, router=None,
 ):
     config = load_config()
     if theta is not None:
         config["router"]["theta"] = theta
+    config["router"].update(router or {})
     config["controller"]["stagger_s"] = 0.0
     config["controller"]["solver"] = solver  # the optional solver; off by default
     config["router"]["admission"] = admission
@@ -863,8 +864,10 @@ def test_one_violation_does_not_confirm_and_intrinsically_long_ttft_is_excluded(
 
 
 def test_live_decode_stall_confirms_without_waiting_for_request_completion():
+    # legacy gap feedback: a live gap past 0.9 x the TPOT SLO is pressure
     clock, _, groups, _, router, controller, _ = setup(
-        table=published(), admission="slack", overload="best_effort"
+        table=published(), admission="slack", overload="best_effort",
+        router={"tpot_feedback": "gap"},
     )
     activate(groups[1:2])  # the others parked: expansion has groups to wake
     ticket = router.try_admit(128, True)
@@ -923,7 +926,8 @@ def test_solver_capacity_prediction_cannot_expand_without_production_confirmatio
 
 def test_old_first_token_latency_is_not_refreshed_by_new_tokens_or_completion():
     clock, _, groups, _, router, _, _ = setup(
-        table=published(), admission="slack", overload="best_effort"
+        table=published(), admission="slack", overload="best_effort",
+        router={"tpot_feedback": "gap"},
     )
     activate(groups)
     ticket = router.try_admit(128, True)
@@ -1363,3 +1367,78 @@ def test_hard_projected_kv_makes_requests_wait_instead_of_overfilling_d():
     assert router.step(router.new_waiter(), 2048, True, 0) == "wait"
     router, group = length_router(10, 0.85)  # default: warn, then best effort
     assert router.step(router.new_waiter(), 2048, True, 0).overflow == "best_effort"
+
+
+def window_setup(**router):
+    return setup(table=published(), admission="slack", overload="best_effort",
+                 router={"tpot_feedback": "window", "tpot_window_s": 30.0,
+                         "tpot_window_min_gaps": 20, **router})
+
+
+def stream(router, clock, ticket, gaps_ms) -> None:
+    for gap in gaps_ms:
+        clock.now += gap / 1000
+        router.token_progress(ticket, gap)
+
+
+def test_window_feedback_ignores_isolated_long_gaps():
+    clock, _, groups, _, router, controller, _ = window_setup()
+    activate(groups[1:2])
+    slo = router.settings.tpot_slo_ms
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    # healthy spacing with 3 % of the gaps above the SLO, and a short live stall
+    stream(router, clock, ticket, [0.4 * slo] * 29 + [1.5 * slo])
+    clock.now += 1.5 * slo / 1000
+    asyncio.run(controller.tick())
+    f = controller.feedback
+    assert controller.mode == "energy" and not f["pressure"] and not f["severe"]
+    assert f["tpot_window_ratio"] < 1 and f["tpot_window_group"] == ticket.dgroup.name
+
+
+def test_window_feedback_confirms_when_the_gap_quantile_reaches_the_slo():
+    clock, _, groups, _, router, controller, _ = window_setup()
+    activate(groups[1:2])
+    slo = router.settings.tpot_slo_ms
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    stream(router, clock, ticket, [0.5 * slo] * 15 + [1.1 * slo] * 5)  # 25 % above
+    asyncio.run(controller.tick())
+    assert controller.feedback["tpot_window_ratio"] >= 1
+    assert controller.mode == "confirming"
+
+
+def test_window_feedback_needs_enough_gaps_and_forgets_old_ones():
+    clock, _, groups, _, router, controller, _ = window_setup(
+        tpot_window_s=1.0, tpot_window_min_gaps=20
+    )
+    activate(groups[1:2])
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    stream(router, clock, ticket, [30] * 5 + [120] * 5)  # too few gaps in the window
+    assert router.tpot_window() == (0.0, None)
+    stream(router, clock, ticket, [20] * 30)  # 0.6 s: the slow gaps leave the window
+    assert 0 < router.tpot_window()[0] < 1
+
+
+def test_window_feedback_treats_a_hung_stream_as_pressure_not_severity():
+    clock, _, groups, _, router, controller, _ = window_setup()
+    activate(groups[1:2])
+    slo = router.settings.tpot_slo_ms
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    stream(router, clock, ticket, [0.4 * slo] * 3)
+    clock.now += 5.5 * slo / 1000  # no token for 5.5 x the SLO
+    f = router.production_feedback(10, 5, 0.9)
+    assert f["pressure"] and not f["severe"] and f["stall_ratio"] >= 5
+
+
+def test_window_feedback_drops_completion_tpot():
+    clock, _, groups, _, router, _, _ = window_setup()
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    router.finish(ticket, status="ok", ttft_ms=100, tpot_ms=3 * router.settings.tpot_slo_ms,
+                  output_tokens=64)
+    f = router.production_feedback(10, 1, 0.9)
+    assert f["samples"] == 1 and not f["pressure"]

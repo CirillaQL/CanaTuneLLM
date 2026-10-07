@@ -99,6 +99,18 @@ class RouterSettings:
     d_balance_modes: tuple[str, ...] = ("confirming", "expanding", "full_effort")
     d_choice: str = "concentrate"
     p_choice: str = "balance"
+    # Production TPOT feedback. window: per D, the quantile of the token gaps of the last
+    # tpot_window_s against the TPOT SLO (pressure at or above it); a single live gap
+    # counts only from tpot_stall_factor x the SLO (a hung stream), never as severe.
+    # A D stall delays every sequence of its step at once, so the window spans enough
+    # steps (~70 at 5 s) that one stall stays below the quantile.
+    # gap (legacy): every request's latest gap against feedback_near_slo x the SLO, and
+    # a live gap of 2 x the SLO is severe.
+    tpot_feedback: str = "window"
+    tpot_window_s: float = 5.0
+    tpot_window_quantile: float = 0.95
+    tpot_window_min_gaps: int = 50
+    tpot_stall_factor: float = 5.0
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "RouterSettings":
@@ -133,7 +145,19 @@ class RouterSettings:
             d_balance_modes=_modes(raw),
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
+            tpot_feedback=_choice(raw, "tpot_feedback", ("window", "gap"), "window"),
+            tpot_window_s=_positive(raw, "tpot_window_s", 5.0),
+            tpot_window_quantile=_fraction(raw, "tpot_window_quantile", 0.95),
+            tpot_window_min_gaps=int(_positive(raw, "tpot_window_min_gaps", 50)),
+            tpot_stall_factor=_positive(raw, "tpot_stall_factor", 5.0),
         )
+
+
+def _fraction(raw: Mapping[str, Any], key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 < value <= 1:
+        raise RouterConfigError(f"router.{key} must be in (0, 1]")
+    return float(value)
 
 
 def _admission(raw: Mapping[str, Any]) -> str:
@@ -312,6 +336,8 @@ class CanaTuneRouter:
         self._live: dict[int, Ticket] = {}
         # One sample per request: live stream updates replace rather than multiply it.
         self._production: dict[int, tuple[float, float, float, float]] = {}
+        # window TPOT feedback: recent token gaps (time, ms) per D
+        self._gaps: dict[str, deque[tuple[float, float]]] = {}
 
     def signal_pressure(self, reason: str) -> None:
         """Wake control immediately; this signal never changes GPU clocks here."""
@@ -994,10 +1020,38 @@ class CanaTuneRouter:
             self.pressure_event.set()  # feedback wakes control without becoming a prediction
 
     def token_progress(self, ticket: Ticket, tpot_ms: float | None) -> None:
-        ticket.last_token_at = self._clock()
+        now = ticket.last_token_at = self._clock()
         ttft = ((ticket.first_token_at - ticket.admitted_at) * 1000 + ticket.wait_ms
                 if ticket.first_token_at is not None else None)
-        self.observe_latency(ticket, ttft, tpot_ms)
+        if self.settings.tpot_feedback == "gap":
+            self.observe_latency(ticket, ttft, tpot_ms)
+            return
+        # window: the gap joins its D's window (TPOT feedback is the windows' quantile)
+        if tpot_ms is not None:
+            gaps = self._gaps.setdefault(ticket.dgroup.name, deque())
+            gaps.append((now, tpot_ms))
+            while gaps and gaps[0][0] < now - self.settings.tpot_window_s:
+                gaps.popleft()
+            if tpot_ms >= self.settings.tpot_stall_factor * self.settings.tpot_slo_ms:
+                self.pressure_event.set()
+        self.observe_latency(ticket, ttft, None)
+
+    def tpot_window(self) -> tuple[float, str | None]:
+        """-> (the largest windowed gap quantile over the TPOT SLO, its D group); D
+        groups with fewer than tpot_window_min_gaps recent gaps do not count."""
+        s = self.settings
+        now = self._clock()
+        worst, where = 0.0, None
+        for name, gaps in self._gaps.items():
+            while gaps and gaps[0][0] < now - s.tpot_window_s:
+                gaps.popleft()
+            if len(gaps) < s.tpot_window_min_gaps:
+                continue
+            ordered = sorted(ms for _, ms in gaps)
+            q = ordered[min(len(ordered) - 1, math.ceil(s.tpot_window_quantile * len(ordered)) - 1)]
+            if q / s.tpot_slo_ms > worst:
+                worst, where = q / s.tpot_slo_ms, name
+        return worst, where
 
     def production_feedback(
         self, window_s: float, min_samples: int, near: float, *, since: float = float("-inf"),
@@ -1012,7 +1066,8 @@ class CanaTuneRouter:
             max(r if t >= cutoff else 0, dr if dt >= cutoff else 0)
             for t, r, dt, dr in self._production.values() if max(t, dt) >= cutoff
         ]
-        live_ratio = 0.0
+        window = self.settings.tpot_feedback == "window"
+        live_ratio = stall_ratio = 0.0
         for ticket in self._live.values():
             if ticket.first_token_at is None:
                 if not ticket.streaming and ticket.stage != "prefill":
@@ -1021,19 +1076,25 @@ class CanaTuneRouter:
                     age = (now - ticket.admitted_at) * 1000 + ticket.wait_ms
                     live_ratio = max(live_ratio, age / self.settings.ttft_slo_ms)
             elif ticket.last_token_at is not None:
-                live_ratio = max(
-                    live_ratio, (now - ticket.last_token_at) * 1000 / self.settings.tpot_slo_ms,
-                )
+                gap = (now - ticket.last_token_at) * 1000 / self.settings.tpot_slo_ms
+                if window:  # a stall counts as pressure, never as severe
+                    stall_ratio = max(stall_ratio, gap)
+                else:
+                    live_ratio = max(live_ratio, gap)
         wait_ratio = max(
             ((now - t) * 1000 / self.settings.ttft_slo_ms
              for t in self._waiting_since.values()), default=0.0,
         )
         fraction = sum(r >= near for r in ratios) / len(ratios) if ratios else 0.0
+        tpot_q, tpot_group = self.tpot_window() if window else (0.0, None)
+        stalled = stall_ratio >= self.settings.tpot_stall_factor
         return {
             "samples": len(ratios), "near_fraction": fraction,
             "live_ratio": live_ratio, "wait_ratio": wait_ratio,
+            "tpot_window_ratio": tpot_q, "tpot_window_group": tpot_group,
+            "stall_ratio": stall_ratio,
             "pressure": (len(ratios) >= min_samples and fraction > self.settings.theta)
-            or max(live_ratio, wait_ratio) >= near,
+            or max(live_ratio, wait_ratio) >= near or tpot_q >= 1.0 or stalled,
             "severe": max(live_ratio, wait_ratio) >= 2,
         }
 
@@ -1061,8 +1122,10 @@ class CanaTuneRouter:
         self._live.pop(ticket.id, None)
         if status == "ok":
             recent = self._production.get(ticket.id)
-            # Keep recent stream spacing; completion's cumulative TPOT can be old.
-            feedback_tpot = None if recent and recent[2] != float("-inf") else tpot_ms
+            # Keep recent stream spacing; completion's cumulative TPOT can be old (window:
+            # TPOT feedback comes from the gap windows only).
+            feedback_tpot = (None if self.settings.tpot_feedback == "window"
+                             or (recent and recent[2] != float("-inf")) else tpot_ms)
             self.observe_latency(ticket, ttft_ms, feedback_tpot)
         else:
             self._production.pop(ticket.id, None)

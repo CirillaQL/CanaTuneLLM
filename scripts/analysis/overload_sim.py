@@ -149,6 +149,11 @@ class Physics:
     p_power_model: tuple = ()  # (f, idle W, dynamic W at full utilization)
     d_power_model: tuple = ()
     tpot_jitter_ms: float = 0.0  # per-request TPOT noise (sd)
+    # Per D step: Gaussian noise (sd) and a rare stall (probability, extra ms), so token
+    # gaps spread as measured (production feedback reacts to gaps, not to means)
+    d_step_jitter_ms: float = 0.0
+    d_stall_prob: float = 0.0
+    d_stall_ms: float = 0.0
     # D admission: "reserve" (prompt + whole output must fit, the original model) or
     # "vllm" (the prompt fits now; when growth fills the cache the latest sequence is
     # preempted and recomputed on D when it rejoins)
@@ -232,6 +237,11 @@ L4_G = replace(
     name="l4g",
     d_model=((300, 82.1, 1.57, 3.2e-3), (735, 59.39, 0.407, 1.30e-3),
              (1170, 57.73, 0.192, 1.007e-3), (2040, 56.16, 0.272, 7.11e-4)),  # fmt: skip
+    # Token gaps of job M (CanaTune at H, ShareGPT 2 req/s, D 1170 MHz): p50 / p90 / p99
+    # 74 / 80 / 88 ms and 0.1 % stalls of ~280 ms; the step model alone spreads 69 / 72 / 75.
+    d_step_jitter_ms=4.0,
+    d_stall_prob=0.001,
+    d_stall_ms=210.0,
 )
 PHYSICS = {"reference": REFERENCE, "l4e": L4_E, "l4g": L4_G}
 
@@ -607,7 +617,12 @@ class Sim:
                     self.send(p)
         held = self.kv_used(pair)
         n = len(pair.d_running)
-        dur = self.phys.d_iter_ms(pair.clock.decode_mhz, n, held) / 1000.0 + recompute_s
+        step_ms = self.phys.d_iter_ms(pair.clock.decode_mhz, n, held)
+        if self.phys.d_step_jitter_ms:
+            step_ms = max(0.5 * step_ms, step_ms + self.rng.gauss(0.0, self.phys.d_step_jitter_ms))
+        if self.phys.d_stall_prob and self.rng.random() < self.phys.d_stall_prob:
+            step_ms += self.phys.d_stall_ms
+        dur = step_ms / 1000.0 + recompute_s
         pair.d_busy_s += dur
         pair.d_running_integral += dur * n
         for r in pair.d_running:
