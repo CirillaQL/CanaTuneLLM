@@ -55,7 +55,15 @@ topology:
     kv_port_base: 14579
     high_frequency_mhz: 1500
     memory_frequency_mhz: 6251
-    gpu_memory_utilization: 0.82
+    # auto: 1 - reserve / GPU memory (canatune.infrastructure.memory_plan); the reserve
+    # holds what vLLM does not plan for: the P2P receive buffer (kv_transfer.kv_buffer_bytes),
+    # overflow past it, one NCCL communicator per sending P, a margin. A number keeps a
+    # fixed fraction (0.82 before: 4.3 GB on an L4, which job K's overload exhausted).
+    gpu_memory_utilization: auto
+    memory_reserve:
+      overflow_bytes: 3.0e9     # received tensors past the buffer, allocator cached blocks
+      per_peer_bytes: 0.25e9    # NCCL communicator buffers per P sending to this D
+      safety_bytes: 1.0e9
 
   endpoints:
     P0: {role: prefill, gpu_id: 0, http_port: 8100, kv_port: 14579}

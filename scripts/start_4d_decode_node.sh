@@ -93,6 +93,17 @@ for index in "${!gpu_ids[@]}"; do
   http_port=$((DECODE_HTTP_PORT_BASE + index))
   kv_port=$((DECODE_KV_PORT_BASE + index))
   kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_consumer","kv_port":%d}' "$kv_port")
+  # GPU memory for vLLM: a fixed DECODE_GPU_MEMORY_UTILIZATION, or (unset / auto) the
+  # GPU's memory less the configured reserve (canatune.infrastructure.memory_plan).
+  mem_util="${DECODE_GPU_MEMORY_UTILIZATION:-auto}"
+  if [[ "$mem_util" == auto ]]; then
+    : "${CANATUNE_CONFIG:?Set CANATUNE_CONFIG (or a fixed DECODE_GPU_MEMORY_UTILIZATION)}"
+    total_mib=$(nvidia-smi -i "$gpu_id" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')
+    mem_util=$(PYTHONPATH="${PROJECT_ROOT:+$PROJECT_ROOT/src:}${PYTHONPATH:-}" "$PYTHON_BIN" \
+      -m canatune.infrastructure.memory_plan --config "$CANATUNE_CONFIG" --total-mib "$total_mib") \
+      || { echo "decode_${index}: no memory plan for GPU $gpu_id" >&2; exit 2; }
+  fi
+  echo "decode_${index}: GPU $gpu_id gpu-memory-utilization $mem_util"
   log_file="${ROLE_WORK_DIR}/logs/decode_${index}.log"
 
   # Optional: a chat template for /v1/chat/completions (a base model has none);
@@ -102,7 +113,7 @@ for index in "${!gpu_ids[@]}"; do
   CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
     --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
-    --gpu-memory-utilization "${DECODE_GPU_MEMORY_UTILIZATION:-0.82}" \
+    --gpu-memory-utilization "$mem_util" \
     --kv-transfer-config "$kv_config" \
     --no-enable-prefix-caching --no-enable-chunked-prefill \
     ${chat_args[@]+"${chat_args[@]}"} >"$log_file" 2>&1 &
