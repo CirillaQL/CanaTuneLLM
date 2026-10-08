@@ -57,6 +57,17 @@ def main(argv: list[str] | None = None) -> int:
     if n < 2 or len(args.decode_gpus) != n:
         ap.error("need the same number (>= 2) of prefill and decode GPUs: pair 0 is the Canary")
     config = yaml.safe_load(Path(args.base).read_text(encoding="utf-8"))
+    overrides = []
+    for item in args.set:
+        key, sep, value = item.partition("=")
+        if not sep:
+            ap.error(f"--set needs KEY=VALUE: {item}")
+        overrides.append((key, value))
+    # Node-group settings (ports, GPU type) must be in place before the endpoints are
+    # derived from them; the overrides are applied again at the end, so an explicit
+    # topology.endpoints.* value still wins.
+    for key, value in overrides:
+        set_path(config, key, value)
     topology = config["topology"]
     groups = {"prefill": topology["prefill_nodegroup"], "decode": topology["decode_nodegroup"]}
     groups["prefill"].update(node=args.prefill_node, gpu_ids=args.prefill_gpus)
@@ -85,10 +96,7 @@ def main(argv: list[str] | None = None) -> int:
     config["routing"]["production_pairs"] = [[f"P{i}", f"D{i}"] for i in range(1, n)]
     config["runtime"]["python"] = args.python
     config["project"]["work_dir_root"] = str(Path(args.work_dir).parent)
-    for item in args.set:
-        key, sep, value = item.partition("=")
-        if not sep:
-            ap.error(f"--set needs KEY=VALUE: {item}")
+    for key, value in overrides:
         set_path(config, key, value)
     Path(args.out).write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     print(f"wrote {args.out}: {n} pairs, canary P0/D0", file=sys.stderr)
