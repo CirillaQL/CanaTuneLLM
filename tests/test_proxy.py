@@ -99,6 +99,31 @@ def test_nixl_decode_reads_the_blocks_prefill_names() -> None:
     }
 
 
+def test_nixl_prefill_always_stops_at_its_one_token() -> None:
+    """NIXL hands KV over only when P stops at max_tokens: EOS and stop strings are
+    off for P; D keeps the client's conditions."""
+    upstream = []
+
+    def handler(request):
+        upstream.append(request)
+        if request.url.port < 8200:
+            return httpx.Response(200, json=PREFILL_OK)
+        return httpx.Response(200, json={"choices": [{"text": "done"}]})
+
+    body = {"model": "m", "prompt": "hi", "max_tokens": 8, "stop": ["\n"], "min_tokens": 2,
+            "stop_token_ids": [2]}
+
+    async def run():
+        async with make_client(handler) as client:
+            assert (await client.post("/v1/completions", json=body)).status_code == 200
+
+    asyncio.run(run())
+    prefill, decode = (json.loads(r.read()) for r in upstream)
+    assert prefill["ignore_eos"] is True and prefill["max_tokens"] == 1
+    assert not {"stop", "stop_token_ids", "min_tokens"} & prefill.keys()
+    assert decode == {**body, "kv_transfer_params": KV_PARAMS}
+
+
 def test_nixl_prefill_without_kv_params_never_reaches_decode() -> None:
     """Without kv_transfer_params D would compute the prompt itself: an error instead."""
     upstream = []

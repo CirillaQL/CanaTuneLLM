@@ -176,7 +176,10 @@ class KvHandoffError(RuntimeError):
 
 def prefill_request(body: Mapping[str, Any], prefill: Endpoint) -> dict[str, Any]:
     """P's half of a request: one token, not streamed. NixlConnector: P keeps the
-    prompt's KV blocks for D to read (do_remote_decode) and returns where they are."""
+    prompt's KV blocks for D to read (do_remote_decode) and returns where they are,
+    but only when it stops at max_tokens (vLLM 0.15.1: FINISHED_LENGTH_CAPPED); a first
+    token that is EOS or a stop string would free the blocks, so P ignores both (job
+    274777: 15-17 % of ShareGPT requests). D still gets the client's own conditions."""
     sent = dict(body)
     sent["stream"] = False
     sent["max_tokens"] = 1
@@ -184,6 +187,9 @@ def prefill_request(body: Mapping[str, Any], prefill: Endpoint) -> dict[str, Any
         sent["max_completion_tokens"] = 1
     sent.pop("stream_options", None)
     if prefill.connector == NIXL_CONNECTOR:
+        sent["ignore_eos"] = True
+        for key in ("stop", "stop_token_ids", "min_tokens"):
+            sent.pop(key, None)
         sent["kv_transfer_params"] = {
             "do_remote_decode": True,
             "do_remote_prefill": False,
