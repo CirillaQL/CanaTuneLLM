@@ -9,9 +9,23 @@ import pytest
 from canatune.app import create_app
 from canatune.config import load_config
 
+# NixlConnector: P names the blocks D reads (vLLM's kv_transfer_params).
+KV_PARAMS = {
+    "do_remote_prefill": True,
+    "do_remote_decode": False,
+    "remote_block_ids": [1, 2],
+    "remote_engine_id": "p-engine",
+    "remote_request_id": "p-request",
+    "remote_host": "127.0.0.1",
+    "remote_port": 14579,
+}
+PREFILL_OK = {"choices": [], "kv_transfer_params": KV_PARAMS}
 
-def make_client(handler):
+
+def make_client(handler, connector=None):
     config = load_config()
+    if connector is not None:
+        config["kv_transfer"]["connector"] = connector
     config["topology"]["prefill_nodegroup"]["node"] = "127.0.0.1"
     config["topology"]["decode_nodegroup"]["node"] = "127.0.0.2"
     transport = httpx.MockTransport(handler)
@@ -23,6 +37,7 @@ def make_client(handler):
 
 
 def test_production_round_robin_and_shared_kv_request_id() -> None:
+    """P2pNcclConnector: P pushes to the D address carried in the request id."""
     upstream = []
 
     def handler(request):
@@ -32,7 +47,7 @@ def test_production_round_robin_and_shared_kv_request_id() -> None:
         return httpx.Response(200, json={"choices": [{"text": "done"}]})
 
     async def run():
-        async with make_client(handler) as client:
+        async with make_client(handler, connector="P2pNcclConnector") as client:
             for expected in ("P1", "P2", "P3", "P1"):
                 response = await client.post(
                     "/v1/completions",
@@ -53,6 +68,57 @@ def test_production_round_robin_and_shared_kv_request_id() -> None:
         assert prefill.read() != decode.read()
 
 
+def test_nixl_decode_reads_the_blocks_prefill_names() -> None:
+    """NixlConnector: P keeps the KV (do_remote_decode) and D gets P's
+    kv_transfer_params; the request id stays as the client gave it."""
+    upstream = []
+
+    def handler(request):
+        upstream.append(request)
+        if request.url.port < 8200:
+            return httpx.Response(200, json=PREFILL_OK)
+        return httpx.Response(200, json={"choices": [{"text": "done"}]})
+
+    async def run():
+        async with make_client(handler) as client:
+            response = await client.post(
+                "/v1/completions",
+                headers={"X-Request-Id": "my-request"},
+                json={"model": "example", "prompt": "hello", "max_tokens": 8},
+            )
+            assert response.status_code == 200
+
+    asyncio.run(run())
+    prefill, decode = upstream
+    assert prefill.headers["X-Request-Id"] == decode.headers["X-Request-Id"] == "my-request"
+    sent = json.loads(prefill.read())
+    assert sent["kv_transfer_params"]["do_remote_decode"] is True
+    assert sent["max_tokens"] == 1 and sent["stream"] is False
+    assert json.loads(decode.read()) == {
+        "model": "example", "prompt": "hello", "max_tokens": 8, "kv_transfer_params": KV_PARAMS
+    }
+
+
+def test_nixl_prefill_without_kv_params_never_reaches_decode() -> None:
+    """Without kv_transfer_params D would compute the prompt itself: an error instead."""
+    upstream = []
+
+    def handler(request):
+        upstream.append(request)
+        return httpx.Response(200, json={"choices": []})
+
+    async def run():
+        async with make_client(handler) as client:
+            response = await client.post(
+                "/v1/completions", json={"model": "example", "prompt": "hello", "max_tokens": 8}
+            )
+            assert response.status_code == 502
+            assert "kv_transfer_params" in response.json()["error"]
+
+    asyncio.run(run())
+    assert [request.url.port for request in upstream] == [8101]
+
+
 def test_canary_stream_is_forwarded_from_decode() -> None:
     upstream = []
     sse = b'data: {"choices":[{"text":"hello"}]}\n\ndata: [DONE]\n\n'
@@ -65,7 +131,7 @@ def test_canary_stream_is_forwarded_from_decode() -> None:
     def handler(request):
         upstream.append(request)
         if request.url.port == 8100:
-            return httpx.Response(200, json={"choices": []})
+            return httpx.Response(200, json=PREFILL_OK)
         return httpx.Response(
             200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
         )
@@ -85,7 +151,7 @@ def test_canary_stream_is_forwarded_from_decode() -> None:
 
     asyncio.run(run())
     assert [request.url.port for request in upstream] == [8100, 8200]
-    assert upstream[0].headers["X-Request-Id"].endswith("_my-request")
+    assert upstream[0].headers["X-Request-Id"] == "my-request"
     assert upstream[0].headers["X-Request-Id"] == upstream[1].headers["X-Request-Id"]
     assert upstream[0].read().find(b'"max_tokens":1') != -1
     assert upstream[0].read().find(b'"stream":false') != -1
@@ -114,7 +180,7 @@ def test_prefill_failure_does_not_call_decode() -> None:
 
 def test_stream_requires_real_decode_sse() -> None:
     def handler(request):
-        return httpx.Response(200, json={"choices": []})
+        return httpx.Response(200, json=PREFILL_OK)
 
     async def run():
         async with make_client(handler) as client:
@@ -183,7 +249,7 @@ def test_cantune_cold_start_admits_all_then_risk_admission() -> None:
 
     def handler(request):
         if request.url.port < 8200:
-            return httpx.Response(200, json={"choices": []})
+            return httpx.Response(200, json=PREFILL_OK)
         return httpx.Response(
             200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
         )
@@ -247,7 +313,7 @@ def test_cantune_slack_admission_tracks_stages_through_the_proxy() -> None:
 
     def handler(request):
         if request.url.port < 8200:
-            return httpx.Response(200, json={"choices": []})
+            return httpx.Response(200, json=PREFILL_OK)
         return httpx.Response(
             200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
         )
@@ -350,7 +416,7 @@ def test_cancelled_request_releases_its_reservation(stage) -> None:
         if (stage == "prefill") == is_prefill:
             entered.set()
             await asyncio.Event().wait()  # never answers
-        return httpx.Response(200, json={"choices": []})
+        return httpx.Response(200, json=PREFILL_OK)
 
     async def run():
         client, runtime = make_cantune(handler, admission="slack")
@@ -404,7 +470,7 @@ def test_proxy_marks_non_streaming_requests_for_production_feedback() -> None:
                 return httpx.Response(
                     200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
                 )
-        return httpx.Response(200, json={"choices": [{"text": "t"}]})
+        return httpx.Response(200, json={**PREFILL_OK, "choices": [{"text": "t"}]})
 
     async def run():
         client, runtime = make_cantune(handler, admission="slack", overload="best_effort")
@@ -486,7 +552,9 @@ def test_chat_completions_go_through_p_and_d_chat_endpoints() -> None:
     def handler(request):
         upstream.append(request)
         if request.url.port < 8200:
-            return httpx.Response(200, json={"choices": [{"message": {"content": "H"}}]})
+            return httpx.Response(
+                200, json={**PREFILL_OK, "choices": [{"message": {"content": "H"}}]}
+            )
         return httpx.Response(
             200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
         )
@@ -522,7 +590,7 @@ def test_chat_completions_go_through_p_and_d_chat_endpoints() -> None:
     sent = json.loads(prefill.read())
     assert sent["max_tokens"] == 1 and sent["stream"] is False and "stream_options" not in sent
     assert sent["messages"] == body["messages"]
-    assert json.loads(decode.read()) == body
+    assert json.loads(decode.read()) == {**body, "kv_transfer_params": KV_PARAMS}
 
 
 def test_baseline_serves_chat_and_models() -> None:
@@ -535,7 +603,7 @@ def test_baseline_serves_chat_and_models() -> None:
                 return httpx.Response(503, json={"error": "down"})
             return httpx.Response(200, json={"data": [{"id": "mistral"}]})
         if request.url.port < 8200:
-            return httpx.Response(200, json={"choices": []})
+            return httpx.Response(200, json=PREFILL_OK)
         return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
 
     async def run():
@@ -552,3 +620,40 @@ def test_baseline_serves_chat_and_models() -> None:
     asyncio.run(run())
     assert [r.url.path for r in upstream[:2]] == ["/v1/chat/completions"] * 2
     assert [r.url.port for r in upstream[2:]] == [8201, 8202]
+
+
+def test_an_error_event_in_the_decode_stream_is_a_decode_error() -> None:
+    """vLLM ends a failed request (a KV read under load_failure_policy fail) with an
+    error event in an otherwise normal stream: the proxy records it as decode_error."""
+    from canatune.proxy.proxy import StreamTimer
+
+    timer = StreamTimer(clock=lambda: 1.0)
+    timer.feed(b'data: {"choices":[{"text":"a"}]}\n\n')
+    timer.feed(b'data: {"error": {"message": "Internal server error"}}\n\ndata: [DONE]\n\n')
+    assert len(timer.token_times) == 1 and timer.error == "Internal server error"
+
+    class SSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"error": {"message": "Internal server error"}}\n\ndata: [DONE]\n\n'
+
+    def handler(request):
+        if request.url.port < 8200:
+            return httpx.Response(200, json=PREFILL_OK)
+        return httpx.Response(
+            200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
+        )
+
+    async def run():
+        client, runtime = make_cantune(handler, admission="slack", overload="best_effort")
+        await runtime.start()
+        runtime.stop.set()
+        async with client:
+            response = await client.post(
+                "/v1/completions",
+                json={"model": "m", "prompt": "hello", "max_tokens": 4, "stream": True},
+            )
+            assert response.status_code == 200
+            assert runtime.router.log.recent[-1]["status"] == "decode_error"
+        await asyncio.gather(*runtime.tasks, return_exceptions=True)
+
+    asyncio.run(run())

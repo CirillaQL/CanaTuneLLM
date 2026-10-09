@@ -76,9 +76,11 @@ def published(model: bool = False, calibrated: bool = True, **kwargs) -> TierTab
 
 def setup(
     table=None, telemetry=None, store=None, admission="cells", overload="reject", solver=False,
-    theta=None, router=None,
+    theta=None, router=None, connector=None,
 ):
     config = load_config()
+    if connector is not None:
+        config["kv_transfer"]["connector"] = connector
     if theta is not None:
         config["router"]["theta"] = theta
     config["router"].update(router or {})
@@ -682,6 +684,7 @@ def test_best_effort_signals_before_wait_budget_and_serves_late_requests():
 
 def test_best_effort_hard_limits_queue_fifo_and_cancellation_releases():
     _, _, groups, _, router, _, _ = setup(
+        connector="P2pNcclConnector",
         table=published(), admission="slack", overload="best_effort"
     )
     activate(groups)
@@ -990,6 +993,7 @@ def test_invalid_feedback_settings_are_rejected(kwargs):
 
 def test_a_prompt_larger_than_the_kv_gate_is_admitted_on_an_empty_link() -> None:
     clock, _, groups, _, router, controller, _ = setup(
+        connector="P2pNcclConnector",
         table=published(model=True), admission="slack", overload="best_effort"
     )
     activate(groups)
@@ -1037,11 +1041,22 @@ def test_prefill_reservations_are_not_counted_as_b_star_decode_sequences():
     assert router.risk_signals == 0
 
 
+def test_nixl_has_no_in_flight_kv_gate() -> None:
+    """NixlConnector: D reads KV only into blocks it has allocated; nothing to overflow."""
+    _, _, groups, _, router, _, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    assert router.settings.kv_buffer_bytes is None
+    groups[1].inflight_bytes = 1e12
+    assert not router._kv_blocked(groups[1], 4096)
+
+
 @pytest.mark.parametrize("blocked", ["kv_usage", "transfer_buffer", "stale"])
 def test_full_effort_still_enforces_kv_and_telemetry_guards(blocked):
     clock = FakeClock()
     telemetry = Telemetry({}, period_s=1, client_factory=lambda: None, clock=clock)
     _, _, groups, _, router, _, _ = setup(
+        connector="P2pNcclConnector",
         table=published(decode_max_running=24, decode_kv_limit=0.9),
         telemetry=telemetry, admission="slack", overload="best_effort",
     )
@@ -1278,6 +1293,7 @@ def test_controller_mode_reaches_the_router():
 
 def test_baseline_mode_round_robins_fixed_pairs_within_hard_limits():
     router, busy, idle = dynamic_router()  # dynamic pairing is ignored in baseline mode
+    router.settings = dataclasses.replace(router.settings, kv_buffer_bytes=1e9)  # P2pNccl
     router.baseline_mode = True
     other = router.groups[3]
     activate([other])

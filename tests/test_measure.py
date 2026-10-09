@@ -27,6 +27,9 @@ PAIRS = [
     ),
 ]
 
+# NixlConnector: P names the blocks D reads.
+KV_PARAMS = {"do_remote_prefill": True, "remote_block_ids": [1], "remote_engine_id": "p"}
+
 
 def backend(stall_every: int = 0, stall_s: float = 0.0, growing_s: float = 0.0):
     state = {"prefill_sum": 0.0, "count": 0, "gen": 0, "energy": 0.0, "net": 0, "locks": []}
@@ -44,7 +47,9 @@ def backend(stall_every: int = 0, stall_s: float = 0.0, growing_s: float = 0.0):
                 await asyncio.sleep(stall_s)
             if growing_s:  # overload: every request waits longer than the one before
                 await asyncio.sleep(growing_s * state["count"])
-            return httpx.Response(200, json={"choices": [{"text": "x"}]})
+            return httpx.Response(
+                200, json={"choices": [{"text": "x"}], "kv_transfer_params": KV_PARAMS}
+            )
         if path == "/v1/completions" and host.startswith("d"):
             body = json.loads(request.read())
             state["gen"] += body["max_tokens"]

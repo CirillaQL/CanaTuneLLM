@@ -64,7 +64,7 @@ values = (
     decode["kv_port_base"],
     decode["gpu_memory_utilization"],
     config["runtime"]["environment"]["NCCL_SOCKET_IFNAME"],
-    config["kv_transfer"]["prefill_send_type"],
+    config["kv_transfer"].get("prefill_send_type", "PUT_ASYNC"),  # P2pNccl only
 )
 for value in values:
     text = str(value)

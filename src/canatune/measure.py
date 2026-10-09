@@ -45,7 +45,13 @@ import httpx
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import prom_value
 from canatune.loadgen import prompt_ids
-from canatune.proxy.proxy import Endpoint, StreamTimer, pd_transport_id
+from canatune.proxy.proxy import (
+    Endpoint,
+    StreamTimer,
+    decode_request,
+    pd_transport_id,
+    prefill_request,
+)
 
 DEFAULT_MIX = [[128, 64], [512, 64], [1024, 64], [2048, 64]]
 
@@ -363,7 +369,7 @@ class Measure:
         try:
             response = await client.post(
                 pair.prefill.completions_url,
-                json={**body, "stream": False, "max_tokens": 1},
+                json=prefill_request(body, pair.prefill),
                 headers=headers,
             )
             p_done = self.now_s()
@@ -373,12 +379,17 @@ class Measure:
             d_sent = self.now_s()
             gap_ms = (d_sent - p_done) * 1000.0
             async with client.stream(
-                "POST", pair.decode.completions_url, json=body, headers=headers
+                "POST",
+                pair.decode.completions_url,
+                json=decode_request(body, pair.prefill, response),
+                headers=headers,
             ) as stream:
                 if stream.status_code != 200:
                     raise RuntimeError(f"decode HTTP {stream.status_code}")
                 async for chunk in stream.aiter_bytes():
                     timer.feed(chunk)
+            if timer.error is not None:
+                raise RuntimeError(f"decode: {timer.error}")
             if timer.token_times:
                 decode_first_ms = (timer.token_times[0] - d_sent) * 1000.0
         except Exception as error:  # a failed request is data

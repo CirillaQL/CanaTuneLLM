@@ -1,15 +1,19 @@
 """D GPU memory utilization from an absolute reserve.
 
 vLLM pre-allocates gpu_memory_utilization x the GPU's memory for itself (weights,
-activations, KV cache). What it does not plan for lives in the rest: the P2P
-connector's receive buffer (kv_transfer.kv_buffer_bytes), received tensors past that
-buffer and the allocator's cached blocks (overflow), one NCCL communicator per P that
-sends to this D, and a safety margin. A fixed fraction leaves very different headroom
-per GPU (0.82: 4.3 GB on an L4, 8.7 GB on an L40S; job K's L4s ran out of it under
-overload), so the reserve is set in bytes and the fraction follows from the GPU:
+activations, KV cache). What it does not plan for lives in the rest: with
+P2pNcclConnector the receive buffer (kv_transfer.kv_buffer_bytes) and received tensors
+past it plus the allocator's cached blocks (overflow); one connection per P that sends
+to this D (an NCCL communicator, or NIXL's transfer endpoints); and a safety margin.
+NixlConnector reads the KV straight into D's paged KV cache, so it has no buffer and
+no overflow. A fixed fraction leaves very different headroom per GPU (0.82: 4.3 GB on
+an L4, 8.7 GB on an L40S; job K's L4s ran out of it under overload), so the reserve is
+set in bytes and the fraction follows from the GPU:
 
     utilization = 1 - (kv_buffer + overflow + peers x per_peer + safety) / GPU memory
 
+at most 0.95 (a GPU large enough to leave more is capped there; vLLM's own profile of
+weights and activations is inside its share either way).
 peers: the P a D receives from (fixed pairing: 1; dynamic: every P).
 topology.decode_nodegroup.gpu_memory_utilization: a number keeps a fixed fraction;
 auto uses the reserve (topology.decode_nodegroup.memory_reserve).
@@ -25,7 +29,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from canatune.config import load_config
+from canatune.config import kv_receive_buffer_bytes, load_config
 
 DEFAULT_RESERVE = {"overflow_bytes": 3.0e9, "per_peer_bytes": 0.25e9, "safety_bytes": 1.0e9}
 MIN_UTILIZATION, MAX_UTILIZATION = 0.5, 0.95
@@ -57,11 +61,11 @@ def _bytes(value: Any, name: str) -> float:
 def reserve_bytes(config: Mapping[str, Any]) -> float:
     given = config["topology"]["decode_nodegroup"].get("memory_reserve") or {}
     raw = {k: _bytes(v, f"memory_reserve.{k}") for k, v in {**DEFAULT_RESERVE, **given}.items()}
-    kv_buffer = _bytes(config.get("kv_transfer", {}).get("kv_buffer_bytes", 1e9), "kv_buffer_bytes")
-    return (
-        kv_buffer + raw["overflow_bytes"] + peers(config) * raw["per_peer_bytes"]
-        + raw["safety_bytes"]
-    )  # fmt: skip
+    connections = peers(config) * raw["per_peer_bytes"] + raw["safety_bytes"]
+    kv_buffer = kv_receive_buffer_bytes(config)
+    if kv_buffer is None:  # NixlConnector: nothing is received outside the KV cache
+        return connections
+    return kv_buffer + raw["overflow_bytes"] + connections
 
 
 def utilization(config: Mapping[str, Any], total_bytes: float) -> float:
@@ -74,12 +78,12 @@ def utilization(config: Mapping[str, Any], total_bytes: float) -> float:
     if total_bytes <= 0:
         raise MemoryPlanError("the GPU memory must be positive")
     fraction = 1.0 - reserve_bytes(config) / total_bytes
-    if not MIN_UTILIZATION <= fraction <= MAX_UTILIZATION:
+    if fraction < MIN_UTILIZATION:
         raise MemoryPlanError(
             f"the reserve leaves utilization {fraction:.3f} on a {total_bytes / 1e9:.1f} GB "
-            f"GPU, outside [{MIN_UTILIZATION}, {MAX_UTILIZATION}]"
+            f"GPU, below {MIN_UTILIZATION}"
         )
-    return fraction
+    return min(fraction, MAX_UTILIZATION)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

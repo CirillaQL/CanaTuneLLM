@@ -1,4 +1,9 @@
-"""HTTP proxy for vLLM P2pNcclConnector prefill/decode pairs."""
+"""HTTP proxy for vLLM prefill/decode pairs (NixlConnector or P2pNcclConnector).
+
+Every request goes to P with max_tokens 1, then to D. NixlConnector: P keeps the
+prompt's KV blocks (do_remote_decode) and names them in its response; D allocates its
+own blocks first and then reads P's (kv_transfer_params). P2pNcclConnector: P pushes the
+KV to the D address carried in the request id."""
 
 import asyncio
 import json
@@ -15,6 +20,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from canatune.config import NIXL_CONNECTOR, kv_connector
 from canatune.controller.router import prompt_tokens
 from canatune.infrastructure.records import JsonlLog
 
@@ -33,7 +39,8 @@ class Endpoint:
     http_host: str
     kv_host: str
     http_port: int
-    kv_port: int
+    kv_port: int  # NixlConnector: the side-channel (handshake) port
+    connector: str = NIXL_CONNECTOR
 
     @property
     def completions_url(self) -> str:
@@ -92,6 +99,7 @@ def parse_endpoints(config: Mapping[str, Any]) -> dict[str, Endpoint]:
             "decode KV host",
         ),
     }
+    connector = kv_connector(config)
     endpoints: dict[str, Endpoint] = {}
     for name, raw in raw_endpoints.items():
         value = _mapping(raw, f"endpoint {name}")
@@ -105,6 +113,7 @@ def parse_endpoints(config: Mapping[str, Any]) -> dict[str, Endpoint]:
             kv_host=kv_hosts[role],
             http_port=_port(value.get("http_port"), f"{name}.http_port"),
             kv_port=_port(value.get("kv_port"), f"{name}.kv_port"),
+            connector=connector,
         )
     return endpoints
 
@@ -146,16 +155,63 @@ class PairSelector:
 
 
 def pd_transport_id(value: str | None, prefill: Endpoint, decode: Endpoint) -> str:
-    """Request id carrying both KV addresses (P2pNcclConnector routing)."""
+    """Request id of both halves: P2pNcclConnector routes by the KV addresses in it;
+    NixlConnector by kv_transfer_params, so the id stays as given."""
     logical_id = uuid.uuid4().hex if value is None else value
     if len(logical_id) > 256 or not re.fullmatch(r"[A-Za-z0-9._-]+", logical_id):
         raise ValueError(
             "X-Request-Id must contain 1-256 letters, digits, dots, underscores or hyphens"
         )
+    if prefill.connector == NIXL_CONNECTOR:
+        return logical_id
     return (
         f"___prefill_addr_{prefill.kv_host}:{prefill.kv_port}"
         f"___decode_addr_{decode.kv_host}:{decode.kv_port}_{logical_id}"
     )
+
+
+class KvHandoffError(RuntimeError):
+    """P answered without telling D where the KV is."""
+
+
+def prefill_request(body: Mapping[str, Any], prefill: Endpoint) -> dict[str, Any]:
+    """P's half of a request: one token, not streamed. NixlConnector: P keeps the
+    prompt's KV blocks for D to read (do_remote_decode) and returns where they are."""
+    sent = dict(body)
+    sent["stream"] = False
+    sent["max_tokens"] = 1
+    if "max_completion_tokens" in sent:
+        sent["max_completion_tokens"] = 1
+    sent.pop("stream_options", None)
+    if prefill.connector == NIXL_CONNECTOR:
+        sent["kv_transfer_params"] = {
+            "do_remote_decode": True,
+            "do_remote_prefill": False,
+            "remote_engine_id": None,
+            "remote_block_ids": None,
+            "remote_host": None,
+            "remote_port": None,
+        }
+    return sent
+
+
+def decode_request(
+    body: Mapping[str, Any], prefill: Endpoint, prefill_response: httpx.Response
+) -> dict[str, Any]:
+    """D's half: the client's body; NixlConnector: plus the kv_transfer_params of P's
+    response. Without them D would compute the prompt itself, a silently different
+    request, so their absence raises KvHandoffError."""
+    sent = dict(body)
+    if prefill.connector != NIXL_CONNECTOR:
+        return sent
+    try:
+        params = prefill_response.json().get("kv_transfer_params")
+    except (ValueError, AttributeError):
+        params = None
+    if not isinstance(params, Mapping) or params.get("do_remote_prefill") is not True:
+        raise KvHandoffError("prefill returned no kv_transfer_params")
+    sent["kv_transfer_params"] = dict(params)
+    return sent
 
 
 def is_token_chunk(choice: Mapping[str, Any]) -> bool:
@@ -181,6 +237,9 @@ class StreamTimer:
         self._clock = clock
         self._buffer = b""
         self.token_times: list[float] = []
+        # vLLM ends a failed request (e.g. a KV load under kv_load_failure_policy
+        # fail) with an error event in an otherwise normal stream.
+        self.error: str | None = None
 
     def feed(self, chunk: bytes) -> int:
         self._buffer += chunk
@@ -200,8 +259,14 @@ class StreamTimer:
                 if payload == b"[DONE]":
                     continue
                 try:
-                    choices = json.loads(payload).get("choices") or []
+                    event_body = json.loads(payload)
+                    choices = event_body.get("choices") or []
                 except (ValueError, AttributeError):
+                    continue
+                if event_body.get("error") is not None:
+                    error = event_body["error"]
+                    message = error.get("message") if isinstance(error, Mapping) else error
+                    self.error = str(message)[:200]
                     continue
                 if choices and is_token_chunk(choices[0]):
                     self.token_times.append(self._clock())
@@ -472,12 +537,7 @@ def create_proxy_router(
         }
         if ticket is not None:
             response_headers["X-CanaTune-Group"] = ticket.group.name
-        prefill_body = dict(body)
-        prefill_body["stream"] = False
-        prefill_body["max_tokens"] = 1
-        if "max_completion_tokens" in prefill_body:
-            prefill_body["max_completion_tokens"] = 1
-        prefill_body.pop("stream_options", None)
+        prefill_body = prefill_request(body, prefill)
 
         # Admitted but not yet streaming: a cancellation (client gone, timeout,
         # shutdown) is no HTTPError, so the reservation is released here.
@@ -502,6 +562,12 @@ def create_proxy_router(
                         status_code=502,
                         headers=response_headers,
                     )
+                decode_body = decode_request(body, prefill, prefill_response)
+            except KvHandoffError as error:
+                finish("prefill_error", None)
+                return JSONResponse(
+                    {"error": str(error)}, status_code=502, headers=response_headers
+                )
             except httpx.HTTPError:
                 finish("prefill_error", None)
                 return JSONResponse(
@@ -511,14 +577,14 @@ def create_proxy_router(
             client = factory()
             clients.append(client)
             try:
-                decode_request = client.build_request(
+                decode_call = client.build_request(
                     "POST",
                     decode.chat_url if kind == "chat" else decode.completions_url,
-                    json=body,
+                    json=decode_body,
                     headers=headers,
                 )
                 stamps["decode_sent"] = time.monotonic()
-                decode_response = await client.send(decode_request, stream=True)
+                decode_response = await client.send(decode_call, stream=True)
                 if decode_response.status_code != 200:
                     await decode_response.aclose()
                     await client.aclose()
@@ -558,7 +624,7 @@ def create_proxy_router(
                                     )
                                     runtime.router.token_progress(ticket, recent_tpot)
                                 yield chunk
-                            status = "ok"
+                            status = "ok" if timer.error is None else "decode_error"
                         except httpx.HTTPError:
                             status = "decode_error"
                         finally:

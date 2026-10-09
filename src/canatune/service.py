@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from canatune.config import P2P_NCCL_CONNECTOR, kv_connector
 from canatune.controller.canary import CanaryScheduler, SchedulerSettings
 from canatune.controller.locator import (
     AdmissionInputs,
@@ -103,8 +104,10 @@ def identity(config: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "model": config["model"]["name"],
         "vllm_version": config["runtime"].get("vllm_version"),
-        "connector": config["kv_transfer"]["connector"],
-        "send_type": config["kv_transfer"]["prefill_send_type"],
+        "connector": kv_connector(config),
+        "send_type": config["kv_transfer"].get("prefill_send_type")
+        if kv_connector(config) == P2P_NCCL_CONNECTOR
+        else None,
         "prefill_gpu": config["topology"]["prefill_nodegroup"]["gpu_type"],
         "decode_gpu": config["topology"]["decode_nodegroup"]["gpu_type"],
         "max_model_len": config["model"]["max_model_len"],

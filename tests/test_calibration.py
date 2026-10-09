@@ -106,6 +106,7 @@ def test_probe_records_the_state_each_request_was_sent_into() -> None:
 
 def test_router_applies_the_published_calibration_and_per_clock_costs() -> None:
     config = load_config()
+    config["kv_transfer"]["connector"] = "P2pNcclConnector"  # the receive-buffer gate
     config["router"]["admission"] = "slack"
     groups = build_groups(config)
     for g in groups:

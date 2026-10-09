@@ -17,6 +17,9 @@ from canatune.infrastructure.clocks import GpuRef
 from canatune.proxy.proxy import parse_endpoints
 from canatune.service import build_groups, identity
 
+# NixlConnector: P names the blocks D reads.
+KV_PARAMS = {"do_remote_prefill": True, "remote_block_ids": [1], "remote_engine_id": "p"}
+
 
 class FakeAgent:
     """Energy counters that grow 100 W (P) / 30 W (D); P is power capped at 2040."""
@@ -85,7 +88,9 @@ def vllm_handler(requests, metrics=None):
             if metrics is not None:
                 metrics.prefill_sum += (20 + 0.05 * len(body["prompt"])) / 1000
                 metrics.prefill_count += 1
-            return httpx.Response(200, json={"choices": [{"text": "x"}]})
+            return httpx.Response(
+                200, json={"choices": [{"text": "x"}], "kv_transfer_params": KV_PARAMS}
+            )
         n = body["max_tokens"]
         if metrics is not None:
             metrics.generated += n

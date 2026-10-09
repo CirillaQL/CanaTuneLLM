@@ -29,8 +29,8 @@ count is fixed; the system never scales out.
 | Model | Mistral-7B-v0.1, vLLM 0.15.1, TP = 1 |
 | Prefill | 4 × NVIDIA L40S (P0–P3) |
 | Decode | 4 × NVIDIA L4 (D0–D3) |
-| KV transfer | `P2pNcclConnector`, `send_type=PUT_ASYNC`, over TCP (`NCCL_IB_DISABLE=1`) |
-| Engine flags | prefix cache off, chunked prefill off, max-model-len 4096, D `gpu-memory-utilization 0.82` |
+| KV transfer | `NixlConnector` (`kv_both`, `kv_load_failure_policy=fail`): D allocates blocks, then reads P's KV into them; earlier jobs (up to N, homo-l40s): `P2pNcclConnector`, `send_type=PUT_ASYNC`, over TCP (`NCCL_IB_DISABLE=1`) |
+| Engine flags | prefix cache off, chunked prefill off, max-model-len 4096, D `gpu-memory-utilization auto` (GPU memory less an absolute reserve, `memory_plan`) |
 | Groups | G0 = (P0, D0) is the Canary; G1–G3 = (P1–P3, D1–D3) form the production pool. P<sub>i</sub>/D<sub>i</sub> are fixed pairs in v1 |
 | Clock control | per-node GPU agent: `sudo -n nvidia-smi -lgc f,f`, NVML read-back |
 
@@ -46,8 +46,8 @@ offline runs.
 
 | Source | What |
 |---|---|
-| configuration | the model's `config.json` (KV bytes per token), `kv_transfer` (connector, `kv_buffer_bytes`), topology, the policy: SLOs, theta, `max_wait_ms`, `hold_max_ms`, `t_down_s`, the output cap `canary.max_output_tokens` (cold-start probes generate it: the heaviest decode load, so the first H is conservative) |
-| Canary experiments | everything else: tiers, S(L) per clock, D iteration model, power per clock vs load, capacity, the admission predictor, the slack-risk seed, the KV-in-flight gate |
+| configuration | the model's `config.json` (KV bytes per token), `kv_transfer` (connector; P2pNccl: `kv_buffer_bytes`), topology, the policy: SLOs, theta, `max_wait_ms`, `hold_max_ms`, `t_down_s`, the output cap `canary.max_output_tokens` (cold-start probes generate it: the heaviest decode load, so the first H is conservative) |
+| Canary experiments | everything else: tiers, S(L) per clock, D iteration model, power per clock vs load, capacity, the admission predictor, the slack-risk seed, the KV-in-flight gate (P2pNccl only) |
 | production, online | predictor refits, slack-risk counts, offered rate; the (prompt, output) lengths of finished requests, which the Canary's probes replay (random tokens, `ignore_eos`) once `length_min_samples` requests finished |
 
 ### Lifecycle
@@ -328,7 +328,15 @@ bypasses admission. The pair used is returned in the
 configuration; it does not probe vLLM nodes.
 
 The proxy expects the vLLM servers to be started separately, for example with
-the scripts in `scripts/`. The prefill script takes `PREFILL_KV_SEND_TYPE`
+the scripts in `scripts/`. They take `KV_CONNECTOR` (default `NixlConnector`; the
+process controller sets it from `kv_transfer.connector`). With NIXL, P is asked to
+keep the prompt's KV (`kv_transfer_params.do_remote_decode`) and its response's
+`kv_transfer_params` go to D, which reads the blocks; a P response without them is
+an error (D would otherwise compute the prompt itself), and so is an error event in
+D's stream (a failed KV read). Each endpoint's `kv_port` is its NIXL side-channel
+port (`VLLM_NIXL_SIDE_CHANNEL_PORT`, host `CANATUNE_{PREFILL,DECODE}_KV_HOST`).
+The `nixl` Python package (NIXL 0.9, vLLM 0.15.1's time) must be importable by
+vLLM. With `P2pNcclConnector` the prefill script takes `PREFILL_KV_SEND_TYPE`
 (default `PUT_ASYNC`).
 
 To lock clocks, set `clock_control.enabled: true`. The process controller then

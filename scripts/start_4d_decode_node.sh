@@ -3,6 +3,8 @@
 # per GPU in DECODE_GPU_IDS (1-8 GPUs; endpoint i uses port base + i). Optional
 # DECODE_GPU_UUIDS (same order) is checked before each launch: GPUs are not
 # cgroup-constrained on the cluster, so a wrong index would hit another job's GPU.
+# KV_CONNECTOR: NixlConnector (default; D reads P's KV, endpoint i's own side channel
+# on kv port base + i) or P2pNcclConnector.
 # Supply site-specific values through the variables below.
 set -euo pipefail
 
@@ -12,7 +14,18 @@ set -euo pipefail
 : "${DECODE_GPU_IDS:?Set DECODE_GPU_IDS, for example 0,1,2,3}"
 : "${DECODE_HTTP_PORT_BASE:?Set DECODE_HTTP_PORT_BASE, for example 8200}"
 : "${DECODE_KV_PORT_BASE:?Set DECODE_KV_PORT_BASE, for example 14579}"
-: "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
+KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
+KV_LOAD_FAILURE_POLICY="${KV_LOAD_FAILURE_POLICY:-fail}"
+if [[ "$KV_CONNECTOR" == P2pNcclConnector ]]; then
+  : "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
+elif [[ "$KV_CONNECTOR" != NixlConnector ]]; then
+  echo "KV_CONNECTOR must be NixlConnector or P2pNcclConnector" >&2; exit 2
+fi
+[[ "$KV_LOAD_FAILURE_POLICY" == fail || "$KV_LOAD_FAILURE_POLICY" == recompute ]] || {
+  echo "KV_LOAD_FAILURE_POLICY must be fail or recompute" >&2; exit 2;
+}
+side_host="${CANATUNE_DECODE_KV_HOST:-${CANATUNE_DECODE_HOST:-}}"
+[[ -n "$side_host" ]] || side_host=$(hostname -I | awk '{print $1}')
 
 [[ -x "$PYTHON_BIN" ]] || { echo "Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 [[ -d "$MODEL_PATH" ]] || { echo "Model directory does not exist: $MODEL_PATH" >&2; exit 2; }
@@ -92,7 +105,13 @@ for index in "${!gpu_ids[@]}"; do
   fi
   http_port=$((DECODE_HTTP_PORT_BASE + index))
   kv_port=$((DECODE_KV_PORT_BASE + index))
-  kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_consumer","kv_port":%d}' "$kv_port")
+  if [[ "$KV_CONNECTOR" == NixlConnector ]]; then
+    kv_config=$(printf '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"%s"}' "$KV_LOAD_FAILURE_POLICY")
+    kv_env=("VLLM_NIXL_SIDE_CHANNEL_HOST=$side_host" "VLLM_NIXL_SIDE_CHANNEL_PORT=$kv_port")
+  else
+    kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_consumer","kv_port":%d}' "$kv_port")
+    kv_env=()
+  fi
   # GPU memory for vLLM: a fixed DECODE_GPU_MEMORY_UTILIZATION, or (unset / auto) the
   # GPU's memory less the configured reserve (canatune.infrastructure.memory_plan).
   mem_util="${DECODE_GPU_MEMORY_UTILIZATION:-auto}"
@@ -110,7 +129,8 @@ for index in "${!gpu_ids[@]}"; do
   # P and D must use the same one so both see the same prompt tokens.
   chat_args=()
   if [[ -n "${VLLM_CHAT_TEMPLATE:-}" ]]; then chat_args=(--chat-template "$VLLM_CHAT_TEMPLATE"); fi
-  CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
+  CUDA_VISIBLE_DEVICES="$gpu_id" env ${kv_env[@]+"${kv_env[@]}"} \
+    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
     --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --gpu-memory-utilization "$mem_util" \

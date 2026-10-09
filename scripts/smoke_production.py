@@ -45,7 +45,12 @@ import httpx
 
 from canatune import loadgen
 from canatune.config import load_config
-from canatune.proxy.proxy import parse_endpoints, pd_transport_id
+from canatune.proxy.proxy import (
+    decode_request,
+    parse_endpoints,
+    pd_transport_id,
+    prefill_request,
+)
 from canatune.service import cold_start_lengths
 
 READY_TIMEOUT_S = 1800
@@ -103,8 +108,8 @@ def model_name(client: httpx.Client, endpoints: dict) -> str:
 
 
 def warm_pairs(client: httpx.Client, config: dict, endpoints: dict, model: str) -> None:
-    """Three short requests per pair straight to vLLM: the first P2pNccl transfer of
-    a pair sets up the connection and would otherwise land in the first phase."""
+    """Three short requests per pair straight to vLLM: the first KV transfer of a
+    pair sets up the connection and would otherwise land in the first phase."""
     routing = config["routing"]
     pairs = [tuple(routing["canary_pair"])] + [tuple(p) for p in routing["production_pairs"]]
     for prefill_name, decode_name in dict.fromkeys(pairs):
@@ -119,16 +124,20 @@ def warm_pairs(client: httpx.Client, config: dict, endpoints: dict, model: str) 
             }
             headers = {"X-Request-Id": pd_transport_id(f"warm-{i}", prefill, decode)}
             try:
-                client.post(
+                response = client.post(
                     prefill.completions_url,
-                    json={**body, "max_tokens": 1},
+                    json=prefill_request(body, prefill),
+                    headers=headers,
+                    timeout=120,
+                )
+                response.raise_for_status()
+                client.post(
+                    decode.completions_url,
+                    json=decode_request(body, prefill, response),
                     headers=headers,
                     timeout=120,
                 ).raise_for_status()
-                client.post(
-                    decode.completions_url, json=body, headers=headers, timeout=120
-                ).raise_for_status()
-            except httpx.HTTPError as error:
+            except (httpx.HTTPError, RuntimeError) as error:
                 log(f"warm-up {prefill_name}/{decode_name} failed: {error!r}")
         log(f"warmed {prefill_name}/{decode_name}")
 

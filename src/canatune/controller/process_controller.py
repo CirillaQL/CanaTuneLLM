@@ -12,7 +12,7 @@ from pathlib import Path
 
 import httpx
 
-from canatune.config import load_config
+from canatune.config import kv_connector, load_config
 
 
 class ServiceExited(RuntimeError):
@@ -248,6 +248,12 @@ def main() -> int:
         )
         for index in range(counts[role])
     ]
+    # The node steps (srun inherits this environment) start vLLM with the connector
+    # the proxy speaks.
+    os.environ["KV_CONNECTOR"] = kv_connector(config)
+    os.environ["KV_LOAD_FAILURE_POLICY"] = str(
+        config["kv_transfer"].get("load_failure_policy", "fail")
+    )
     # Node steps: optionally request the role's GPUs for the step without binding
     # (each vLLM process selects its own GPU via CUDA_VISIBLE_DEVICES).
     step_gpus = os.environ.get("CANATUNE_STEP_GPUS") == "1"

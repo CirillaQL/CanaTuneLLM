@@ -5,9 +5,10 @@ the least-loaded active group; all production groups run at MAX meanwhile.
 
 With a published table, for each routable group the Router checks
 * hard guards: fresh D telemetry, D KV usage below the Canary's limit, and
-  (admission `slack`) the KV bytes in flight to its D below a fraction of the
-  connector's receive buffer (the gate the Canary measured; overflowing that
-  buffer stalls P and can crash D),
+  (admission `slack`, P2pNcclConnector) the KV bytes in flight to its D below a
+  fraction of the connector's receive buffer (the gate the Canary measured;
+  overflowing that buffer stalls P and can crash D; NixlConnector has no such
+  buffer: D reads the KV only into blocks it has allocated),
 * the SLO risk: `slack` predicts the request's TTFT from the group's state (own
   prefill cost, pending P work, KV in flight, requests decoding) and looks up the
   violation risk of that predicted slack; `cells` (v1) looks up the risk table
@@ -40,6 +41,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from canatune.config import kv_receive_buffer_bytes
 from canatune.domain.admission import (
     CostBook,
     PrefillCost,
@@ -80,7 +82,7 @@ class RouterSettings:
     chars_per_token: float
     admission: str = "slack"  # slack (state-based) or cells (v1 risk table)
     kv_bytes_per_token: float = 131072.0
-    kv_buffer_bytes: float = 1e9  # the KV connector's receive buffer on D
+    kv_buffer_bytes: float | None = 1e9  # D's KV receive buffer; None: none (NIXL)
     overload: str = "best_effort"  # risk triggers resources; queue only at hard limits
     doomed: str = "backfill"  # serve: backfill (wait for spare capacity) or dispatch
     backfill_slack_ms: float | None = None  # backfill only where a fresh request keeps this
@@ -132,7 +134,7 @@ class RouterSettings:
             chars_per_token=_positive(raw, "chars_per_token", 4.0),
             admission=_admission(raw),
             kv_bytes_per_token=float(kv_bytes_setting(config)),
-            kv_buffer_bytes=float(config.get("kv_transfer", {}).get("kv_buffer_bytes", 1e9)),
+            kv_buffer_bytes=kv_receive_buffer_bytes(config),
             overload=_choice(raw, "overload", ("reject", "serve", "best_effort"), "best_effort"),
             hold_max_ms=_positive(raw, "hold_max_ms", 30000),
             doomed=_choice(raw, "doomed", ("backfill", "dispatch"), "backfill"),
@@ -419,6 +421,8 @@ class CanaTuneRouter:
         never blocked: the gate is a measured congestion knee, not a size limit,
         and a prompt larger than it would otherwise wait until the timeout."""
         s = self.settings
+        if s.kv_buffer_bytes is None:
+            return False
         gate = self.kv_fraction * s.kv_buffer_bytes
         if group.inflight_bytes >= gate:
             return True

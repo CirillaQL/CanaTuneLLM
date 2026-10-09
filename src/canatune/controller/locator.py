@@ -350,7 +350,7 @@ class AdmissionInputs:
     """What the admission calibration needs besides the windows (config + priors)."""
 
     kv_bytes_per_token: float
-    kv_buffer_bytes: float
+    kv_buffer_bytes: float | None  # None: no receive buffer (NixlConnector), no KV gate
     predictor_prior: tuple[float, ...] | None = None  # None: plain least squares
 
 
@@ -751,7 +751,7 @@ class TierLocator:
             tpot_slo_ms=self.s.tpot_slo_ms,
             kv_bytes_per_token=0.0 if self.admission is None else self.admission.kv_bytes_per_token,
             kv_gate_bytes=None
-            if gate is None or self.admission is None
+            if gate is None or self.admission is None or self.admission.kv_buffer_bytes is None
             else gate * self.admission.kv_buffer_bytes,
             kv_capacity_tokens=d_ev.get("kv_capacity_tokens"),
             b_star=b_by_clock or ({} if b_star is None else {park.decode_mhz: b_star}),

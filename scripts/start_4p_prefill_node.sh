@@ -3,6 +3,8 @@
 # per GPU in PREFILL_GPU_IDS (1-8 GPUs; endpoint i uses port base + i). Optional
 # PREFILL_GPU_UUIDS (same order) is checked before each launch: GPUs are not
 # cgroup-constrained on the cluster, so a wrong index would hit another job's GPU.
+# KV_CONNECTOR: NixlConnector (default; endpoint i's NIXL side channel listens on
+# kv port base + i at CANATUNE_PREFILL_KV_HOST) or P2pNcclConnector.
 # Supply site-specific values through the variables below.
 set -euo pipefail
 
@@ -12,11 +14,23 @@ set -euo pipefail
 : "${PREFILL_GPU_IDS:?Set PREFILL_GPU_IDS, for example 0,1,2,3}"
 : "${PREFILL_HTTP_PORT_BASE:?Set PREFILL_HTTP_PORT_BASE, for example 8100}"
 : "${PREFILL_KV_PORT_BASE:?Set PREFILL_KV_PORT_BASE, for example 14579}"
-: "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
-PREFILL_KV_SEND_TYPE="${PREFILL_KV_SEND_TYPE:-PUT_ASYNC}"
-[[ "$PREFILL_KV_SEND_TYPE" == PUT || "$PREFILL_KV_SEND_TYPE" == PUT_ASYNC ]] || {
-  echo "PREFILL_KV_SEND_TYPE must be PUT or PUT_ASYNC" >&2; exit 2;
+KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
+KV_LOAD_FAILURE_POLICY="${KV_LOAD_FAILURE_POLICY:-fail}"
+if [[ "$KV_CONNECTOR" == P2pNcclConnector ]]; then
+  : "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
+  PREFILL_KV_SEND_TYPE="${PREFILL_KV_SEND_TYPE:-PUT_ASYNC}"
+  [[ "$PREFILL_KV_SEND_TYPE" == PUT || "$PREFILL_KV_SEND_TYPE" == PUT_ASYNC ]] || {
+    echo "PREFILL_KV_SEND_TYPE must be PUT or PUT_ASYNC" >&2; exit 2;
+  }
+elif [[ "$KV_CONNECTOR" != NixlConnector ]]; then
+  echo "KV_CONNECTOR must be NixlConnector or P2pNcclConnector" >&2; exit 2
+fi
+[[ "$KV_LOAD_FAILURE_POLICY" == fail || "$KV_LOAD_FAILURE_POLICY" == recompute ]] || {
+  echo "KV_LOAD_FAILURE_POLICY must be fail or recompute" >&2; exit 2;
 }
+# NIXL side channel: the address D connects to for the handshake (this host).
+side_host="${CANATUNE_PREFILL_KV_HOST:-${CANATUNE_PREFILL_HOST:-}}"
+[[ -n "$side_host" ]] || side_host=$(hostname -I | awk '{print $1}')
 
 [[ -x "$PYTHON_BIN" ]] || { echo "Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 [[ -d "$MODEL_PATH" ]] || { echo "Model directory does not exist: $MODEL_PATH" >&2; exit 2; }
@@ -95,14 +109,21 @@ for index in "${!gpu_ids[@]}"; do
   fi
   http_port=$((PREFILL_HTTP_PORT_BASE + index))
   kv_port=$((PREFILL_KV_PORT_BASE + index))
-  kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"%s"}}' "$kv_port" "$PREFILL_KV_SEND_TYPE")
+  if [[ "$KV_CONNECTOR" == NixlConnector ]]; then
+    kv_config=$(printf '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"%s"}' "$KV_LOAD_FAILURE_POLICY")
+    kv_env=("VLLM_NIXL_SIDE_CHANNEL_HOST=$side_host" "VLLM_NIXL_SIDE_CHANNEL_PORT=$kv_port")
+  else
+    kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"%s"}}' "$kv_port" "$PREFILL_KV_SEND_TYPE")
+    kv_env=()
+  fi
   log_file="${ROLE_WORK_DIR}/logs/prefill_${index}.log"
 
   # Optional: a chat template for /v1/chat/completions (a base model has none);
   # P and D must use the same one so both see the same prompt tokens.
   chat_args=()
   if [[ -n "${VLLM_CHAT_TEMPLATE:-}" ]]; then chat_args=(--chat-template "$VLLM_CHAT_TEMPLATE"); fi
-  CUDA_VISIBLE_DEVICES="$gpu_id" "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
+  CUDA_VISIBLE_DEVICES="$gpu_id" env ${kv_env[@]+"${kv_env[@]}"} \
+    "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
     --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --kv-transfer-config "$kv_config" \

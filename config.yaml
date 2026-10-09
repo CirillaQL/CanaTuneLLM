@@ -55,14 +55,15 @@ topology:
     kv_port_base: 14579
     high_frequency_mhz: 1500
     memory_frequency_mhz: 6251
-    # auto: 1 - reserve / GPU memory (canatune.infrastructure.memory_plan); the reserve
-    # holds what vLLM does not plan for: the P2P receive buffer (kv_transfer.kv_buffer_bytes),
-    # overflow past it, one NCCL communicator per sending P, a margin. A number keeps a
-    # fixed fraction (0.82 before: 4.3 GB on an L4, which job K's overload exhausted).
+    # auto: 1 - reserve / GPU memory, at most 0.95 (canatune.infrastructure.memory_plan);
+    # the reserve holds what vLLM does not plan for: one connection per sending P, a
+    # margin and, with P2pNcclConnector, its receive buffer (kv_transfer.kv_buffer_bytes)
+    # and overflow past it. A number keeps a fixed fraction (0.82 before: 4.3 GB on an L4,
+    # which job K's overload exhausted).
     gpu_memory_utilization: auto
     memory_reserve:
-      overflow_bytes: 3.0e9     # received tensors past the buffer, allocator cached blocks
-      per_peer_bytes: 0.25e9    # NCCL communicator buffers per P sending to this D
+      overflow_bytes: 3.0e9     # P2pNccl: received tensors past the buffer, cached blocks
+      per_peer_bytes: 0.25e9    # per P sending to this D (NCCL communicator / NIXL endpoints)
       safety_bytes: 1.0e9
 
   endpoints:
@@ -76,13 +77,17 @@ topology:
     D3: {role: decode, gpu_id: 3, http_port: 8203, kv_port: 14582}
 
 kv_transfer:
-  connector: P2pNcclConnector
-  prefill_role: kv_producer
-  decode_role: kv_consumer
-  prefill_send_type: PUT_ASYNC  # K1b: TTFT 25-38 % lower than PUT
+  # NixlConnector (kv_both on P and D): D allocates blocks in its paged KV cache, then
+  # reads P's KV into them; P keeps the blocks until D has read them (or
+  # VLLM_NIXL_ABORT_REQUEST_TIMEOUT). No receive buffer, so no overflow and no
+  # in-flight KV gate; each endpoint's kv_port is its NIXL side-channel port.
+  # P2pNcclConnector: P pushes into D's receive buffer (jobs up to N and homo-l40s).
+  connector: NixlConnector
+  load_failure_policy: fail   # NIXL: a failed KV read fails the request (recompute: D redoes it)
+  prefill_send_type: PUT_ASYNC  # P2pNccl only; K1b: TTFT 25-38 % lower than PUT
   disable_prefix_cache: true
   disable_chunked_prefill: true
-  kv_buffer_bytes: 1.0e9      # P2pNccl kv_buffer_size on D (vLLM default 1e9)
+  kv_buffer_bytes: 1.0e9      # P2pNccl only: kv_buffer_size on D (vLLM default 1e9)
   kv_bytes_per_token: null    # null: from the model's config.json (Mistral-7B bf16: 131072)
 
 proxy:

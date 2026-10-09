@@ -41,7 +41,13 @@ from canatune.infrastructure.telemetry import (
     parse_snapshot,
     prom_value,
 )
-from canatune.proxy.proxy import Endpoint, StreamTimer, pd_transport_id
+from canatune.proxy.proxy import (
+    Endpoint,
+    StreamTimer,
+    decode_request,
+    pd_transport_id,
+    prefill_request,
+)
 
 # NVML clocks-event reasons that mean "held below the requested clock".
 LIMIT_MASK = 0x4 | 0x8 | 0x20 | 0x40 | 0x80  # SW power cap, HW slowdown, thermal, power brake
@@ -262,9 +268,10 @@ class CanaryProbe:
         timer = StreamTimer()
         status = "ok"
         try:
-            prefill_body = {**body, "stream": False, "max_tokens": 1}
             response = await client.post(
-                self.prefill.completions_url, json=prefill_body, headers=headers
+                self.prefill.completions_url,
+                json=prefill_request(body, self.prefill),
+                headers=headers,
             )
             prefill_ms = (time.monotonic() - sent) * 1000.0
             self._at_prefill.pop(probe_id, None)
@@ -273,7 +280,10 @@ class CanaryProbe:
             if response.status_code != 200:
                 raise httpx.HTTPError(f"prefill HTTP {response.status_code}")
             async with client.stream(
-                "POST", self.decode.completions_url, json=body, headers=headers
+                "POST",
+                self.decode.completions_url,
+                json=decode_request(body, self.prefill, response),
+                headers=headers,
             ) as stream:
                 if stream.status_code != 200:
                     raise httpx.HTTPError(f"decode HTTP {stream.status_code}")
@@ -284,6 +294,8 @@ class CanaryProbe:
                         self._inflight_tokens -= prompt_tokens
                         self._decoding += 1
                         stage = "decode"
+            if timer.error is not None:
+                raise RuntimeError(f"decode: {timer.error}")
             tpot_ms = timer.tpot_ms()
         except Exception as error:  # a failed probe is data, never a crash (cancel passes)
             status = f"error: {error!r}"

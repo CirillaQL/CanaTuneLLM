@@ -103,16 +103,19 @@ def kv_gate_fraction(
     samples: Sequence[ProbeSample],
     *,
     kv_bytes_per_token: float,
-    buffer_bytes: float,
+    buffer_bytes: float | None,
     theta: float,
     min_samples: int = 20,
     bins: int = 10,
-) -> tuple[float, str, dict[str, list[int]]]:
+) -> tuple[float | None, str, dict[str, list[int]]]:
     """-> (gate, source, bins). Share of the receive buffer in flight up to which
     violations stay within theta: the lower edge of the first well-sampled bin
     whose violation rate is clearly above theta (its Wilson lower bound, source
     "measured"); if the windows never reached such a bin, the buffer itself (1.0,
-    source "buffer": the connector's own limit from the config)."""
+    source "buffer": the connector's own limit from the config). No receive buffer
+    (NixlConnector): no gate (None, source "none")."""
+    if buffer_bytes is None:
+        return None, "none", {}
     counts: dict[int, list[int]] = {}
     for s in samples:
         if s.violated is None:
@@ -142,7 +145,7 @@ def calibrate_admission(
     ttft_slo_ms: float,
     theta: float,
     kv_bytes_per_token: float,
-    buffer_bytes: float,
+    buffer_bytes: float | None,
     min_samples: int = 20,
 ) -> dict[str, Any] | None:
     """-> evidence["admission"]: predictor coefficients, slack-bucket counts (the
