@@ -1,12 +1,13 @@
 # CanaTune
 
-## 1. Project Overview
+## 1. Project Scope
 
-CanaTune is a Python proxy/controller for Prefill/Decode (P/D) disaggregated
-vLLM inference. It controls request placement across prefill and decode nodes.
-
-The project explores energy-aware online routing and GPU frequency tuning using
-empirical Canary measurements instead of a learned runtime performance model.
+CanaTune is a Prefill/Decode (P/D) disaggregated inference system for vLLM that
+aims to reduce the energy of inference while keeping the SLOs (TTFT and TPOT) as
+far as possible. It saves energy through GPU DVFS and P/D request scheduling, and
+it finds the clock ranges and SLO judgments that keep the SLOs while saving energy
+from online real-time feedback and experiments on a deployed Canary group, not
+from an offline-trained model.
 
 ## 2. Project Structure
 
