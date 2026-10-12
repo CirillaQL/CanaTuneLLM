@@ -101,6 +101,10 @@ class RouterSettings:
     d_balance_modes: tuple[str, ...] = ("confirming", "expanding", "full_effort")
     d_choice: str = "concentrate"
     p_choice: str = "balance"
+    # Fixed pairing, group among the feasible ones: concentrate (the most loaded, the
+    # default) or round_robin (in turn; ablation A1: clocks from the Canary, no
+    # concentration).
+    group_choice: str = "concentrate"
     # Production TPOT feedback. window: per D, the quantile of the token gaps of the last
     # tpot_window_s against the TPOT SLO (pressure at or above it); a single live gap
     # counts only from tpot_stall_factor x the SLO (a hung stream), never as severe.
@@ -147,6 +151,9 @@ class RouterSettings:
             d_balance_modes=_modes(raw),
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
+            group_choice=_choice(
+                raw, "group_choice", ("concentrate", "round_robin"), "concentrate"
+            ),
             tpot_feedback=_choice(raw, "tpot_feedback", ("window", "gap"), "window"),
             tpot_window_s=_positive(raw, "tpot_window_s", 5.0),
             tpot_window_quantile=_fraction(raw, "tpot_window_quantile", 0.95),
@@ -329,6 +336,7 @@ class CanaTuneRouter:
         # D capacity): round robin over the fixed pairs, hard limits only.
         self.baseline_mode = False
         self._rr = 0
+        self._group_rr = 0  # group_choice round_robin: the next group index in turn
         self.d_exhausted: deque[float] = deque()  # marks: no D safe for one more request
         self.pressure_event = asyncio.Event()
         self.risk_signals = 0
@@ -639,6 +647,12 @@ class CanaTuneRouter:
                 # Spread: least outstanding prompt work first, production before Canary.
                 return min(feasible, key=lambda item: (
                     item[0].p.t_await, item[0].p.n_inflight, item[0].p.canary))  # fmt: skip
+            if self.settings.group_choice == "round_robin":
+                # In turn: the first feasible group at or after the cursor.
+                n = len(self.groups)
+                item = min(feasible, key=lambda item: (index(item[0].p) - self._group_rr) % n)
+                self._group_rr = (index(item[0].p) + 1) % n
+                return item
             # Most loaded feasible group; production before Canary on ties.
             return max(feasible, key=lambda item: (
                 item[0].p.n_inflight, not item[0].p.canary, -index(item[0].p)))  # fmt: skip
