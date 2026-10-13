@@ -636,10 +636,12 @@ class TierLocator:
         park: ClockPoint | None = None,
         capacity_window: WindowResult | None = None,
         b_star: int | None = None,
+        prefill_mhz: int | None = None,
     ) -> None:
         """From every probe and window of this run: plateau + slope per clock, the
         admission parameters (evidence["admission"]) and the cluster model for the
-        solver (evidence["model"])."""
+        solver (evidence["model"]). The congestion knees (KV gate, P slot cap) use
+        the samples at P clocks from `prefill_mhz` (H's) up."""
         assert self.run is not None
         ev = self.run.evidence
         tables = ev.get("prefill_ms_by_clock", {})
@@ -656,6 +658,7 @@ class TierLocator:
                 theta=self.s.theta,
                 kv_bytes_per_token=a.kv_bytes_per_token,
                 buffer_bytes=a.kv_buffer_bytes,
+                prefill_mhz=prefill_mhz,
             )
         if result is not None:
             ev["admission"] = result
@@ -1239,7 +1242,8 @@ class TierLocator:
             }
         )
         self._phase("model")  # after the evidence above: the model reads the D results
-        self.calibrate(park=park, capacity_window=capacity_window, b_star=b_star)
+        self.calibrate(park=park, capacity_window=capacity_window, b_star=b_star,
+                       prefill_mhz=h.prefill_mhz)
         table = TierTable(
             park=park,
             h=h,

@@ -140,6 +140,14 @@ router:
   # first (d_choice: concentrate | balance), then the P (p_choice: balance = lowest
   # predicted TTFT, concentrate = busiest safe P, same = the D's own P).
   pairing: fixed
+  # Fixed pairing, group among the feasible ones: concentrate (the most loaded),
+  # round_robin (ablation A1) or fill: the first group in a fixed order (production,
+  # then the Canary) with fewer requests at its P than the Canary's P slot cap, the
+  # fewest at P once every P is at it; full effort then round robin (power of two
+  # choices from fill_p2c_groups routable groups) without the KV in-flight gate.
+  group_choice: concentrate
+  fill_p2c_groups: 4
+  knee_update: true           # KV gate and P slot cap follow production's clean samples
   d_choice: concentrate
   p_choice: balance
   d_balance_modes: [confirming, expanding, full_effort]  # dynamic: D balanced under pressure

@@ -12,6 +12,14 @@ clock search, fill) cover idle to overloaded:
   kv gate             the share of D's receive buffer in flight above which
                       requests violate more than theta (on whatever buffer and
                       link this cluster has); the whole buffer if none is reached
+  P slot cap          the number of requests already at P (sent, P not returned)
+                      from which requests violate more than theta; under
+                      PUT_ASYNC a send blocked by D holds its request at P, so the
+                      count sees both P queueing and P blocked by D; no cap if
+                      none is reached
+
+Both knees come from the same violation counts per bin (`KneeCounts`): the Canary's
+samples seed them and the Router adds production's (online update).
 """
 
 import math
@@ -99,6 +107,90 @@ def _features(sample: ProbeSample, costs: CostBook, kv_bytes_per_token: float) -
     )
 
 
+KV_GATE_BINS = 10  # the gate in tenths of the receive buffer
+P_SLOT_BINS = 32  # requests at P are counted up to this (more share the last bin)
+
+
+def kv_gate_bin(inflight_bytes: float, buffer_bytes: float) -> int:
+    return max(0, min(KV_GATE_BINS - 1, int(inflight_bytes / buffer_bytes * KV_GATE_BINS)))
+
+
+def gate_of_bin(b: int) -> float:
+    return max(1.0 / KV_GATE_BINS, b / KV_GATE_BINS)
+
+
+def p_slot_bin(at_prefill: int) -> int:
+    return max(0, min(P_SLOT_BINS - 1, int(at_prefill)))
+
+
+class KneeCounts:
+    """[requests, violations] per bin of a congestion signal: a seed (the Canary's
+    counts) plus what is recorded later (production)."""
+
+    def __init__(self, seed: Mapping[str, Sequence[int]] | None = None) -> None:
+        self.seed = {int(b): [int(c[0]), int(c[1])] for b, c in (seed or {}).items()}
+        self.live: dict[int, list[int]] = {}
+
+    def record(self, b: int, violated: bool) -> None:
+        cell = self.live.setdefault(b, [0, 0])
+        cell[0] += 1
+        cell[1] += int(violated)
+
+    def counts(self) -> dict[int, list[int]]:
+        out = {b: list(c) for b, c in self.seed.items()}
+        for b, (n, k) in self.live.items():
+            cell = out.setdefault(b, [0, 0])
+            cell[0] += n
+            cell[1] += k
+        return dict(sorted(out.items()))
+
+    def to_json(self) -> dict[str, list[int]]:
+        return {str(b): c for b, c in self.counts().items()}
+
+    def knee(self, theta: float, min_samples: int) -> int | None:
+        """The lowest bin from which requests violate clearly more than theta and
+        more than below it: bins are merged upwards from each bin until the block
+        holds min_samples (so a sparse tail still counts, without the deep overload
+        far above diluting into it), and the block's Wilson lower bound must pass
+        both theta and the violation rate of all bins below (violations that are
+        as frequent below, e.g. of long prompts, are not this signal's knee; nor is
+        the lowest observed bin, which has nothing below to compare with).
+        None: no such bin was observed."""
+        counts = self.counts()
+        bins = list(counts)
+        head_n = head_k = 0
+        for i, b in enumerate(bins):
+            if i == 0:
+                head_n, head_k = counts[b]
+                continue
+            n = k = 0
+            for c in bins[i:]:
+                n += counts[c][0]
+                k += counts[c][1]
+                if n >= min_samples:
+                    break
+            if n < min_samples:
+                return None  # the rest together is too sparse to tell
+            lower = 1 - wilson_ucb(n - k, n)  # lower bound of the violation rate
+            if lower > max(theta, head_k / head_n if head_n else 0.0):
+                return b
+            head_n += counts[b][0]
+            head_k += counts[b][1]
+        return None
+
+
+def _at_or_above(
+    samples: Sequence[ProbeSample], prefill_mhz: int | None, min_samples: int
+) -> Sequence[ProbeSample]:
+    """Samples sent at P clocks from `prefill_mhz` up (where production runs: the
+    low clocks of the search add violations of slow prefill, not of congestion);
+    all of them when those are too few."""
+    if prefill_mhz is None:
+        return samples
+    kept = [s for s in samples if s.prefill_mhz >= prefill_mhz]
+    return kept if len(kept) >= 2 * min_samples else samples
+
+
 def kv_gate_fraction(
     samples: Sequence[ProbeSample],
     *,
@@ -106,35 +198,39 @@ def kv_gate_fraction(
     buffer_bytes: float | None,
     theta: float,
     min_samples: int = 20,
-    bins: int = 10,
 ) -> tuple[float | None, str, dict[str, list[int]]]:
     """-> (gate, source, bins). Share of the receive buffer in flight up to which
-    violations stay within theta: the lower edge of the first well-sampled bin
-    whose violation rate is clearly above theta (its Wilson lower bound, source
-    "measured"); if the windows never reached such a bin, the buffer itself (1.0,
+    violations stay within theta: the lower edge of the knee bin (`KneeCounts.knee`,
+    source "measured"); if the windows never reached one, the buffer itself (1.0,
     source "buffer": the connector's own limit from the config). No receive buffer
     (NixlConnector): no gate (None, source "none")."""
     if buffer_bytes is None:
         return None, "none", {}
-    counts: dict[int, list[int]] = {}
+    counts = KneeCounts()
     for s in samples:
-        if s.violated is None:
-            continue
-        share = s.inflight_tokens * kv_bytes_per_token / buffer_bytes
-        b = min(bins - 1, int(share * bins))
-        cell = counts.setdefault(b, [0, 0])
-        cell[0] += 1
-        cell[1] += int(s.violated)
-    for b in sorted(counts):
-        n, k = counts[b]
-        if n < min_samples:
-            continue
-        lower = 1 - wilson_ucb(n - k, n)  # lower bound of the violation rate
-        if lower > theta:
-            table = {str(b): c for b, c in sorted(counts.items())}
-            return max(1.0 / bins, b / bins), "measured", table
-    table = {str(b): c for b, c in sorted(counts.items())}
-    return 1.0, "buffer", table
+        if s.violated is not None:
+            counts.record(kv_gate_bin(s.inflight_tokens * kv_bytes_per_token, buffer_bytes),
+                          s.violated)
+    b = counts.knee(theta, min_samples)
+    if b is None:
+        return 1.0, "buffer", counts.to_json()
+    return gate_of_bin(b), "measured", counts.to_json()
+
+
+def p_slot_cap(
+    samples: Sequence[ProbeSample], *, theta: float, min_samples: int = 20
+) -> tuple[int | None, str, dict[str, list[int]]]:
+    """-> (cap, source, bins). A group takes a request while fewer than `cap` are at
+    its P: the knee of the violations by the number of requests already at P when
+    each was sent (source "measured"); None (source "none") if never reached."""
+    counts = KneeCounts()
+    for s in samples:
+        if s.violated is not None:
+            counts.record(p_slot_bin(len(s.at_prefill)), s.violated)
+    b = counts.knee(theta, min_samples)
+    if b is None:
+        return None, "none", counts.to_json()
+    return max(1, b), "measured", counts.to_json()
 
 
 def calibrate_admission(
@@ -147,9 +243,11 @@ def calibrate_admission(
     kv_bytes_per_token: float,
     buffer_bytes: float | None,
     min_samples: int = 20,
+    prefill_mhz: int | None = None,
 ) -> dict[str, Any] | None:
     """-> evidence["admission"]: predictor coefficients, slack-bucket counts (the
-    risk-table seed), the KV gate; None without enough clean samples."""
+    risk-table seed), the KV gate and the P slot cap (both from the samples at P
+    clocks from `prefill_mhz`, H's, up); None without enough clean samples."""
     clean = [s for s in samples if s.ttft_ms is not None and s.violated is not None]
     if len(clean) < 2 * min_samples:
         return None
@@ -172,13 +270,15 @@ def calibrate_admission(
         for (x, _), s in zip(halves[i], outcomes[i]):
             predicted = sum(c * v for c, v in zip(fold, x))
             slack.record(ttft_slo_ms - predicted, bool(s.violated))
+    knees = _at_or_above(clean, prefill_mhz, min_samples)
     gate, gate_source, gate_bins = kv_gate_fraction(
-        clean,
+        knees,
         kv_bytes_per_token=kv_bytes_per_token,
         buffer_bytes=buffer_bytes,
         theta=theta,
         min_samples=min_samples,
     )
+    slot, slot_source, slot_bins = p_slot_cap(knees, theta=theta, min_samples=min_samples)
     residuals = [y - sum(c * v for c, v in zip(coef, x)) for x, y in near]
     return {
         "samples": len(clean),
@@ -191,4 +291,8 @@ def calibrate_admission(
         "kv_gate_fraction": gate,
         "kv_gate_source": gate_source,
         "kv_gate_bins": gate_bins,
+        "p_slot_cap": slot,
+        "p_slot_source": slot_source,
+        "p_slot_bins": slot_bins,
+        "knee_samples": len(knees),
     }

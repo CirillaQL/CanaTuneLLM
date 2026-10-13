@@ -13,7 +13,14 @@ With a published table, for each routable group the Router checks
   prefill cost, pending P work, KV in flight, requests decoding) and looks up the
   violation risk of that predicted slack; `cells` (v1) looks up the risk table
   cell (clock point, queue, prompt bucket, D busy),
-and admits to the most loaded feasible group (concentration keeps batches large).
+and admits to the most loaded feasible group (concentration keeps batches large), or
+(`group_choice: fill`) to the first feasible group in a fixed order (production groups,
+then the Canary) whose P holds fewer requests than the P slot cap the Canary measured,
+spreading over the feasible groups by the fewest at P once every P is at its cap.
+Under P2pNcclConnector PUT_ASYNC a send blocked by D keeps its request at P, so
+the count at P sees P queueing and P blocked by D alike; a group that drains takes
+the next request again (the order is checked from the start every time). The KV gate
+and the P slot cap are updated online from production's clean samples.
 D's SLO bound is the Canary's length model (TPOT = alpha + beta X + gamma K + r95
 over the sequences on D and the context tokens they hold, plus the KV wall); the
 count bound B* remains for tables without it. Best-effort uses either only to warn.
@@ -35,6 +42,7 @@ import asyncio
 import itertools
 import math
 import os
+import random
 import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
@@ -50,6 +58,7 @@ from canatune.domain.admission import (
     kv_bytes_from_model_dir,
     slack_edges,
 )
+from canatune.domain.calibration import KneeCounts, gate_of_bin, kv_gate_bin, p_slot_bin
 from canatune.domain.groups import ClockPoint, Group, TierState
 from canatune.domain.load import LengthStats
 from canatune.domain.models import decode_coef, decode_tpot, interpolate
@@ -102,9 +111,19 @@ class RouterSettings:
     d_choice: str = "concentrate"
     p_choice: str = "balance"
     # Fixed pairing, group among the feasible ones: concentrate (the most loaded, the
-    # default) or round_robin (in turn; ablation A1: clocks from the Canary, no
-    # concentration).
+    # default), round_robin (in turn; ablation A1: clocks from the Canary, no
+    # concentration) or fill (the first in a fixed order below the P slot cap, then
+    # the fewest at P; full effort: round robin, power of two choices from
+    # fill_p2c_groups routable groups, without the KV in-flight gate).
     group_choice: str = "concentrate"
+    fill_p2c_groups: int = 4
+    # fill: a D takes more only while its length-model TPOT bound stays below this
+    # share of the TPOT SLO (controller.feedback_near_slo: from there production
+    # feedback counts the latency as pressure, so a group filled to the SLO itself
+    # would send the whole cluster to full effort).
+    near_slo: float = 0.9
+    # The KV gate and the P slot cap follow production's clean samples (energy mode).
+    knee_update: bool = True
     # Production TPOT feedback. window: per D, the quantile of the token gaps of the last
     # tpot_window_s against the TPOT SLO (pressure at or above it); a single live gap
     # counts only from tpot_stall_factor x the SLO (a hung stream), never as severe.
@@ -152,8 +171,11 @@ class RouterSettings:
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
             group_choice=_choice(
-                raw, "group_choice", ("concentrate", "round_robin"), "concentrate"
+                raw, "group_choice", ("concentrate", "round_robin", "fill"), "concentrate"
             ),
+            fill_p2c_groups=int(_positive(raw, "fill_p2c_groups", 4)),
+            near_slo=_fraction(controller, "feedback_near_slo", 0.9),
+            knee_update=bool(raw.get("knee_update", True)),
             tpot_feedback=_choice(raw, "tpot_feedback", ("window", "gap"), "window"),
             tpot_window_s=_positive(raw, "tpot_window_s", 5.0),
             tpot_window_quantile=_fraction(raw, "tpot_window_quantile", 0.95),
@@ -321,6 +343,11 @@ class CanaTuneRouter:
         # Share of D's receive buffer allowed in flight: the Canary's measured gate;
         # the whole buffer (the connector's own limit) until then.
         self.kv_fraction = 1.0
+        # Requests at one P from which the Canary measured violations (fill); None: no cap.
+        self.p_slot_cap: int | None = None
+        self._kv_knee: KneeCounts | None = None  # Canary's counts + production's
+        self._slot_knee: KneeCounts | None = None
+        self._rng = random.Random(0)  # power of two choices (reproducible)
         self._applied_key: object = None
         self._costs = self._cost_book(None)
         self._slack_by_group: dict[str, tuple[tuple[float, ...], float, Any]] = {}
@@ -392,6 +419,12 @@ class CanaTuneRouter:
             self.predictor.set_prior(admission["predictor_coef"])
             self.slack.set_seed(admission.get("slack_counts") or {})
             self.kv_fraction = float(admission.get("kv_gate_fraction") or 1.0)
+            cap = admission.get("p_slot_cap")
+            self.p_slot_cap = None if cap is None else int(cap)
+            bins = admission.get("kv_gate_bins")
+            self._kv_knee = KneeCounts(bins) if bins and self.settings.kv_buffer_bytes else None
+            bins = admission.get("p_slot_bins")
+            self._slot_knee = KneeCounts(bins) if bins else None
             self.log.write({"event": "admission_calibration", "published_at": key, **admission})
 
     def prefill_cost(self, mhz: int | None = None) -> PrefillCost:
@@ -647,6 +680,19 @@ class CanaTuneRouter:
                 # Spread: least outstanding prompt work first, production before Canary.
                 return min(feasible, key=lambda item: (
                     item[0].p.t_await, item[0].p.n_inflight, item[0].p.canary))  # fmt: skip
+            if self.settings.group_choice == "fill":
+                # Fixed order, production before Canary: the first group with room, P
+                # below its slot cap and D below the near-SLO share of the TPOT SLO.
+                order = sorted(feasible, key=lambda item: (item[0].p.canary, index(item[0].p)))
+                cap, near = self.p_slot_cap, self.settings.near_slo * self.settings.tpot_slo_ms
+                for item in order:
+                    tpot = self._tpot_by_group.get(item[0].d.name)
+                    if (cap is None or item[0].p.n_at_p < cap) and (tpot is None or tpot <= near):
+                        return item
+                # No group has room: spread by the fewest at P, then the lightest D.
+                return min(order, key=lambda item: (
+                    item[0].p.n_at_p, self._tpot_by_group.get(item[0].d.name, 0.0),
+                    item[0].p.pending_ms))  # fmt: skip
             if self.settings.group_choice == "round_robin":
                 # In turn: the first feasible group at or after the cursor.
                 n = len(self.groups)
@@ -746,14 +792,19 @@ class CanaTuneRouter:
     def _admit_baseline(self, tokens: int, exact: bool, waited_ms: float) -> Ticket | None:
         """Baseline mode (high load): what the default system does, round robin over
         the fixed pairs, keeping only the hard limits (fresh D telemetry, D KV wall,
-        KV in flight). No risk, length model or concentration decides here."""
+        KV in flight). No risk, length model or concentration decides here. With
+        `group_choice: fill` the KV in-flight gate does not apply (at full effort it
+        held back hardly any request), and from fill_p2c_groups usable groups the
+        less loaded P of two drawn at random takes it (power of two choices)."""
         n = len(self.groups)
+        fill = self.settings.group_choice == "fill"
+        usable: list[tuple[Group, bool]] = []
         for k in range(n):
             group = self.groups[(self._rr + k) % n]
             if not group.routable:
                 continue
             d_busy, blocked = self._decode_state(group)
-            if blocked is not None or self._kv_blocked(group, tokens):
+            if blocked is not None or (not fill and self._kv_blocked(group, tokens)):
                 continue
             table = self.tiers.table
             if (self.settings.kv_projection_hard and table is not None
@@ -761,16 +812,25 @@ class CanaTuneRouter:
                 snapshot = self.telemetry.fresh(group.decode, self.settings.snapshot_max_age_s)
                 if self._kv_projected_over(group, tokens, table, snapshot):
                     continue
-            self._rr = (self.groups.index(group) + 1) % n
-            assert group.effective is not None
-            route = Route(group, group)
-            cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
-            s_own = self.prefill_cost(group.effective.prefill_mhz)(tokens)
-            x, predicted = self._predict(group, s_own)
-            self._slack_by_group = {route.key: (x, predicted, None)}
-            self._tpot_by_group = {}
-            return self._issue(route, cell, None, d_busy, tokens, exact, waited_ms, None)
-        return None
+            usable.append((group, d_busy))
+            if not fill:
+                break  # round robin: the first usable group in turn
+        if not usable:
+            return None
+        group, d_busy = usable[0]
+        if fill and len(usable) >= self.settings.fill_p2c_groups:
+            drawn = self._rng.sample(usable, 2)
+            group, d_busy = min(drawn, key=lambda item: (
+                item[0].n_at_p, item[0].pending_ms, self.groups.index(item[0])))  # fmt: skip
+        self._rr = (self.groups.index(group) + 1) % n
+        assert group.effective is not None
+        route = Route(group, group)
+        cell = self.table.cell(group.effective, group.n_await, tokens, d_busy)
+        s_own = self.prefill_cost(group.effective.prefill_mhz)(tokens)
+        x, predicted = self._predict(group, s_own)
+        self._slack_by_group = {route.key: (x, predicted, None)}
+        self._tpot_by_group = {}
+        return self._issue(route, cell, None, d_busy, tokens, exact, waited_ms, None)
 
     def _issue(
         self,
@@ -807,6 +867,7 @@ class CanaTuneRouter:
                 "n_await": dg.n_await,
                 "t_await": dg.t_await,
                 "n_inflight": group.n_inflight,
+                "n_at_p": group.n_at_p,
                 "d_busy": d_busy,
                 "tier": group.tier.value,
                 "clock": None if group.effective is None or dg.effective is None
@@ -1175,6 +1236,7 @@ class CanaTuneRouter:
                 # on the time after dispatch (the wait at the proxy is known exactly).
                 self.slack.record(ticket.slack_ms, bool(violated))
                 self.predictor.record(ticket.features, max(0.0, ttft_ms - ticket.wait_ms))
+            self._update_knees(ticket, bool(violated))
         if status == "ok" and self.lengths is not None:
             self.lengths.record(ticket.prompt_tokens, output_tokens)
         self.log.write(
@@ -1203,6 +1265,32 @@ class CanaTuneRouter:
             }
         )
 
+    def _update_knees(self, ticket: Ticket, violated: bool) -> None:
+        """Online KV gate and P slot cap: a clean sample admitted in energy mode (full
+        effort's overload would show violations at every level) joins the Canary's
+        counts, and both knees are read again."""
+        s = self.settings
+        if not s.knee_update or ticket.snapshot.get("routing") == "baseline":
+            return
+        theta, min_samples = s.theta, self.table.min_samples
+        if self._kv_knee is not None and s.kv_buffer_bytes:
+            inflight = float(ticket.snapshot.get("inflight_mb") or 0.0) * 1e6
+            self._kv_knee.record(kv_gate_bin(inflight, s.kv_buffer_bytes), violated)
+            b = self._kv_knee.knee(theta, min_samples)
+            fraction = 1.0 if b is None else gate_of_bin(b)
+            if fraction != self.kv_fraction:
+                self.log.write({"event": "kv_gate_update", "from": self.kv_fraction,
+                                "to": fraction, "bins": self._kv_knee.to_json()})
+                self.kv_fraction = fraction
+        if self._slot_knee is not None and "n_at_p" in ticket.snapshot:
+            self._slot_knee.record(p_slot_bin(ticket.snapshot["n_at_p"]), violated)
+            b = self._slot_knee.knee(theta, min_samples)
+            cap = None if b is None else max(1, b)
+            if cap != self.p_slot_cap:
+                self.log.write({"event": "p_slot_update", "from": self.p_slot_cap,
+                                "to": cap, "bins": self._slot_knee.to_json()})
+                self.p_slot_cap = cap
+
     def state(self) -> dict[str, Any]:
         return {
             "admission": self.settings.admission,
@@ -1216,6 +1304,7 @@ class CanaTuneRouter:
             "risk_signals": self.risk_signals,
             "queued": len(self._queue),
             "kv_gate_fraction": self.kv_fraction,
+            "p_slot_cap": self.p_slot_cap,
             "backfill_slack_ms": self.backfill_slack_ms(),
             "overflows": dict(self.overflows),
             "holding": len(self._holding),
