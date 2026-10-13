@@ -78,6 +78,9 @@ class ControllerSettings:
     # exit_rate_fraction of the rate it was entered at.
     full_effort_min_s: float = 30.0
     exit_rate_fraction: float = 0.8
+    # Clocks of a group at tier H: canary (the Canary's published H, the default) or
+    # max (ablation A2: concentration and admission as usual, no frequency scaling).
+    production_clocks: str = "canary"
 
     def __post_init__(self) -> None:
         durations = (self.feedback_window_s, self.confirm_s, self.expansion_grace_s)
@@ -91,6 +94,8 @@ class ControllerSettings:
                 or self.d_trigger_count < 1 or not self.d_trigger_window_s > 0
                 or self.full_effort_min_s < 0 or not 0 < self.exit_rate_fraction <= 1):
             raise ControllerConfigError("invalid high-load settings")
+        if self.production_clocks not in ("canary", "max"):
+            raise ControllerConfigError("controller.production_clocks must be canary or max")
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControllerSettings":
@@ -122,6 +127,7 @@ class ControllerSettings:
             d_trigger_window_s=float(raw.get("d_trigger_window_s", 3)),
             full_effort_min_s=float(raw.get("full_effort_min_s", 30)),
             exit_rate_fraction=float(raw.get("exit_rate_fraction", 0.8)),
+            production_clocks=str(raw.get("production_clocks", "canary")),
         )
 
 
@@ -201,6 +207,8 @@ class TierController:
         """Lock P and D to `tier`; the Router sees the conservative point meanwhile."""
         old = group.effective
         target = self.tiers.clocks(tier)
+        if tier is Tier.H and self.settings.production_clocks == "max":
+            target = self.tiers.clocks(Tier.MAX)  # ablation A2: H in name, MAX clocks
         group.tier = tier
         epochs = self.router.clock_epochs
         epochs[group.name] = epochs.get(group.name, 0) + 1
