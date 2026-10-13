@@ -20,7 +20,10 @@ spreading over the feasible groups by the fewest at P once every P is at its cap
 Under P2pNcclConnector PUT_ASYNC a send blocked by D keeps its request at P, so
 the count at P sees P queueing and P blocked by D alike; a group that drains takes
 the next request again (the order is checked from the start every time). The KV gate
-and the P slot cap are updated online from production's clean samples.
+and the P slot cap are updated online from production's clean samples. A group whose
+own production latency is near the SLO can be cooled by the Controller (`cool`): fill
+then gives it no room for a while, so new requests go to the next group before the
+whole cluster is sent to full effort.
 D's SLO bound is the Canary's length model (TPOT = alpha + beta X + gamma K + r95
 over the sequences on D and the context tokens they hold, plus the KV wall); the
 count bound B* remains for tables without it. Best-effort uses either only to warn.
@@ -373,6 +376,8 @@ class CanaTuneRouter:
         self._live: dict[int, Ticket] = {}
         # One sample per request: live stream updates replace rather than multiply it.
         self._production: dict[int, tuple[float, float, float, float]] = {}
+        self._production_meta: dict[int, tuple[str, float]] = {}  # id -> (group, admitted)
+        self.cooled: dict[str, float] = {}  # fill: group -> clock time until it has no room
         # window TPOT feedback: recent token gaps (time, ms) per D
         self._gaps: dict[str, deque[tuple[float, float]]] = {}
 
@@ -687,7 +692,8 @@ class CanaTuneRouter:
                 cap, near = self.p_slot_cap, self.settings.near_slo * self.settings.tpot_slo_ms
                 for item in order:
                     tpot = self._tpot_by_group.get(item[0].d.name)
-                    if (cap is None or item[0].p.n_at_p < cap) and (tpot is None or tpot <= near):
+                    if ((cap is None or item[0].p.n_at_p < cap) and (tpot is None or tpot <= near)
+                            and not self.is_cooled(item[0].p.name)):
                         return item
                 # No group has room: spread by the fewest at P, then the lightest D.
                 return min(order, key=lambda item: (
@@ -1078,6 +1084,34 @@ class CanaTuneRouter:
         idle = interpolate(self._idle_ttft, tokens)
         return idle is None or idle < self.settings.ttft_slo_ms
 
+    def _intrinsically_near(self, ticket: Ticket) -> bool:
+        """The request's TTFT is near the SLO even on an idle group at its admission
+        clock: the Canary's idle TTFT (top clock) with the prefill cost moved from the
+        top clock to that clock. Its latency is no sign of load, so it counts as
+        pressure only once it actually violates the SLO."""
+        self._apply_table()
+        idle = interpolate(self._idle_ttft, ticket.prompt_tokens)
+        if idle is None:
+            return False
+        at_clock = idle - self.prefill_cost(None)(ticket.prompt_tokens) + ticket.s_own_ms
+        return at_clock >= self.settings.near_slo * self.settings.ttft_slo_ms
+
+    def _ttft_ratio(self, ticket: Ticket, ttft_ms: float) -> float:
+        """TTFT over the SLO as feedback; 0 for a prompt impossible at idle/MAX, and
+        scaled by near_slo for an intrinsically near one (counted only when late)."""
+        if not self._actionable_ttft(ticket.prompt_tokens):
+            return 0.0
+        ratio = ttft_ms / self.settings.ttft_slo_ms
+        return ratio * self.settings.near_slo if self._intrinsically_near(ticket) else ratio
+
+    def cool(self, group: str, until: float) -> None:
+        """fill: `group` has no room until clock time `until` (the Controller saw its
+        production latency near the SLO); it stays feasible for spreading."""
+        self.cooled[group] = max(until, self.cooled.get(group, float("-inf")))
+
+    def is_cooled(self, group: str, now: float | None = None) -> bool:
+        return self.cooled.get(group, float("-inf")) > (self._clock() if now is None else now)
+
     def observe_latency(
         self, ticket: Ticket, ttft_ms: float | None, tpot_ms: float | None,
     ) -> None:
@@ -1090,11 +1124,11 @@ class CanaTuneRouter:
         if ttft_ms is not None:
             # TTFT belongs to first-token time, not every subsequent token/finish.
             ttft_time = ticket.first_token_at if ticket.first_token_at is not None else now
-            ttft_ratio = (ttft_ms / self.settings.ttft_slo_ms
-                          if self._actionable_ttft(ticket.prompt_tokens) else 0.0)
+            ttft_ratio = self._ttft_ratio(ticket, ttft_ms)
         if tpot_ms is not None:
             tpot_time, tpot_ratio = now, tpot_ms / self.settings.tpot_slo_ms
         self._production[ticket.id] = (ttft_time, ttft_ratio, tpot_time, tpot_ratio)
+        self._production_meta[ticket.id] = (ticket.group.name, ticket.admitted_at)
         if max(ttft_ratio, tpot_ratio) >= 0.9:
             self.pressure_event.set()  # feedback wakes control without becoming a prediction
 
@@ -1134,26 +1168,43 @@ class CanaTuneRouter:
 
     def production_feedback(
         self, window_s: float, min_samples: int, near: float, *, since: float = float("-inf"),
+        admitted_since: float = float("-inf"),
     ) -> dict[str, Any]:
-        """Recent actual latency plus unfinished-request/physical-capacity waits."""
+        """Recent actual latency plus unfinished-request/physical-capacity waits, over
+        the cluster and per group (`groups`; `pressured_groups`: those with near-SLO
+        requests or waits of their own, where the cluster's pressure comes from).
+        `admitted_since` keeps only requests admitted from then on (after a redirect:
+        what the new routing serves)."""
         now = self._clock()
         cutoff = max(now - window_s, since)
         self._production = {
             k: v for k, v in self._production.items() if max(v[0], v[2]) >= now - window_s
         }
-        ratios = [
-            max(r if t >= cutoff else 0, dr if dt >= cutoff else 0)
-            for t, r, dt, dr in self._production.values() if max(t, dt) >= cutoff
-        ]
+        self._production_meta = {
+            k: v for k, v in self._production_meta.items() if k in self._production
+        }
+        per: dict[str, list[float]] = {}
+        ratios = []
+        for k, (t, r, dt, dr) in self._production.items():
+            group, admitted = self._production_meta.get(k, ("", float("-inf")))
+            if max(t, dt) < cutoff or admitted < admitted_since:
+                continue
+            ratio = max(r if t >= cutoff else 0, dr if dt >= cutoff else 0)
+            ratios.append(ratio)
+            per.setdefault(group, []).append(ratio)
         window = self.settings.tpot_feedback == "window"
         live_ratio = stall_ratio = 0.0
+        live_by: dict[str, float] = {}
         for ticket in self._live.values():
+            if ticket.admitted_at < admitted_since:
+                continue
             if ticket.first_token_at is None:
                 if not ticket.streaming and ticket.stage != "prefill":
                     continue  # past P without a stream: no TTFT evidence either way
-                if self._actionable_ttft(ticket.prompt_tokens):
-                    age = (now - ticket.admitted_at) * 1000 + ticket.wait_ms
-                    live_ratio = max(live_ratio, age / self.settings.ttft_slo_ms)
+                age = (now - ticket.admitted_at) * 1000 + ticket.wait_ms
+                ratio = self._ttft_ratio(ticket, age)
+                live_ratio = max(live_ratio, ratio)
+                live_by[ticket.group.name] = max(live_by.get(ticket.group.name, 0.0), ratio)
             elif ticket.last_token_at is not None:
                 gap = (now - ticket.last_token_at) * 1000 / self.settings.tpot_slo_ms
                 if window:  # a stall counts as pressure, never as severe
@@ -1167,6 +1218,19 @@ class CanaTuneRouter:
         fraction = sum(r >= near for r in ratios) / len(ratios) if ratios else 0.0
         tpot_q, tpot_group = self.tpot_window() if window else (0.0, None)
         stalled = stall_ratio >= self.settings.tpot_stall_factor
+        groups, pressured = {}, []
+        for name in sorted(set(per) | set(live_by)):
+            values = per.get(name, [])
+            share = sum(r >= near for r in values) / len(values) if values else 0.0
+            live = live_by.get(name, 0.0)
+            groups[name] = {"samples": len(values), "near_fraction": share, "live_ratio": live}
+            # Where the cluster's pressure comes from: a group with near-SLO requests of
+            # its own (the cluster test above already asked for min_samples; one group
+            # rarely has as many in a window, so it is not asked again here).
+            if share > 0 or live >= near:
+                pressured.append(name)
+        if tpot_q >= 1.0 and tpot_group is not None and tpot_group not in pressured:
+            pressured.append(tpot_group)
         return {
             "samples": len(ratios), "near_fraction": fraction,
             "live_ratio": live_ratio, "wait_ratio": wait_ratio,
@@ -1175,6 +1239,7 @@ class CanaTuneRouter:
             "pressure": (len(ratios) >= min_samples and fraction > self.settings.theta)
             or max(live_ratio, wait_ratio) >= near or tpot_q >= 1.0 or stalled,
             "severe": max(live_ratio, wait_ratio) >= 2,
+            "groups": groups, "pressured_groups": pressured,
         }
 
     def finish(
@@ -1208,6 +1273,7 @@ class CanaTuneRouter:
             self.observe_latency(ticket, ttft_ms, feedback_tpot)
         else:
             self._production.pop(ticket.id, None)
+            self._production_meta.pop(ticket.id, None)
 
         violated = is_violation(
             ttft_ms,

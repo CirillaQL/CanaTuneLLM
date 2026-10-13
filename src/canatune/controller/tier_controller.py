@@ -6,8 +6,13 @@ Router admits everything; the Controller does nothing else.
 With a table, every tick:
 * best-effort stages: prediction warning -> persistent Production latency confirms
   pressure -> expand at measured working capacity -> MAX/reclaim Canary only after
-  expansion fails or unfinished work is severely stalled. Recover after a quiet
-  t_down_s using actual feedback, not a model-only feasibility decision.
+  expansion fails or unfinished work is severely stalled. With `redirect` (router
+  group_choice fill) confirmed pressure is first answered inside the serving groups:
+  the groups whose own latency shows it are cooled (no room for a feedback window),
+  new requests go to the groups with room, and only when no group has room or the
+  requests admitted after the redirect still show pressure does the cluster go to MAX.
+  Recover after a quiet t_down_s using actual feedback, not a model-only feasibility
+  decision.
   Legacy overload policies retain incremental wake/abort/boost behavior.
 * plan (the Canary's cluster model, `domain.models.Solver`): from the offered
   request rate (Router arrivals over `load_window_s`; its burst factor over
@@ -81,6 +86,9 @@ class ControllerSettings:
     # Clocks of a group at tier H: canary (the Canary's published H, the default) or
     # max (ablation A2: concentration and admission as usual, no frequency scaling).
     production_clocks: str = "canary"
+    # fill: answer confirmed pressure by cooling the pressured groups and sending new
+    # requests to the others first; MAX only once no group has room.
+    redirect: bool = True
 
     def __post_init__(self) -> None:
         durations = (self.feedback_window_s, self.confirm_s, self.expansion_grace_s)
@@ -128,6 +136,7 @@ class ControllerSettings:
             full_effort_min_s=float(raw.get("full_effort_min_s", 30)),
             exit_rate_fraction=float(raw.get("exit_rate_fraction", 0.8)),
             production_clocks=str(raw.get("production_clocks", "canary")),
+            redirect=bool(raw.get("redirect", True)),
         )
 
 
@@ -183,6 +192,7 @@ class TierController:
         self._pressure_ticks: deque[tuple[float, bool]] = deque()
         self._full_effort_since = float("-inf")
         self._full_effort_rate = 0.0
+        self._redirected_at: float | None = None  # expanding by a redirect since then
 
     # ---- actuation ---------------------------------------------------------------
 
@@ -406,9 +416,12 @@ class TierController:
             if self.mode == "energy":
                 self._mode("warning", "prediction")
         since = self._expanded_at if self.mode == "expanding" else None
+        redirected = self._redirected_at if self.mode == "expanding" else None
         f = self.feedback = self.router.production_feedback(
             s.feedback_window_s, s.feedback_min_samples, s.feedback_near_slo,
             since=float("-inf") if since is None else since,
+            # after a redirect, what the new routing serves (requests admitted since)
+            admitted_since=float("-inf") if redirected is None else redirected,
         )
         if f["pressure"]:
             self._pressure_at = now
@@ -451,7 +464,7 @@ class TierController:
                 return
             self._full_effort = self.router.full_effort = False
             self.router.baseline_mode = False
-            self._expanded_at = None
+            self._expanded_at = self._redirected_at = None
             for group in self.groups:
                 if group.state is GroupState.ACTIVE and self.tiers.table is not None:
                     await self.set_tier(group, Tier.H, "recovered")
@@ -468,14 +481,21 @@ class TierController:
             if now - self._expanded_at < s.expansion_grace_s:
                 return
             if confirmed:
-                await self._enter_full_effort("expansion_insufficient")
+                if self._redirected_at is not None and self._redirect(now, f):
+                    return  # the requests sent after the redirect: another group cooled
+                await self._enter_full_effort(
+                    "redirect_insufficient" if self._redirected_at is not None
+                    else "expansion_insufficient"
+                )
                 return
         elif confirmed:
             if not any(
                 g.state not in (GroupState.ACTIVE, GroupState.EXPLORING) for g in self.groups
             ):
-                # Every group already serves: expansion cannot add capacity, waiting
-                # out its grace only delays MAX.
+                # Every group already serves: expansion cannot add capacity. Redirect
+                # within them first (fill); else waiting out a grace only delays MAX.
+                if self._redirect(now, f):
+                    return
                 await self._enter_full_effort("nothing_to_expand")
                 return
             self._mode("expanding", "production_confirmed")
@@ -486,8 +506,35 @@ class TierController:
         quiet_after = (max(self._pressure_at, self._warning_at)
                        if self.mode in ("warning", "confirming") else self._pressure_at)
         if not f["pressure"] and now - quiet_after >= s.t_down_s:
-            self._expanded_at = None
+            self._expanded_at = self._redirected_at = None
             self._mode("energy", "production_recovered")
+
+    def _redirect(self, now: float, f: Mapping[str, Any]) -> bool:
+        """fill: cool the groups whose own production latency shows the pressure (no
+        room for a feedback window) and keep serving at the working clocks while some
+        routable group has room -> whether the pressure was answered this way. Pressure
+        in every group leaves no room, and pressure no group shows (the proxy's own
+        wait) is no hot spot: False, MAX."""
+        s = self.settings
+        if not s.redirect or self.router.settings.group_choice != "fill":
+            return False
+        pressured = [g for g in self.groups if g.name in (f.get("pressured_groups") or ())]
+        if not pressured:
+            return False
+        until = now + s.feedback_window_s
+        for group in pressured:
+            self.router.cool(group.name, until)
+        room = [g.name for g in self.groups
+                if g.routable and not self.router.is_cooled(g.name, now)]
+        self.log.write({"event": "redirect", "cooled": [g.name for g in pressured],
+                        "until_s": s.feedback_window_s, "room": room,
+                        "groups": f.get("groups")})
+        if not room:
+            return False
+        self._mode("expanding", "redirect")
+        self._expanded_at = self._redirected_at = self._clock()
+        self._confirm_since = None
+        return True
 
     async def _expand_capacity(self, now: float) -> None:
         """Wake enough groups at the measured working point; static uses C_H."""
@@ -522,6 +569,7 @@ class TierController:
 
     async def _enter_full_effort(self, reason: str) -> None:
         self._mode("full_effort", reason)
+        self._redirected_at = None
         if not self._full_effort:
             self._full_effort = self.router.full_effort = True
             self.router.baseline_mode = self.settings.full_effort_routing == "baseline"

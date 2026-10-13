@@ -154,7 +154,8 @@ class KneeCounts:
         far above diluting into it), and the block's Wilson lower bound must pass
         both theta and the violation rate of all bins below (violations that are
         as frequent below, e.g. of long prompts, are not this signal's knee; nor is
-        the lowest observed bin, which has nothing below to compare with).
+        the lowest observed bin, which has nothing below to compare with). In a
+        merged block the knee is the first bin whose own rate passes that floor.
         None: no such bin was observed."""
         counts = self.counts()
         bins = list(counts)
@@ -164,16 +165,21 @@ class KneeCounts:
                 head_n, head_k = counts[b]
                 continue
             n = k = 0
+            block = []
             for c in bins[i:]:
                 n += counts[c][0]
                 k += counts[c][1]
+                block.append(c)
                 if n >= min_samples:
                     break
             if n < min_samples:
                 return None  # the rest together is too sparse to tell
             lower = 1 - wilson_ucb(n - k, n)  # lower bound of the violation rate
-            if lower > max(theta, head_k / head_n if head_n else 0.0):
-                return b
+            floor = max(theta, head_k / head_n if head_n else 0.0)
+            if lower > floor:
+                # A merged block: the knee is its first bin that is itself above the
+                # floor (the violations of a higher bin are not the lower one's).
+                return next((c for c in block if counts[c][1] > floor * counts[c][0]), b)
             head_n += counts[b][0]
             head_k += counts[b][1]
         return None
