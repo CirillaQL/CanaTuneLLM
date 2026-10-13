@@ -84,6 +84,7 @@ kv_transfer:
   # P2pNcclConnector: P pushes into D's receive buffer (jobs up to N and homo-l40s).
   connector: NixlConnector
   load_failure_policy: fail   # NIXL: a failed KV read fails the request (recompute: D redoes it)
+  kv_buffer_device: cuda      # NIXL: cuda (KV cache registered) or cpu (host staging buffer)
   prefill_send_type: PUT_ASYNC  # P2pNccl only; K1b: TTFT 25-38 % lower than PUT
   disable_prefix_cache: true
   disable_chunked_prefill: true

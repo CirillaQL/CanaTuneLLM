@@ -50,6 +50,17 @@ def kv_connector(config: Mapping[str, Any]) -> str:
     return value
 
 
+def kv_buffer_device(config: Mapping[str, Any]) -> str:
+    """kv_transfer.kv_buffer_device (NixlConnector): cuda (default) registers the KV
+    cache itself with NIXL; cpu stages it through a host buffer. Without RDMA the host
+    path is faster across nodes (job 275371: READ 3.4-3.7 vs 0.7-0.8 GB/s over TCP) at
+    the cost of a host buffer as large as the KV cache and a copy on each side."""
+    value = (config.get("kv_transfer") or {}).get("kv_buffer_device", "cuda")
+    if value not in ("cuda", "cpu"):
+        raise ConfigError("kv_transfer.kv_buffer_device must be cuda or cpu")
+    return value
+
+
 def kv_receive_buffer_bytes(config: Mapping[str, Any]) -> float | None:
     """D's KV receive buffer in bytes: P2pNcclConnector's kv_buffer_size
     (kv_transfer.kv_buffer_bytes, vLLM default 1e9). None for NixlConnector: D reads

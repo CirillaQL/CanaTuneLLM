@@ -16,6 +16,10 @@ set -euo pipefail
 : "${PREFILL_KV_PORT_BASE:?Set PREFILL_KV_PORT_BASE, for example 14579}"
 KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
 KV_LOAD_FAILURE_POLICY="${KV_LOAD_FAILURE_POLICY:-fail}"
+KV_BUFFER_DEVICE="${KV_BUFFER_DEVICE:-cuda}"
+[[ "$KV_BUFFER_DEVICE" == cuda || "$KV_BUFFER_DEVICE" == cpu ]] || {
+  echo "KV_BUFFER_DEVICE must be cuda or cpu" >&2; exit 2;
+}
 if [[ "$KV_CONNECTOR" == P2pNcclConnector ]]; then
   : "${NCCL_SOCKET_IFNAME:?Set NCCL_SOCKET_IFNAME to the P-D network interface}"
   PREFILL_KV_SEND_TYPE="${PREFILL_KV_SEND_TYPE:-PUT_ASYNC}"
@@ -110,7 +114,7 @@ for index in "${!gpu_ids[@]}"; do
   http_port=$((PREFILL_HTTP_PORT_BASE + index))
   kv_port=$((PREFILL_KV_PORT_BASE + index))
   if [[ "$KV_CONNECTOR" == NixlConnector ]]; then
-    kv_config=$(printf '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"%s"}' "$KV_LOAD_FAILURE_POLICY")
+    kv_config=$(printf '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"%s","kv_buffer_device":"%s"}' "$KV_LOAD_FAILURE_POLICY" "$KV_BUFFER_DEVICE")
     kv_env=("VLLM_NIXL_SIDE_CHANNEL_HOST=$side_host" "VLLM_NIXL_SIDE_CHANNEL_PORT=$kv_port")
   else
     kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"%s"}}' "$kv_port" "$PREFILL_KV_SEND_TYPE")
