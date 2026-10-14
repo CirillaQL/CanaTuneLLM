@@ -211,3 +211,73 @@ def test_a_failed_stage_skips_only_the_rest_of_its_workload(tmp_path) -> None:
     b = summary["stages"]["b_r0_1rps"]
     assert b["workload"] == "b" and b["good"] == 3
     assert b["by_slo"]["1000/100"]["good"] == 3 and b["by_slo"]["200/50"]["good"] == 0
+
+
+# ---- replay workloads --------------------------------------------------------------------
+
+
+def _replay_dataset(tmp_path, arrivals):
+    path = tmp_path / "replay.jsonl"
+    with open(path, "w") as handle:
+        for i, at in enumerate(arrivals):
+            handle.write(json.dumps({"arrival_s": at, "prompt": f"p{i}", "output_tokens": 3,
+                                     "request_tokens": 5}) + "\n")  # fmt: skip
+    bench.replay_rows.cache_clear()
+    return path
+
+
+def test_a_replay_workload_is_planned_as_segments_and_a_total(tmp_path) -> None:
+    path = _replay_dataset(tmp_path, [0.0, 1.0, 650.0, 1300.0])
+    env = {"BENCH_WORKLOADS": json.dumps([
+        {"name": "bgpt", "dataset": str(path), "replay": True, "segment_s": 600}])}  # fmt: skip
+    stages = bench.BenchSettings.from_env(env).stages()
+    assert [s.name for s in stages] == ["bgpt_w00", "bgpt_w01", "bgpt_w02", "bgpt_total"]
+    assert [s.num_prompts for s in stages] == [2, 1, 1, 4]
+    assert stages[0].segment == (0.0, 600.0) and stages[-1].segment[1] == float("inf")
+
+
+def test_replay_sends_at_the_arrival_times_and_measures_the_stream(tmp_path) -> None:
+    import httpx
+
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        sent.append((body["prompt"], body["max_tokens"], body.get("ignore_eos"), clock.now))
+        if body["prompt"] == "p1":
+            return httpx.Response(503, text="busy")
+        lines = [f'data: {json.dumps({"choices": [{"text": "a"}]})}' for _ in range(3)]
+        lines += [f'data: {json.dumps({"choices": [], "usage": {"completion_tokens": 3}})}',
+                  "data: [DONE]"]  # fmt: skip
+        return httpx.Response(200, text="\n\n".join(lines) + "\n\n")
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self) -> float:
+            return self.now
+
+    clock = Clock()
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):  # the replay waits on its own clock; started tasks run first
+        await real_sleep(0)
+        clock.now += delay
+
+    rows = bench.replay_rows(str(_replay_dataset(tmp_path, [0.0, 2.5, 7.0])))
+    settings = bench.BenchSettings(dataset="x", rates=(1.0,), replay=True)
+    bench.asyncio.sleep = fake_sleep
+    try:
+        t0, records, end = asyncio.run(bench.replay_requests(
+            settings, rows, base_url="http://proxy", model="m", clock=clock,
+            transport=httpx.MockTransport(handler)))  # fmt: skip
+    finally:
+        bench.asyncio.sleep = real_sleep
+    assert [s[3] for s in sent] == [0.0, 2.5, 7.0]  # each at its own arrival
+    assert all(s[1] == 3 and s[2] is True for s in sent)
+    assert records[1]["error"] == "HTTP 503" and records[1]["ttft"] == 0.0
+    assert records[0]["output_len"] == 3 and len(records[0]["itl"]) == 2
+    result = bench.replay_result(records)
+    assert result["completed"] == 2 and result["failed"] == 1
+    outcome = bench.request_outcomes(result, 600, 100)
+    assert outcome["offered"] == 3 and outcome["ok"] == 2

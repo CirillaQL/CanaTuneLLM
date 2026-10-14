@@ -55,3 +55,24 @@ def test_prompts_have_exactly_the_logged_length() -> None:
     for item in data:
         assert len(tok(item["prompt"]).input_ids) == item["request_tokens"]
         assert item["output_tokens"] in (3, 40, 1)
+
+
+def test_a_window_keeps_every_row_in_time_order_with_its_arrival(tmp_path) -> None:
+    path = tmp_path / "b.csv"
+    with open(path, "w", newline="") as handle:
+        w = csv.writer(handle)
+        w.writerow(
+            ["Timestamp", "Model", "Request tokens", "Response tokens", "Total tokens", "Log Type"]
+        )
+        w.writerows([
+            [99, "ChatGPT", 10, 2, 12, "c"], [100, "ChatGPT", 12, 3, 15, "c"],
+            [105, "GPT-4", 7, 0, 7, "c"], [103, "GPT-4", 9, 4, 13, "c"],
+            [160, "ChatGPT", 5, 1, 6, "c"],
+        ])  # fmt: skip
+    rows, seen = mk.load_window([str(path)], "all", 4096, 100, 60)
+    assert rows == [(0.0, 12, 3), (3.0, 9, 4)] and seen == 3  # 105: no response; 160: out
+    tok = WordTokenizer()
+    stream = mk.token_stream(tok, (f"w{i} x{i} y{i}" for i in range(10_000)), 5_000)
+    data, misses = mk.build_window(rows, stream, tok, seed=1)
+    assert [d["arrival_s"] for d in data] == [0.0, 3.0] and misses == [0, 0]
+    assert [len(tok(d["prompt"]).input_ids) for d in data] == [12, 9]

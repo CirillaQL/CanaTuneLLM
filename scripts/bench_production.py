@@ -42,12 +42,21 @@ Environment: everything `canatune.controller.process_controller` needs, plus
   BENCH_SCORE_SLOS   more SLOs to score every stage against, "ttft:tpot,..." in ms
                      (by_slo in the summary; e.g. one baseline run for several SLOs)
 
+Replay workloads ({"replay": true, "segment_s": 600} in BENCH_WORKLOADS, a dataset whose
+rows carry `arrival_s`, as make_burstgpt_dataset.py --window-start writes): every request
+is sent at its own arrival time (seconds after the replay starts; no rates, no vllm bench)
+as a streaming completion of exactly its output tokens. The run is reported as segments of
+`segment_s` (<name>_w00, _w01, ...: the requests that arrived in it, energy over its time)
+and as a whole (<name>_total).
+
 Exit status: 0 done, 2 no table before the deadline, 3 the service stopped early,
 4 the service never became ready, 5 calibration kept failing, 6 a benchmark failed.
 """
 
 import asyncio
+import functools
 import json
+import math
 import os
 import shlex
 import signal
@@ -81,6 +90,7 @@ class Stage:
     rate_rps: float
     num_prompts: int
     workload: str = ""
+    segment: tuple[float, float] | None = None  # replay: arrival seconds [start, end)
 
 
 @dataclass(frozen=True)
@@ -102,6 +112,8 @@ class BenchSettings:
     name: str = ""
     workloads: tuple["BenchSettings", ...] = ()
     score_slos: tuple[tuple[float, float], ...] = ()
+    replay: bool = False
+    segment_s: float = 600.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "BenchSettings":
@@ -149,12 +161,17 @@ class BenchSettings:
 
     def plan(self) -> list[tuple["BenchSettings", Stage]]:
         """-> (the workload's settings, stage) in run order."""
-        return [
-            (w, Stage(f"{w.name}_r{i}_{rate:g}rps" if w.name else f"r{i}_{rate:g}rps", rate,
-                      max(1, round(rate * w.stage_s)), w.name))
-            for w in (self.workloads or (self,))
-            for i, rate in enumerate(w.rates)
-        ]  # fmt: skip
+        out = []
+        for w in self.workloads or (self,):
+            if w.replay:
+                out += [(w, stage) for stage in replay_stages(w)]
+                continue
+            out += [
+                (w, Stage(f"{w.name}_r{i}_{rate:g}rps" if w.name else f"r{i}_{rate:g}rps", rate,
+                          max(1, round(rate * w.stage_s)), w.name))
+                for i, rate in enumerate(w.rates)
+            ]  # fmt: skip
+        return out
 
     def stages(self) -> list[Stage]:
         return [stage for _, stage in self.plan()]
@@ -176,7 +193,133 @@ def _workload_fields(item: Mapping[str, Any]) -> dict[str, Any]:
         fields["output_len"] = int(item["output_len"]) if item["output_len"] else None
     if "ignore_eos" in item:
         fields["ignore_eos"] = bool(item["ignore_eos"])
+    if "replay" in item:
+        fields["replay"] = bool(item["replay"])
+    if "segment_s" in item:
+        fields["segment_s"] = float(item["segment_s"])
+        if not fields["segment_s"] > 0:
+            raise SystemExit("segment_s must be positive")
     return fields
+
+
+@functools.lru_cache(maxsize=4)
+def replay_rows(path: str) -> tuple[dict, ...]:
+    """The replay dataset: rows with arrival_s, prompt, output_tokens, in time order."""
+    rows = [json.loads(line) for line in open(path) if line.strip()]
+    if not rows or any("arrival_s" not in r for r in rows):
+        raise SystemExit(f"{path}: every replay row needs arrival_s")
+    return tuple(sorted(rows, key=lambda r: float(r["arrival_s"])))
+
+
+def replay_stages(w: "BenchSettings") -> list[Stage]:
+    """Segments of segment_s by arrival time, then the whole replay."""
+    rows = replay_rows(w.dataset)
+    span = float(rows[-1]["arrival_s"]) + 1e-6
+    stages = []
+    for k in range(max(1, math.ceil(span / w.segment_s))):
+        a, b = k * w.segment_s, min(span, (k + 1) * w.segment_s)
+        n = sum(1 for r in rows if a <= float(r["arrival_s"]) < b)
+        stages.append(Stage(f"{w.name}_w{k:02d}", n / (b - a), n, w.name, (a, b)))
+    stages.append(Stage(f"{w.name}_total", len(rows) / span, len(rows), w.name, (0.0, math.inf)))
+    return stages
+
+
+async def replay_requests(
+    settings: "BenchSettings",
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    base_url: str,
+    model: str,
+    clock,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[float, list[dict[str, Any]], float]:
+    """Send every row at t0 + arrival_s (clock: seconds) as a streaming completion of its
+    output tokens -> (t0, one record per row, the clock when the last one ended). A record
+    holds what vllm bench measures: ttft (s, 0 when it failed), the gaps between token
+    chunks (s), output tokens (the usage if reported, else the chunks), error."""
+    records: list[dict[str, Any]] = [{} for _ in rows]
+
+    async def one(i: int, row: Mapping[str, Any], t0: float) -> None:
+        sent = clock()
+        rec = {"arrival_s": float(row["arrival_s"]), "lag_s": sent - t0 - float(row["arrival_s"]),
+               "prompt_tokens": row.get("request_tokens"), "ttft": 0.0, "itl": [],
+               "output_len": 0, "error": ""}  # fmt: skip
+        body = {"model": model, "prompt": row["prompt"], "temperature": 0, "stream": True,
+                "max_tokens": int(row["output_tokens"]),
+                "stream_options": {"include_usage": True}}  # fmt: skip
+        if settings.ignore_eos:
+            body["ignore_eos"] = True
+        last, chunks = None, 0
+        try:
+            async with client.stream("POST", base_url + settings.endpoint, json=body) as resp:
+                if resp.status_code != 200:
+                    await resp.aread()
+                    rec["error"] = f"HTTP {resp.status_code}"
+                else:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        chunk = json.loads(data)
+                        usage = chunk.get("usage") or {}
+                        if usage.get("completion_tokens"):
+                            rec["output_len"] = int(usage["completion_tokens"])
+                        choices = chunk.get("choices") or []
+                        if choices and choices[0].get("text"):
+                            now = clock()
+                            if last is None:  # > 0: a TTFT of 0 marks a failure
+                                rec["ttft"] = max(now - sent, 1e-6)
+                            else:
+                                rec["itl"].append(now - last)
+                            last, chunks = now, chunks + 1
+                    if last is None:
+                        rec["error"] = "no tokens"
+        except Exception as error:  # a failed request is data, never a crash
+            rec["error"] = repr(error)
+        if not rec["output_len"]:
+            rec["output_len"] = chunks
+        rec["end_s"] = clock() - t0
+        records[i] = rec
+
+    limits = httpx.Limits(max_connections=4096, max_keepalive_connections=512)
+    timeout = httpx.Timeout(900.0, connect=30.0)
+    async with httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False,
+                                 transport=transport) as client:  # fmt: skip
+        t0 = clock()
+        tasks = []
+        for i, row in enumerate(rows):
+            delay = t0 + float(row["arrival_s"]) - clock()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            tasks.append(asyncio.create_task(one(i, row, t0)))
+        await asyncio.gather(*tasks)
+    return t0, records, clock()
+
+
+def replay_result(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Records in vllm bench's detailed-result shape (request_outcomes reads it)."""
+    ok = [r for r in records if not r["error"]]
+    starts = [r["arrival_s"] for r in records]
+    ends = [r["end_s"] for r in records]
+    duration = (max(ends) - min(starts)) if records else 0.0
+    out_tokens = sum(r["output_len"] for r in ok)
+    return {
+        "ttfts": [r["ttft"] for r in records],
+        "itls": [r["itl"] for r in records],
+        "errors": [r["error"] for r in records],
+        "output_lens": [r["output_len"] for r in records],
+        "completed": len(ok),
+        "failed": len(records) - len(ok),
+        "duration": duration,
+        "total_input_tokens": sum(r["prompt_tokens"] or 0 for r in records),
+        "total_output_tokens": out_tokens,
+        "request_throughput": len(ok) / duration if duration > 0 else None,
+        "output_throughput": out_tokens / duration if duration > 0 else None,
+        "request_goodput": None,
+        "max_lag_s": max((r["lag_s"] for r in records), default=0.0),
+    }
 
 
 def bench_command(
@@ -369,12 +512,40 @@ async def run_stages(
     """-> per stage (stage, energy window, vllm result or None, exit code), and the
     end of the run on the sampler's clock."""
     done, failed = [], set()
+    replays: dict[str, tuple[float, list[dict[str, Any]], float]] = {}
+    plan = settings.plan()
     async with Sampler(base_url, agents, out, state_poll) as sampler:
-        for workload, stage in settings.plan():
+        for index, (workload, stage) in enumerate(plan):
             if stage.workload in failed:
                 continue
             stage_dir = out / "stages" / stage.name
             stage_dir.mkdir(parents=True, exist_ok=True)
+            if workload.replay:
+                if stage.workload not in replays:
+                    rows = replay_rows(workload.dataset)
+                    log(f"{stage.workload}: replaying {len(rows)} requests over "
+                        f"{float(rows[-1]['arrival_s']):.0f} s")  # fmt: skip
+                    replays[stage.workload] = await replay_requests(
+                        workload, rows, base_url=base_url, model=model, clock=sampler.now_s
+                    )
+                    t0, records, end = replays[stage.workload]
+                    with open(out / f"replay_{stage.workload}.jsonl", "w") as handle:
+                        for rec in records:
+                            handle.write(json.dumps(rec) + "\n")
+                    lag = max((r["lag_s"] for r in records), default=0.0)
+                    log(f"{stage.workload}: replay done, {sum(1 for r in records if r['error'])}"
+                        f" failed, send lag max {lag:.2f} s")  # fmt: skip
+                t0, records, end = replays[stage.workload]
+                a, b = stage.segment or (0.0, math.inf)
+                sel = [r for r in records if a <= r["arrival_s"] < b]
+                window = (t0 + a, min(t0 + b, end))
+                result = replay_result(sel)
+                (stage_dir / "bench.json").write_text(json.dumps(result) + "\n")
+                done.append((stage, window, result, 0))
+                last = index + 1 == len(plan) or plan[index + 1][1].workload != stage.workload
+                if last and settings.gap_s > 0:
+                    await asyncio.sleep(settings.gap_s)
+                continue
             cmd = bench_command(
                 workload, stage, base_url=base_url, model=model, result_dir=stage_dir,
                 ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
@@ -455,6 +626,8 @@ def main() -> int:
     for workload in settings.workloads or (settings,):
         if not Path(workload.dataset).is_file():
             raise SystemExit(f"dataset {workload.dataset} is not a file")
+        if workload.replay:
+            replay_rows(workload.dataset)  # fails early on a dataset without arrival times
     cap = config.get("canary", {}).get("max_output_tokens")
     for workload in settings.workloads or (settings,):
         if mode == "cantune" and workload.output_len and cap and workload.output_len > cap:
