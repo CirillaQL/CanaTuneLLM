@@ -12,6 +12,8 @@
 # nodes runs this script once per node: DECODE_INDEX_OFFSET numbers its instances after
 # the earlier nodes' (names, logs) and DECODE_ROLE_DIR (default decode) separates its
 # work directory on the shared file system.
+# DECODE_DISABLE_CUSTOM_ALL_REDUCE=1 (TP > 1): NCCL all-reduce instead of vLLM's custom
+# kernel, which needs GPU peer access (2 x L4 over PCIe: 'invalid argument' at graph capture).
 set -euo pipefail
 
 : "${PYTHON_BIN:?Set PYTHON_BIN to the vLLM environment's Python executable}"
@@ -151,10 +153,14 @@ for ((index = 0; index < ${#gpu_ids[@]} / TP; index++)); do
   # P and D must use the same one so both see the same prompt tokens.
   chat_args=()
   if [[ -n "${VLLM_CHAT_TEMPLATE:-}" ]]; then chat_args=(--chat-template "$VLLM_CHAT_TEMPLATE"); fi
+  tp_args=(--tensor-parallel-size "$TP")
+  if [[ "$TP" -gt 1 && "${DECODE_DISABLE_CUSTOM_ALL_REDUCE:-0}" == 1 ]]; then
+    tp_args+=(--disable-custom-all-reduce)
+  fi
   CUDA_VISIBLE_DEVICES="$devices" env ${kv_env[@]+"${kv_env[@]}"} \
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
-    --tensor-parallel-size "$TP" --max-model-len "${MAX_MODEL_LEN:-4096}" \
+    "${tp_args[@]}" --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --gpu-memory-utilization "$mem_util" \
     --kv-transfer-config "$kv_config" \
     --no-enable-prefix-caching --no-enable-chunked-prefill \

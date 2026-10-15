@@ -293,6 +293,8 @@ def main() -> int:
         tp = tensor_parallel_size(config, role)
         prefix = role.upper()
         env = [f"{prefix}_TP={tp}"]
+        if config["topology"][f"{role}_nodegroup"].get("disable_custom_all_reduce"):
+            env.append(f"{prefix}_DISABLE_CUSTOM_ALL_REDUCE=1")
         if len(nodes[role]) > 1:
             offset = sum(len(n["gpu_ids"]) // tp for n in nodes[role][:k])
             host = host_of(config, role, node["node"])

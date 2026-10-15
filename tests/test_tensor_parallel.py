@@ -181,7 +181,7 @@ def test_identity_names_tp_only_when_used(tmp_path) -> None:
 
 
 def test_controller_starts_a_step_and_an_agent_per_node(tmp_path, monkeypatch) -> None:
-    tp_config(tmp_path)
+    tp_config(tmp_path, "topology.decode_nodegroup.disable_custom_all_reduce=true")
     path = tmp_path / "job.yaml"
     monkeypatch.setenv("PROJECT_ROOT", str(ROOT))
     monkeypatch.setenv("CANATUNE_CONFIG", str(path))
@@ -215,6 +215,8 @@ def test_controller_starts_a_step_and_an_agent_per_node(tmp_path, monkeypatch) -
     decode = captured["decode_command"]
     assert "DECODE_TP=2" in decode and "--gpus-per-node=8" in decode
     assert not any(a.startswith("DECODE_GPU_IDS=") for a in decode)  # one node: inherited
+    assert "DECODE_DISABLE_CUSTOM_ALL_REDUCE=1" in decode
+    assert not any("CUSTOM_ALL_REDUCE" in a for a in first)
     assert set(captured["agent_commands"]) == {"prefill", "prefill1", "decode"}
     assert "CANATUNE_AGENT_GPUS=4,5,6,7" in captured["agent_commands"]["prefill1"]
     assert sorted(captured["agent_health_urls"]) == [
@@ -257,7 +259,7 @@ def test_launch_script_groups_gpus_into_tp_instances(tmp_path) -> None:
         "PREFILL_KV_PORT_BASE": "14579", "PREFILL_TP": "2", "PREFILL_INDEX_OFFSET": "2",
         "PREFILL_ROLE_DIR": "prefill1", "KV_CONNECTOR": "P2pNcclConnector",
         "NCCL_SOCKET_IFNAME": "^lo", "CANATUNE_PREFILL_KV_HOST": "10.0.0.3",
-        "NODE_SHUTDOWN_GRACE_S": "1",
+        "NODE_SHUTDOWN_GRACE_S": "1", "PREFILL_DISABLE_CUSTOM_ALL_REDUCE": "1",
     }  # fmt: skip
     process = subprocess.Popen(
         ["bash", str(ROOT / "scripts/start_4p_prefill_node.sh")],
@@ -285,6 +287,7 @@ def test_launch_script_groups_gpus_into_tp_instances(tmp_path) -> None:
     assert "All 2 Prefill instances are ready (TP 2)" in out
     launched = sorted(calls.read_text().splitlines())  # the stubs may log in either order
     assert launched[0].startswith("CVD=4,5 ") and "--tensor-parallel-size 2" in launched[0]
+    assert "--disable-custom-all-reduce" in launched[0]
     assert '"kv_port":14579' in launched[0]
     assert '"kv_port":14581' in launched[1] and launched[1].startswith("CVD=6,7 ")
     assert (tmp_path / "pd/prefill1/logs/prefill_3.log").exists()

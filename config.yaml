@@ -41,9 +41,12 @@ topology:
   # the endpoint's kv_port + r). A role on several nodes lists them under `nodes`
   # ([{node, gpu_ids, gpu_uuids}]); scripts/make_job_config.py fills both in, and the
   # job passes the node addresses as CANATUNE_NODE_HOSTS ("node=ip,...").
+  # disable_custom_all_reduce: true runs TP's all-reduce on NCCL instead of vLLM's custom
+  # kernel, which needs GPU peer access (TP2 on PCIe L4s failed at CUDA-graph capture).
   prefill_nodegroup:
     node: prefill-node
     tensor_parallel_size: 1
+    disable_custom_all_reduce: false
     gpu_type: NVIDIA L40S
     endpoint_prefix: P
     gpu_ids: [0, 1, 2, 3]
@@ -55,6 +58,7 @@ topology:
   decode_nodegroup:
     node: decode-node
     tensor_parallel_size: 1
+    disable_custom_all_reduce: false
     gpu_type: NVIDIA L4
     endpoint_prefix: D
     gpu_ids: [0, 1, 2, 3]
