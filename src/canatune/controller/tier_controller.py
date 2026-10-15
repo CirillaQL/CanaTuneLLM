@@ -43,7 +43,7 @@ from typing import Any
 from canatune.controller.router import CanaTuneRouter
 from canatune.domain.groups import Group, GroupState, Tier, TierState, TierStore, TierTable, slower
 from canatune.domain.models import ClusterModel, Evaluation, Solver
-from canatune.infrastructure.clocks import ClockActuator, GpuRef
+from canatune.infrastructure.clocks import ClockActuator, GpuRef, endpoint_reading
 from canatune.infrastructure.records import JsonlLog
 
 
@@ -727,7 +727,6 @@ class TierController:
             return
         self._last_energy_log = now
         agents = sorted({ref.agent_url for ref in self.gpu_refs.values()})
-        by_gpu = {(ref.agent_url, ref.gpu): name for name, ref in self.gpu_refs.items()}
         state = {g.prefill: g for g in self.groups} | {g.decode: g for g in self.groups}
         for agent in agents:
             try:
@@ -735,9 +734,9 @@ class TierController:
             except Exception as error:
                 self.log.write({"event": "energy_error", "agent": agent, "error": str(error)})
                 continue
-            for reading in readings:
-                endpoint = by_gpu.get((agent, reading.get("index")))
-                if endpoint is not None:
+            for endpoint, ref in self.gpu_refs.items():
+                reading = endpoint_reading(ref, readings) if ref.agent_url == agent else None
+                if reading is not None:  # a TP endpoint: its GPUs summed
                     group = state.get(endpoint)
                     self.log.write(
                         {

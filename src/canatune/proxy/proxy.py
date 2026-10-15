@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from canatune.config import NIXL_CONNECTOR, kv_connector
 from canatune.controller.router import prompt_tokens
 from canatune.infrastructure.records import JsonlLog
+from canatune.topology import node_hosts
 
 if TYPE_CHECKING:
     from canatune.service import Runtime
@@ -100,17 +101,20 @@ def parse_endpoints(config: Mapping[str, Any]) -> dict[str, Endpoint]:
         ),
     }
     connector = kv_connector(config)
+    per_node = {name: _host(host, f"host of {name}") for name, host in node_hosts().items()}
     endpoints: dict[str, Endpoint] = {}
     for name, raw in raw_endpoints.items():
         value = _mapping(raw, f"endpoint {name}")
         role = value.get("role")
         if role not in hosts:
             raise ProxyConfigError(f"endpoint {name} has invalid role")
+        # A role on several nodes: the endpoint's node address (CANATUNE_NODE_HOSTS).
+        node_host = per_node.get(str(value.get("node") or ""))
         endpoints[name] = Endpoint(
             name=name,
             role=role,
-            http_host=hosts[role],
-            kv_host=kv_hosts[role],
+            http_host=node_host or hosts[role],
+            kv_host=node_host or kv_hosts[role],
             http_port=_port(value.get("http_port"), f"{name}.http_port"),
             kv_port=_port(value.get("kv_port"), f"{name}.kv_port"),
             connector=connector,

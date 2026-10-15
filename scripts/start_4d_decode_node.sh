@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Run on the allocated Decode host. Starts one TP=1 vLLM consumers,
-# per GPU in DECODE_GPU_IDS (1-8 GPUs; endpoint i uses port base + i). Optional
+# Run on the allocated Decode host. Starts one vLLM consumer per
+# DECODE_TP GPUs of DECODE_GPU_IDS (1-8 GPUs; ports below). Optional
 # DECODE_GPU_UUIDS (same order) is checked before each launch: GPUs are not
 # cgroup-constrained on the cluster, so a wrong index would hit another job's GPU.
 # KV_CONNECTOR: NixlConnector (default; D reads P's KV, endpoint i's own side channel
-# on kv port base + i) or P2pNcclConnector.
+# on its KV port, below) or P2pNcclConnector.
 # Supply site-specific values through the variables below.
+# Tensor parallelism: DECODE_TP (default 1) consecutive GPUs of DECODE_GPU_IDS form one
+# instance (--tensor-parallel-size); instance i uses HTTP port base + i and KV port
+# base + i x TP (vLLM's connector rank r listens on kv_port + r). A role on several
+# nodes runs this script once per node: DECODE_INDEX_OFFSET numbers its instances after
+# the earlier nodes' (names, logs) and DECODE_ROLE_DIR (default decode) separates its
+# work directory on the shared file system.
 set -euo pipefail
 
 : "${PYTHON_BIN:?Set PYTHON_BIN to the vLLM environment's Python executable}"
@@ -15,6 +21,11 @@ set -euo pipefail
 : "${DECODE_HTTP_PORT_BASE:?Set DECODE_HTTP_PORT_BASE, for example 8200}"
 : "${DECODE_KV_PORT_BASE:?Set DECODE_KV_PORT_BASE, for example 14579}"
 KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
+TP="${DECODE_TP:-1}"
+INDEX_OFFSET="${DECODE_INDEX_OFFSET:-0}"
+[[ "$TP" =~ ^[1-9][0-9]*$ && "$INDEX_OFFSET" =~ ^[0-9]+$ ]] || {
+  echo "DECODE_TP must be a positive integer and DECODE_INDEX_OFFSET a non-negative one" >&2; exit 2;
+}
 KV_LOAD_FAILURE_POLICY="${KV_LOAD_FAILURE_POLICY:-fail}"
 KV_BUFFER_DEVICE="${KV_BUFFER_DEVICE:-cuda}"
 [[ "$KV_BUFFER_DEVICE" == cuda || "$KV_BUFFER_DEVICE" == cpu ]] || {
@@ -45,11 +56,12 @@ fi
 for gpu_id in "${gpu_ids[@]}"; do
   [[ "$gpu_id" =~ ^[0-9]+$ ]] || { echo "Invalid GPU ID: $gpu_id" >&2; exit 2; }
 done
+(( ${#gpu_ids[@]} % TP == 0 )) || { echo "DECODE_GPU_IDS must be a multiple of DECODE_TP=$TP" >&2; exit 2; }
 [[ ${#gpu_ids[@]} -eq $(printf '%s\n' "${gpu_ids[@]}" | sort -u | wc -l | tr -d ' ') ]] || {
   echo "Decode GPU IDs must be unique" >&2; exit 2;
 }
 
-ROLE_WORK_DIR="${PD_WORK_DIR}/decode"
+ROLE_WORK_DIR="${PD_WORK_DIR}/${DECODE_ROLE_DIR:-decode}"
 export HOME="${ROLE_WORK_DIR}/home"
 export HF_HOME="${ROLE_WORK_DIR}/huggingface"
 export HF_HUB_CACHE="${HF_HOME}/hub"
@@ -99,16 +111,22 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for index in "${!gpu_ids[@]}"; do
-  gpu_id=${gpu_ids[$index]}
-  if [[ ${#gpu_uuids[@]} -gt 0 ]]; then
-    actual=$(nvidia-smi -i "$gpu_id" --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
-    [[ "$actual" == "${gpu_uuids[$index]}" ]] || {
-      echo "GPU $gpu_id is $actual, expected ${gpu_uuids[$index]}; refusing to start" >&2; exit 97;
-    }
-  fi
+for ((index = 0; index < ${#gpu_ids[@]} / TP; index++)); do
+  name=$((INDEX_OFFSET + index))
+  devices=""
+  for ((rank = 0; rank < TP; rank++)); do
+    slot=$((index * TP + rank))
+    gpu_id=${gpu_ids[$slot]}
+    if [[ ${#gpu_uuids[@]} -gt 0 ]]; then
+      actual=$(nvidia-smi -i "$gpu_id" --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
+      [[ "$actual" == "${gpu_uuids[$slot]}" ]] || {
+        echo "GPU $gpu_id is $actual, expected ${gpu_uuids[$slot]}; refusing to start" >&2; exit 97;
+      }
+    fi
+    devices="${devices:+$devices,}$gpu_id"
+  done
   http_port=$((DECODE_HTTP_PORT_BASE + index))
-  kv_port=$((DECODE_KV_PORT_BASE + index))
+  kv_port=$((DECODE_KV_PORT_BASE + index * TP))
   if [[ "$KV_CONNECTOR" == NixlConnector ]]; then
     kv_config=$(printf '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"%s","kv_buffer_device":"%s"}' "$KV_LOAD_FAILURE_POLICY" "$KV_BUFFER_DEVICE")
     kv_env=("VLLM_NIXL_SIDE_CHANNEL_HOST=$side_host" "VLLM_NIXL_SIDE_CHANNEL_PORT=$kv_port")
@@ -124,19 +142,19 @@ for index in "${!gpu_ids[@]}"; do
     total_mib=$(nvidia-smi -i "$gpu_id" --query-gpu=memory.total --format=csv,noheader,nounits | tr -d ' ')
     mem_util=$(PYTHONPATH="${PROJECT_ROOT:+$PROJECT_ROOT/src:}${PYTHONPATH:-}" "$PYTHON_BIN" \
       -m canatune.infrastructure.memory_plan --config "$CANATUNE_CONFIG" --total-mib "$total_mib") \
-      || { echo "decode_${index}: no memory plan for GPU $gpu_id" >&2; exit 2; }
+      || { echo "decode_${name}: no memory plan for GPU $gpu_id" >&2; exit 2; }
   fi
-  echo "decode_${index}: GPU $gpu_id gpu-memory-utilization $mem_util"
-  log_file="${ROLE_WORK_DIR}/logs/decode_${index}.log"
+  echo "decode_${name}: GPU $devices gpu-memory-utilization $mem_util"
+  log_file="${ROLE_WORK_DIR}/logs/decode_${name}.log"
 
   # Optional: a chat template for /v1/chat/completions (a base model has none);
   # P and D must use the same one so both see the same prompt tokens.
   chat_args=()
   if [[ -n "${VLLM_CHAT_TEMPLATE:-}" ]]; then chat_args=(--chat-template "$VLLM_CHAT_TEMPLATE"); fi
-  CUDA_VISIBLE_DEVICES="$gpu_id" env ${kv_env[@]+"${kv_env[@]}"} \
+  CUDA_VISIBLE_DEVICES="$devices" env ${kv_env[@]+"${kv_env[@]}"} \
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
-    --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
+    --tensor-parallel-size "$TP" --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --gpu-memory-utilization "$mem_util" \
     --kv-transfer-config "$kv_config" \
     --no-enable-prefix-caching --no-enable-chunked-prefill \
@@ -152,11 +170,11 @@ for index in "${!gpu_ids[@]}"; do
     fi
     sleep 5
   done
-  [[ "$ready" -eq 1 ]] || { echo "D${index} failed to start; see $log_file" >&2; exit 1; }
-  echo "D${index} ready: GPU=${gpu_id} HTTP=${http_port} KV=${kv_port}"
+  [[ "$ready" -eq 1 ]] || { echo "D${name} failed to start; see $log_file" >&2; exit 1; }
+  echo "D${name} ready: GPU=${devices} HTTP=${http_port} KV=${kv_port}"
 done
 
-echo "All ${#gpu_ids[@]} Decode instances are ready"
+echo "All $(( ${#gpu_ids[@]} / TP )) Decode instances are ready (TP $TP)"
 # Stay up while every instance runs (portable: no `wait -n`, which needs bash 4.3).
 while true; do
   for pid in "${pids[@]}"; do

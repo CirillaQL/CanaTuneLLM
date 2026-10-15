@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Run on the allocated Prefill host. Starts one TP=1 vLLM producers,
-# per GPU in PREFILL_GPU_IDS (1-8 GPUs; endpoint i uses port base + i). Optional
+# Run on the allocated Prefill host. Starts one vLLM producer per
+# PREFILL_TP GPUs of PREFILL_GPU_IDS (1-8 GPUs; ports below). Optional
 # PREFILL_GPU_UUIDS (same order) is checked before each launch: GPUs are not
 # cgroup-constrained on the cluster, so a wrong index would hit another job's GPU.
 # KV_CONNECTOR: NixlConnector (default; endpoint i's NIXL side channel listens on
-# kv port base + i at CANATUNE_PREFILL_KV_HOST) or P2pNcclConnector.
+# its KV port, below, at CANATUNE_PREFILL_KV_HOST) or P2pNcclConnector.
 # Supply site-specific values through the variables below.
+# Tensor parallelism: PREFILL_TP (default 1) consecutive GPUs of PREFILL_GPU_IDS form one
+# instance (--tensor-parallel-size); instance i uses HTTP port base + i and KV port
+# base + i x TP (vLLM's connector rank r listens on kv_port + r). A role on several
+# nodes runs this script once per node: PREFILL_INDEX_OFFSET numbers its instances after
+# the earlier nodes' (names, logs) and PREFILL_ROLE_DIR (default prefill) separates its
+# work directory on the shared file system.
 set -euo pipefail
 
 : "${PYTHON_BIN:?Set PYTHON_BIN to the vLLM environment's Python executable}"
@@ -15,6 +21,11 @@ set -euo pipefail
 : "${PREFILL_HTTP_PORT_BASE:?Set PREFILL_HTTP_PORT_BASE, for example 8100}"
 : "${PREFILL_KV_PORT_BASE:?Set PREFILL_KV_PORT_BASE, for example 14579}"
 KV_CONNECTOR="${KV_CONNECTOR:-NixlConnector}"
+TP="${PREFILL_TP:-1}"
+INDEX_OFFSET="${PREFILL_INDEX_OFFSET:-0}"
+[[ "$TP" =~ ^[1-9][0-9]*$ && "$INDEX_OFFSET" =~ ^[0-9]+$ ]] || {
+  echo "PREFILL_TP must be a positive integer and PREFILL_INDEX_OFFSET a non-negative one" >&2; exit 2;
+}
 KV_LOAD_FAILURE_POLICY="${KV_LOAD_FAILURE_POLICY:-fail}"
 KV_BUFFER_DEVICE="${KV_BUFFER_DEVICE:-cuda}"
 [[ "$KV_BUFFER_DEVICE" == cuda || "$KV_BUFFER_DEVICE" == cpu ]] || {
@@ -50,11 +61,12 @@ fi
 for gpu_id in "${gpu_ids[@]}"; do
   [[ "$gpu_id" =~ ^[0-9]+$ ]] || { echo "Invalid GPU ID: $gpu_id" >&2; exit 2; }
 done
+(( ${#gpu_ids[@]} % TP == 0 )) || { echo "PREFILL_GPU_IDS must be a multiple of PREFILL_TP=$TP" >&2; exit 2; }
 [[ ${#gpu_ids[@]} -eq $(printf '%s\n' "${gpu_ids[@]}" | sort -u | wc -l | tr -d ' ') ]] || {
   echo "Prefill GPU IDs must be unique" >&2; exit 2;
 }
 
-ROLE_WORK_DIR="${PD_WORK_DIR}/prefill"
+ROLE_WORK_DIR="${PD_WORK_DIR}/${PREFILL_ROLE_DIR:-prefill}"
 export HOME="${ROLE_WORK_DIR}/home"
 export HF_HOME="${ROLE_WORK_DIR}/huggingface"
 export HF_HUB_CACHE="${HF_HOME}/hub"
@@ -103,16 +115,22 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for index in "${!gpu_ids[@]}"; do
-  gpu_id=${gpu_ids[$index]}
-  if [[ ${#gpu_uuids[@]} -gt 0 ]]; then
-    actual=$(nvidia-smi -i "$gpu_id" --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
-    [[ "$actual" == "${gpu_uuids[$index]}" ]] || {
-      echo "GPU $gpu_id is $actual, expected ${gpu_uuids[$index]}; refusing to start" >&2; exit 97;
-    }
-  fi
+for ((index = 0; index < ${#gpu_ids[@]} / TP; index++)); do
+  name=$((INDEX_OFFSET + index))
+  devices=""
+  for ((rank = 0; rank < TP; rank++)); do
+    slot=$((index * TP + rank))
+    gpu_id=${gpu_ids[$slot]}
+    if [[ ${#gpu_uuids[@]} -gt 0 ]]; then
+      actual=$(nvidia-smi -i "$gpu_id" --query-gpu=uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
+      [[ "$actual" == "${gpu_uuids[$slot]}" ]] || {
+        echo "GPU $gpu_id is $actual, expected ${gpu_uuids[$slot]}; refusing to start" >&2; exit 97;
+      }
+    fi
+    devices="${devices:+$devices,}$gpu_id"
+  done
   http_port=$((PREFILL_HTTP_PORT_BASE + index))
-  kv_port=$((PREFILL_KV_PORT_BASE + index))
+  kv_port=$((PREFILL_KV_PORT_BASE + index * TP))
   if [[ "$KV_CONNECTOR" == NixlConnector ]]; then
     kv_config=$(printf '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"%s","kv_buffer_device":"%s"}' "$KV_LOAD_FAILURE_POLICY" "$KV_BUFFER_DEVICE")
     kv_env=("VLLM_NIXL_SIDE_CHANNEL_HOST=$side_host" "VLLM_NIXL_SIDE_CHANNEL_PORT=$kv_port")
@@ -120,16 +138,16 @@ for index in "${!gpu_ids[@]}"; do
     kv_config=$(printf '{"kv_connector":"P2pNcclConnector","kv_role":"kv_producer","kv_port":%d,"kv_connector_extra_config":{"send_type":"%s"}}' "$kv_port" "$PREFILL_KV_SEND_TYPE")
     kv_env=()
   fi
-  log_file="${ROLE_WORK_DIR}/logs/prefill_${index}.log"
+  log_file="${ROLE_WORK_DIR}/logs/prefill_${name}.log"
 
   # Optional: a chat template for /v1/chat/completions (a base model has none);
   # P and D must use the same one so both see the same prompt tokens.
   chat_args=()
   if [[ -n "${VLLM_CHAT_TEMPLATE:-}" ]]; then chat_args=(--chat-template "$VLLM_CHAT_TEMPLATE"); fi
-  CUDA_VISIBLE_DEVICES="$gpu_id" env ${kv_env[@]+"${kv_env[@]}"} \
+  CUDA_VISIBLE_DEVICES="$devices" env ${kv_env[@]+"${kv_env[@]}"} \
     "$PYTHON_BIN" -m vllm.entrypoints.openai.api_server \
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
-    --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
+    --tensor-parallel-size "$TP" --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --kv-transfer-config "$kv_config" \
     --no-enable-prefix-caching --no-enable-chunked-prefill \
     --disable-log-requests ${chat_args[@]+"${chat_args[@]}"} >"$log_file" 2>&1 &
@@ -144,11 +162,11 @@ for index in "${!gpu_ids[@]}"; do
     fi
     sleep 5
   done
-  [[ "$ready" -eq 1 ]] || { echo "P${index} failed to start; see $log_file" >&2; exit 1; }
-  echo "P${index} ready: GPU=${gpu_id} HTTP=${http_port} KV=${kv_port}"
+  [[ "$ready" -eq 1 ]] || { echo "P${name} failed to start; see $log_file" >&2; exit 1; }
+  echo "P${name} ready: GPU=${devices} HTTP=${http_port} KV=${kv_port}"
 done
 
-echo "All ${#gpu_ids[@]} Prefill instances are ready"
+echo "All $(( ${#gpu_ids[@]} / TP )) Prefill instances are ready (TP $TP)"
 # Stay up while every instance runs (portable: no `wait -n`, which needs bash 4.3).
 while true; do
   for pid in "${pids[@]}"; do

@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 
+from canatune import topology
 from canatune.config import load_config
 from canatune.measure import Measure, Pair, Plan
 from canatune.proxy.proxy import parse_endpoints
@@ -54,6 +55,9 @@ def main() -> int:
     config = load_config(os.environ["CANATUNE_CONFIG"])
     if config["routing"]["policy"] != "round_robin" or not config["clock_control"]["enabled"]:
         raise SystemExit("measure needs routing.policy=round_robin and clock_control.enabled")
+    if any(len(topology.role_nodes(config, r)) > 1 or topology.tensor_parallel_size(config, r) > 1
+           for r in ("prefill", "decode")):
+        raise SystemExit("measure locks one GPU per endpoint on one node per role (TP 1)")
     raw_plan = os.environ.get("MEASURE_PLAN")
     plan = Plan.from_json(json.loads(Path(raw_plan).read_text())) if raw_plan else Plan()
     proxy = config["proxy"]

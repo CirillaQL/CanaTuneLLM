@@ -43,7 +43,7 @@ from pathlib import Path
 
 import httpx
 
-from canatune import loadgen
+from canatune import loadgen, topology
 from canatune.config import load_config
 from canatune.proxy.proxy import (
     decode_request,
@@ -71,20 +71,25 @@ def log(message: str) -> None:
 
 
 def agents_and_names(config: dict) -> tuple[list[str], dict[str, str]]:
-    """Agent base URLs and agent|gpu index -> endpoint name."""
+    """Agent base URLs (one per node of each role) and agent|gpu index -> endpoint name;
+    every GPU of a tensor-parallel endpoint maps to that endpoint."""
     clock = config.get("clock_control") or {}
     if not clock.get("enabled"):
         return [], {}
-    raw_port = clock.get("agent_port", 9300)
-    urls = {}
-    for role, env in (("prefill", "CANATUNE_PREFILL_HOST"), ("decode", "CANATUNE_DECODE_HOST")):
-        port = int(raw_port[role] if isinstance(raw_port, dict) else raw_port)
-        urls[role] = f"http://{os.environ[env]}:{port}"
-    names = {
-        f"{urls[e['role']]}|{e['gpu_id']}": name
-        for name, e in config["topology"]["endpoints"].items()
-    }
-    return sorted(set(urls.values())), names
+    urls = topology.agent_urls(config)
+    multi = {role: sum(1 for r, _ in urls if r == role) > 1 for role in ("prefill", "decode")}
+    port = topology.agent_port
+    names = {}
+    for name, e in config["topology"]["endpoints"].items():
+        role = e["role"]
+        url = (
+            urls[(role, topology.endpoint_node(config, e))]
+            if multi[role]
+            else f"http://{os.environ[topology.ROLE_HOST_ENV[role]]}:{port(config, role)}"
+        )
+        for gpu in topology.endpoint_gpus(e):
+            names[f"{url}|{gpu}"] = name
+    return sorted({key.rpartition("|")[0] for key in names}), names
 
 
 def reset_clocks(client: httpx.Client, agents: list[str]) -> list[dict]:

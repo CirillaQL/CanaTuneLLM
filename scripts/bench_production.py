@@ -424,9 +424,13 @@ def stage_summary(
     score_slos: Sequence[tuple[float, float]] = (),
 ) -> dict[str, Any]:
     start, end = window
-    per_gpu = {
-        gpu_names.get(k, k): loadgen.energy_between(v, start, end) for k, v in series.items()
-    }
+    per_gpu: dict[str, float | None] = {}  # per endpoint: a TP endpoint's GPUs summed
+    for k, v in series.items():
+        name, joules = gpu_names.get(k, k), loadgen.energy_between(v, start, end)
+        if name in per_gpu:
+            before = per_gpu[name]
+            joules = None if before is None or joules is None else before + joules
+        per_gpu[name] = joules
     known = [e for e in per_gpu.values() if e is not None]
     energy = sum(known) if known and len(known) == len(per_gpu) else None
     out: dict[str, Any] = {

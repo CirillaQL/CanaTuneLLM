@@ -13,6 +13,17 @@ time; this script fills them in:
 
 Pair i is (P_i, D_i); pair 0 is the Canary, the others form the production pool.
 `--set a.b.c=value` overrides any key (the value is parsed as YAML).
+
+Tensor parallelism and several nodes per role: `--tp 2` makes each endpoint span two
+consecutive GPUs of one node (rank r's P2pNccl/NIXL port is the endpoint's kv_port + r,
+so kv ports step by the TP size); a role on several nodes lists them comma-separated
+and their GPUs (and UUIDs) per node separated by ";", in the same order:
+
+  --prefill-node node-a,node-b --prefill-gpus "0,1,2,3;0,1,2,3" --tp 2
+  --decode-node node-c --decode-gpus 0,1,2,3,4,5,6,7
+
+Endpoints are numbered across the nodes in order (P0, P1 on node-a, P2, P3 on node-b);
+ports restart from the base on every node.
 """
 
 import argparse
@@ -22,12 +33,19 @@ from pathlib import Path
 import yaml
 
 
-def ids(text: str) -> list[int]:
-    return [int(part) for part in text.split(",") if part.strip()]
+def ids(text: str) -> list[list[int]]:
+    """GPU indices per node: "0,1;0,1" -> [[0, 1], [0, 1]]."""
+    return [[int(part) for part in node.split(",") if part.strip()] for node in text.split(";")]
 
 
-def uuids(text: str | None) -> list[str] | None:
-    return None if not text else [part.strip() for part in text.split(",")]
+def uuids(text: str | None) -> list[list[str]] | None:
+    if not text:
+        return None
+    return [[part.strip() for part in node.split(",")] for node in text.split(";")]
+
+
+def nodes(text: str) -> list[str]:
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 def set_path(config: dict, dotted: str, raw: str) -> None:
@@ -48,14 +66,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--decode-gpus", required=True, type=ids)
     ap.add_argument("--prefill-uuids")
     ap.add_argument("--decode-uuids")
+    ap.add_argument("--tp", type=int, help="GPUs per endpoint on both roles (default: config)")
     ap.add_argument("--python", required=True, help="vLLM environment's Python")
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     args = ap.parse_args(argv)
 
-    n = len(args.prefill_gpus)
-    if n < 2 or len(args.decode_gpus) != n:
-        ap.error("need the same number (>= 2) of prefill and decode GPUs: pair 0 is the Canary")
     config = yaml.safe_load(Path(args.base).read_text(encoding="utf-8"))
     overrides = []
     for item in args.set:
@@ -70,27 +86,50 @@ def main(argv: list[str] | None = None) -> int:
         set_path(config, key, value)
     topology = config["topology"]
     groups = {"prefill": topology["prefill_nodegroup"], "decode": topology["decode_nodegroup"]}
-    groups["prefill"].update(node=args.prefill_node, gpu_ids=args.prefill_gpus)
-    groups["decode"].update(node=args.decode_node, gpu_ids=args.decode_gpus)
-    for role, raw in (("prefill", args.prefill_uuids), ("decode", args.decode_uuids)):
-        values = uuids(raw)
-        if values is not None and len(values) != n:
-            ap.error(f"--{role}-uuids must list one UUID per GPU")
-        groups[role]["gpu_uuids"] = values
-        groups[role]["memory_frequency_mhz"] = None  # SM clocks only (as in K1-K4a)
+    placed = {
+        "prefill": (nodes(args.prefill_node), args.prefill_gpus, uuids(args.prefill_uuids)),
+        "decode": (nodes(args.decode_node), args.decode_gpus, uuids(args.decode_uuids)),
+    }
     endpoints = {}
-    for role, prefix, gpus in (
-        ("prefill", "P", args.prefill_gpus),
-        ("decode", "D", args.decode_gpus),
-    ):
+    counts = {}
+    for role, prefix in (("prefill", "P"), ("decode", "D")):
         group = groups[role]
-        for index, gpu in enumerate(gpus):
-            endpoints[f"{prefix}{index}"] = {
-                "role": role,
-                "gpu_id": gpu,
-                "http_port": group["http_port_base"] + index,
-                "kv_port": group["kv_port_base"] + index,
-            }
+        names, gpus, ids_ = placed[role]
+        tp = args.tp or int(group.get("tensor_parallel_size", 1))
+        if len(gpus) != len(names) or (ids_ is not None and len(ids_) != len(names)):
+            ap.error(f"--{role}-gpus (and -uuids) need one ';'-separated list per node")
+        if ids_ is not None and any(len(u) != len(g) for u, g in zip(ids_, gpus)):
+            ap.error(f"--{role}-uuids must list one UUID per GPU")
+        if any(len(g) % tp for g in gpus):
+            ap.error(f"every {role} node needs a multiple of --tp {tp} GPUs")
+        spread = len(names) > 1 or tp > 1
+        group.update(node=names[0], gpu_ids=gpus[0], gpu_uuids=None if ids_ is None else ids_[0])
+        group["tensor_parallel_size"] = tp
+        if len(names) > 1:
+            group["nodes"] = [
+                {"node": name, "gpu_ids": g, "gpu_uuids": None if ids_ is None else u}
+                for name, g, u in zip(names, gpus, ids_ or [None] * len(names))
+            ]
+        else:
+            group.pop("nodes", None)
+        group["memory_frequency_mhz"] = None  # SM clocks only (as in K1-K4a)
+        index = 0
+        for name, g in zip(names, gpus):
+            for local in range(len(g) // tp):
+                endpoint = {
+                    "role": role,
+                    "gpu_id": g[local * tp],
+                    "http_port": group["http_port_base"] + local,
+                    "kv_port": group["kv_port_base"] + local * tp,
+                }
+                if spread:
+                    endpoint.update(node=name, gpu_ids=g[local * tp : (local + 1) * tp])
+                endpoints[f"{prefix}{index}"] = endpoint
+                index += 1
+        counts[role] = index
+    n = counts["prefill"]
+    if n < 2 or counts["decode"] != n:
+        ap.error("need the same number (>= 2) of P and D endpoints: pair 0 is the Canary")
     topology["endpoints"] = endpoints
     config["routing"]["canary_pair"] = ["P0", "D0"]
     config["routing"]["production_pairs"] = [[f"P{i}", f"D{i}"] for i in range(1, n)]

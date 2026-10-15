@@ -41,6 +41,7 @@ from canatune.infrastructure.clocks import (
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import Telemetry
 from canatune.proxy.proxy import parse_endpoints
+from canatune.topology import check_tensor_parallel, tensor_parallel_size
 
 
 @dataclass
@@ -112,7 +113,14 @@ def identity(config: Mapping[str, Any]) -> dict[str, Any]:
         "decode_gpu": config["topology"]["decode_nodegroup"]["gpu_type"],
         "max_model_len": config["model"]["max_model_len"],
         "slo": {"ttft_ms": float(slo["ttft_ms"]), "tpot_ms": float(slo["tpot_ms"])},
-    }
+    } | tensor_parallel_identity(config)
+
+
+def tensor_parallel_identity(config: Mapping[str, Any]) -> dict[str, Any]:
+    """TP > 1 changes every measured capacity and clock response; TP 1 keeps the
+    identity of earlier tables."""
+    tp = [tensor_parallel_size(config, role) for role in ("prefill", "decode")]
+    return {} if tp == [1, 1] else {"tensor_parallel_size": tp}
 
 
 def build_groups(config: Mapping[str, Any]) -> list[Group]:
@@ -179,6 +187,7 @@ def build_runtime(
     refs: Mapping[str, GpuRef] | None = None,
     probe_backend: ProbeBackend | None = None,
 ) -> Runtime:
+    check_tensor_parallel(config)
     record_dir = os.environ.get("CANATUNE_RECORD_DIR")
     requests_log = JsonlLog(None if not record_dir else os.path.join(record_dir, "requests.jsonl"))
     events = JsonlLog(None if not record_dir else os.path.join(record_dir, "events.jsonl"))

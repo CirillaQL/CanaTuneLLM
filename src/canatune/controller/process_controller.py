@@ -13,6 +13,16 @@ from pathlib import Path
 import httpx
 
 from canatune.config import kv_buffer_device, kv_connector, load_config
+from canatune.proxy.proxy import parse_endpoints
+from canatune.topology import (
+    ROLE_HOST_ENV,
+    agent_port,
+    check_tensor_parallel,
+    host_of,
+    node_hosts,
+    role_nodes,
+    tensor_parallel_size,
+)
 
 
 class ServiceExited(RuntimeError):
@@ -29,6 +39,9 @@ class StartupError(RuntimeError):
 
 def _exit_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode or 1
+
+
+NODE_STEPS = ("prefill", "decode")  # step names: prefill, prefill1 (a role's next node), ...
 
 
 class ProcessController:
@@ -138,7 +151,11 @@ class ProcessController:
             return
         self._stopped = True
         self._wait_then_kill(("proxy",))
-        self._wait_then_kill(("prefill", "decode"))
+        self._wait_then_kill(
+            tuple(
+                n for n in self._processes if n.startswith(NODE_STEPS) and not n.endswith("_agent")
+            )
+        )
         if self.before_agents_stop is not None:
             try:
                 self.before_agents_stop()
@@ -160,6 +177,7 @@ class ProcessController:
         agent_commands: Mapping[str, Sequence[str]] | None = None,
         agent_health_urls: Sequence[str] = (),
         agent_timeout_s: float = 120.0,
+        extra_node_commands: Mapping[str, Sequence[str]] | None = None,
     ) -> int:
         """Start services, supervise them, and return a shell-compatible status."""
         previous_handlers = {
@@ -177,6 +195,8 @@ class ProcessController:
                     return 128 + (self._stop_signal or signal.SIGTERM)
             self.start("prefill", prefill_command, cwd=cwd)
             self.start("decode", decode_command, cwd=cwd)
+            for name, command in (extra_node_commands or {}).items():  # a role's other nodes
+                self.start(name, command, cwd=cwd)
             self._wait_for_health(endpoint_urls, endpoint_timeout_s)
             if self._stop_event.is_set():
                 return 128 + (self._stop_signal or signal.SIGTERM)
@@ -230,23 +250,29 @@ def main() -> int:
     """Run the P/D steps and the CanaTune service inside one Slurm allocation."""
     root = Path(os.environ["PROJECT_ROOT"])
     config = load_config(os.environ["CANATUNE_CONFIG"])
+    check_tensor_parallel(config)
     prefill_node = os.environ["PREFILL_NODE"]
     decode_node = os.environ["DECODE_NODE"]
-    prefill_host = os.environ["CANATUNE_PREFILL_HOST"]
-    decode_host = os.environ["CANATUNE_DECODE_HOST"]
-    prefill_port = int(os.environ["PREFILL_HTTP_PORT_BASE"])
-    decode_port = int(os.environ["DECODE_HTTP_PORT_BASE"])
     proxy = config["proxy"]
     proxy_host = "127.0.0.1" if proxy["host"] == "0.0.0.0" else proxy["host"]
-    roles = [e["role"] for e in config["topology"]["endpoints"].values()]
-    counts = {role: roles.count(role) for role in ("prefill", "decode")}
+    nodes = {role: role_nodes(config, role) for role in NODE_STEPS}
+    if len(nodes["prefill"]) == 1:
+        nodes["prefill"][0]["node"] = prefill_node
+    if len(nodes["decode"]) == 1:
+        nodes["decode"][0]["node"] = decode_node
+    hosts = node_hosts()
+    for role in NODE_STEPS:
+        missing = [n["node"] for n in nodes[role] if n["node"] not in hosts]
+        if len(nodes[role]) > 1 and missing:
+            print(
+                f"CanaTune controller: {role} spans several nodes; CANATUNE_NODE_HOSTS has "
+                f"no address for {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            return 2
+    # Health of every endpoint at its own node's address and configured port.
     endpoint_urls = [
-        f"http://{host}:{base + index}/health"
-        for role, host, base in (
-            ("prefill", prefill_host, prefill_port),
-            ("decode", decode_host, decode_port),
-        )
-        for index in range(counts[role])
+        f"http://{e.http_host}:{e.http_port}/health" for e in parse_endpoints(config).values()
     ]
     # The node steps (srun inherits this environment) start vLLM with the connector
     # the proxy speaks.
@@ -255,12 +281,39 @@ def main() -> int:
         config["kv_transfer"].get("load_failure_policy", "fail")
     )
     os.environ["KV_BUFFER_DEVICE"] = kv_buffer_device(config)
-    # Node steps: optionally request the role's GPUs for the step without binding
-    # (each vLLM process selects its own GPU via CUDA_VISIBLE_DEVICES).
+    # Node steps: optionally request the node's GPUs for the step without binding
+    # (each vLLM process selects its own GPUs via CUDA_VISIBLE_DEVICES).
     step_gpus = os.environ.get("CANATUNE_STEP_GPUS") == "1"
+    scripts = {"prefill": "start_4p_prefill_node.sh", "decode": "start_4d_decode_node.sh"}
 
-    def gpu_args(role: str) -> list[str]:
-        return [f"--gpus-per-node={counts[role]}", "--gpu-bind=none"] if step_gpus else []
+    def node_step(role: str, k: int) -> tuple[str, list[str]]:
+        """srun step for the role's k-th node: its GPUs, TP, the index of its first
+        endpoint and its own work directory (the first node keeps the plain names)."""
+        node = nodes[role][k]
+        tp = tensor_parallel_size(config, role)
+        prefix = role.upper()
+        env = [f"{prefix}_TP={tp}"]
+        if len(nodes[role]) > 1:
+            offset = sum(len(n["gpu_ids"]) // tp for n in nodes[role][:k])
+            host = host_of(config, role, node["node"])
+            env += [
+                f"{prefix}_GPU_IDS={','.join(map(str, node['gpu_ids']))}",
+                f"{prefix}_INDEX_OFFSET={offset}",
+                f"{prefix}_ROLE_DIR={role if k == 0 else f'{role}{k}'}",
+                f"{ROLE_HOST_ENV[role]}={host}",
+                f"CANATUNE_{prefix}_KV_HOST={host}",
+            ]
+            if node.get("gpu_uuids"):
+                env.append(f"{prefix}_GPU_UUIDS={','.join(node['gpu_uuids'])}")
+        gpus = [f"--gpus-per-node={len(node['gpu_ids'])}", "--gpu-bind=none"] if step_gpus else []
+        name = role if k == 0 else f"{role}{k}"
+        command = [
+            "srun", "--overlap", "--nodes=1", "--ntasks=1", f"--nodelist={node['node']}",
+            *gpus, "env", *env, "bash", str(root / "scripts" / scripts[role]),
+        ]
+        return name, command
+
+    steps = dict(node_step(role, k) for role in NODE_STEPS for k in range(len(nodes[role])))
 
     endpoint_timeout_s = _positive_seconds(
         os.environ.get("ENDPOINT_TIMEOUT_S", "6030"), "ENDPOINT_TIMEOUT_S"
@@ -273,40 +326,44 @@ def main() -> int:
     agent_health_urls: list[str] = []
     clock_control = config.get("clock_control", {})
     if clock_control.get("enabled"):
-        raw_port = clock_control.get("agent_port", 9300)
         topology = config["topology"]
-        for role, node, host in (
-            ("prefill", prefill_node, prefill_host),
-            ("decode", decode_node, decode_host),
-        ):
-            # One port for both nodes, or {prefill: ..., decode: ...}.
-            port = int(raw_port[role] if isinstance(raw_port, dict) else raw_port)
+        for role in NODE_STEPS:
             group = topology[f"{role}_nodegroup"]
             min_mhz = int((clock_control.get("min_mhz") or {}).get(role, 0))
             memory = group.get("memory_frequency_mhz")
-            agent_commands[role] = [
-                "srun",
-                "--overlap",
-                "--nodes=1",
-                "--ntasks=1",
-                f"--nodelist={node}",
-                "env",
-                f"CANATUNE_AGENT_GPUS={','.join(map(str, group['gpu_ids']))}",
-                f"CANATUNE_AGENT_MIN_MHZ={min_mhz}",
-                f"CANATUNE_AGENT_PORT={port}",
-                *([f"CANATUNE_AGENT_MEMORY_MHZ={memory}"] if memory else []),
-                *(
-                    [f"CANATUNE_AGENT_GPU_UUIDS={','.join(group['gpu_uuids'])}"]
-                    if group.get("gpu_uuids")
-                    else []
-                ),
-                sys.executable,
-                "-m",
-                "canatune.infrastructure.gpu_agent",
-            ]
-            agent_health_urls.append(f"http://{host}:{port}/health")
-            # The proxy process inherits these and reaches the agents over the network.
-            os.environ[f"CANATUNE_{role.upper()}_AGENT"] = f"http://{host}:{port}"
+            for k, node in enumerate(nodes[role]):
+                # One port for both roles, or {prefill: ..., decode: ...}.
+                port = agent_port(config, role)
+                host = (
+                    host_of(config, role, node["node"])
+                    if len(nodes[role]) > 1
+                    else os.environ[ROLE_HOST_ENV[role]]
+                )
+                agent_commands[role if k == 0 else f"{role}{k}"] = [
+                    "srun",
+                    "--overlap",
+                    "--nodes=1",
+                    "--ntasks=1",
+                    f"--nodelist={node['node']}",
+                    "env",
+                    f"CANATUNE_AGENT_GPUS={','.join(map(str, node['gpu_ids']))}",
+                    f"CANATUNE_AGENT_MIN_MHZ={min_mhz}",
+                    f"CANATUNE_AGENT_PORT={port}",
+                    *([f"CANATUNE_AGENT_MEMORY_MHZ={memory}"] if memory else []),
+                    *(
+                        [f"CANATUNE_AGENT_GPU_UUIDS={','.join(node['gpu_uuids'])}"]
+                        if node.get("gpu_uuids")
+                        else []
+                    ),
+                    sys.executable,
+                    "-m",
+                    "canatune.infrastructure.gpu_agent",
+                ]
+                agent_health_urls.append(f"http://{host}:{port}/health")
+                if k == 0:
+                    # The proxy process inherits these and reaches the agents over the
+                    # network; a role's other nodes' agents follow from CANATUNE_NODE_HOSTS.
+                    os.environ[f"CANATUNE_{role.upper()}_AGENT"] = f"http://{host}:{port}"
 
     with httpx.Client(timeout=3, trust_env=False) as client:
 
@@ -321,26 +378,8 @@ def main() -> int:
         controller.before_agents_stop = lambda: reset_agent_clocks(client, agent_urls)
         return controller.run(
             cwd=root,
-            prefill_command=(
-                "srun",
-                "--overlap",
-                "--nodes=1",
-                "--ntasks=1",
-                f"--nodelist={prefill_node}",
-                *gpu_args("prefill"),
-                "bash",
-                str(root / "scripts/start_4p_prefill_node.sh"),
-            ),
-            decode_command=(
-                "srun",
-                "--overlap",
-                "--nodes=1",
-                "--ntasks=1",
-                f"--nodelist={decode_node}",
-                *gpu_args("decode"),
-                "bash",
-                str(root / "scripts/start_4d_decode_node.sh"),
-            ),
+            prefill_command=steps.pop("prefill"),
+            decode_command=steps.pop("decode"),
             proxy_command=(sys.executable, "-m", "canatune"),
             endpoint_urls=endpoint_urls,
             proxy_health_url=f"http://{proxy_host}:{proxy['port']}/health",
@@ -348,6 +387,7 @@ def main() -> int:
             proxy_timeout_s=60,
             agent_commands=agent_commands,
             agent_health_urls=agent_health_urls,
+            extra_node_commands=steps,
         )
 
 

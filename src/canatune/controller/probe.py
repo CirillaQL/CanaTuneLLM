@@ -30,7 +30,7 @@ from canatune.domain.calibration import ProbeSample
 from canatune.domain.groups import ClockPoint, Group
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable, is_violation
-from canatune.infrastructure.clocks import ClockActuator, GpuRef
+from canatune.infrastructure.clocks import ClockActuator, GpuRef, endpoint_reading
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import (
     GENERATION_TOKENS,
@@ -176,10 +176,10 @@ class CanaryProbe:
 
     async def _reading(self, endpoint: str) -> dict[str, Any]:
         ref = self.refs[endpoint]
-        for reading in await self.actuator.readings(ref.agent_url):
-            if reading.get("index") == ref.gpu:
-                return reading
-        raise RuntimeError(f"agent has no reading for {endpoint}")
+        reading = endpoint_reading(ref, await self.actuator.readings(ref.agent_url))
+        if reading is None:
+            raise RuntimeError(f"agent has no reading for {endpoint}")
+        return reading
 
     async def _readings(self) -> tuple[dict[str, Any], dict[str, Any]]:
         return await asyncio.gather(
