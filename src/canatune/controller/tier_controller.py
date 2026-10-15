@@ -41,7 +41,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from canatune.controller.router import CanaTuneRouter
-from canatune.domain.groups import Group, GroupState, Tier, TierState, TierStore, TierTable, slower
+from canatune.domain.groups import (
+    ClockPoint,
+    Group,
+    GroupState,
+    Tier,
+    TierState,
+    TierStore,
+    TierTable,
+    slower,
+)
 from canatune.domain.models import ClusterModel, Evaluation, Solver
 from canatune.infrastructure.clocks import ClockActuator, GpuRef, endpoint_reading
 from canatune.infrastructure.records import JsonlLog
@@ -267,6 +276,37 @@ class TierController:
                 continue
             group.state = GroupState.ACTIVE
             await self.set_tier(group, Tier.MAX if cold else Tier.H, "start")
+
+    async def snap(self, point: ClockPoint) -> ClockPoint:
+        """The supported clocks nearest to `point` (those of the Canary pair's GPUs;
+        unchanged without clock control)."""
+        refs = self.gpu_refs
+        canary = next((g for g in self.groups if g.canary), self.groups[0])
+        out = []
+        wanted = ((canary.prefill, point.prefill_mhz), (canary.decode, point.decode_mhz))
+        for endpoint, mhz in wanted:
+            ref = refs.get(endpoint)
+            clocks = await self.actuator.supported_clocks(ref) if ref is not None else []
+            out.append(min(clocks, key=lambda f: (abs(f - mhz), -f)) if clocks else mhz)
+        return ClockPoint(*out)
+
+    async def set_working(self, point: ClockPoint | None, reason: str = "api") -> ClockPoint:
+        """Override the working clocks of tier H (None: the table's H again) and move
+        every active group at H there now. An evaluation hook (a clock grid against
+        the Canary's choice): the solver, when on, chooses the working point itself."""
+        if self.settings.solver:
+            raise ControllerConfigError("the working point is the solver's while it is on")
+        async with self._control_lock:
+            self.tiers.working = None if point is None else await self.snap(point)
+            target = self.tiers.clocks(Tier.H)
+            for group in self.groups:
+                if group.state is GroupState.ACTIVE and group.tier is Tier.H:
+                    await self.set_tier(group, Tier.H, reason)
+            self.log.write(
+                {"event": "working_override", "requested": None if point is None else point.key(),
+                 "clock": target.key(), "reason": reason}
+            )  # fmt: skip
+            return target
 
     async def publish(self, table: TierTable, reason: str) -> None:
         """Adopt a new tier table; active groups move to it one at a time so that

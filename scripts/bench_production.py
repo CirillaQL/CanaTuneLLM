@@ -40,6 +40,11 @@ Environment: everything `canatune.controller.process_controller` needs, plus
                      the rest from the variables above; stages are named <name>_r<i>_..
                      and a failed stage skips the rest of its workload only
   BENCH_SCORE_SLOS   more SLOs to score every stage against, "ttft:tpot,..." in ms
+  BENCH_CLOCK_GRID   cantune: JSON list of [P MHz, D MHz]; after the publish, every stage
+                     runs once per point with tier H locked there (POST /canatune/working,
+                     snapped to supported clocks), named g<i>_<P>_<D>_<stage>; set
+                     canary.recalibrate=false so that the Canary does not move the table
+  BENCH_GRID_SETTLE_S  seconds after moving H before a point's first stage (default 20)
                      (by_slo in the summary; e.g. one baseline run for several SLOs)
 
 Replay workloads ({"replay": true, "segment_s": 600} in BENCH_WORKLOADS, a dataset whose
@@ -64,7 +69,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -91,6 +96,7 @@ class Stage:
     num_prompts: int
     workload: str = ""
     segment: tuple[float, float] | None = None  # replay: arrival seconds [start, end)
+    clock: tuple[int, int] | None = None  # clock grid: H locked to (P, D) MHz first
 
 
 @dataclass(frozen=True)
@@ -112,6 +118,8 @@ class BenchSettings:
     name: str = ""
     workloads: tuple["BenchSettings", ...] = ()
     score_slos: tuple[tuple[float, float], ...] = ()
+    clock_grid: tuple[tuple[int, int], ...] = ()
+    grid_settle_s: float = 20.0
     replay: bool = False
     segment_s: float = 600.0
 
@@ -141,6 +149,10 @@ class BenchSettings:
                 float(env["BENCH_STAGE_TIMEOUT_S"]) if env.get("BENCH_STAGE_TIMEOUT_S") else None
             ),
             dataset_name=env.get("BENCH_DATASET_NAME", "sharegpt"),
+            clock_grid=tuple(
+                (int(p), int(d)) for p, d in json.loads(env.get("BENCH_CLOCK_GRID") or "[]")
+            ),
+            grid_settle_s=float(env.get("BENCH_GRID_SETTLE_S", "20")),
             score_slos=tuple(
                 (float(t), float(p))
                 for t, p in (x.split(":") for x in env.get("BENCH_SCORE_SLOS", "").split(",") if x)
@@ -160,7 +172,20 @@ class BenchSettings:
         return replace(base, workloads=workloads)
 
     def plan(self) -> list[tuple["BenchSettings", Stage]]:
-        """-> (the workload's settings, stage) in run order."""
+        """-> (the workload's settings, stage) in run order; with a clock grid, every
+        stage once per grid point."""
+        base = self._plan()
+        if not self.clock_grid:
+            return base
+        if any(w.replay for w, _ in base):
+            raise SystemExit("a clock grid does not combine with replay workloads")
+        return [
+            (w, replace(s, name=f"g{i:02d}_{p}_{d}_{s.name}", clock=(p, d)))
+            for i, (p, d) in enumerate(self.clock_grid)
+            for w, s in base
+        ]
+
+    def _plan(self) -> list[tuple["BenchSettings", Stage]]:
         out = []
         for w in self.workloads or (self,):
             if w.replay:
@@ -435,6 +460,7 @@ def stage_summary(
     energy = sum(known) if known and len(known) == len(per_gpu) else None
     out: dict[str, Any] = {
         "workload": stage.workload or None,
+        "clock": None if stage.clock is None else f"{stage.clock[0]}/{stage.clock[1]}",
         "rate_rps": stage.rate_rps,
         "num_prompts": stage.num_prompts,
         "window_s": [round(start, 2), round(end, 2)],
@@ -512,18 +538,41 @@ async def run_stages(
     state_poll: bool,
     ttft_slo_ms: float,
     tpot_slo_ms: float,
+    set_clock: Callable[[tuple[int, int]], Awaitable[dict[str, Any]]] | None = None,
 ) -> tuple[list[tuple[Stage, tuple[float, float], dict | None, int]], float]:
     """-> per stage (stage, energy window, vllm result or None, exit code), and the
-    end of the run on the sampler's clock."""
+    end of the run on the sampler's clock. A stage with a grid clock first moves tier
+    H there (set_clock, default POST /canatune/working) when the previous one ran at
+    another point; a failed stage skips the rest of its workload at that point only."""
     done, failed = [], set()
+    current: tuple[int, int] | None = None
+    if set_clock is None:
+
+        async def set_clock(clock: tuple[int, int]) -> dict[str, Any]:
+            async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+                response = await client.post(
+                    f"{base_url}/canatune/working",
+                    json={"prefill_mhz": clock[0], "decode_mhz": clock[1]},
+                )
+                response.raise_for_status()
+                return response.json()
+
     replays: dict[str, tuple[float, list[dict[str, Any]], float]] = {}
     plan = settings.plan()
     async with Sampler(base_url, agents, out, state_poll) as sampler:
         for index, (workload, stage) in enumerate(plan):
-            if stage.workload in failed:
+            if (stage.clock, stage.workload) in failed:
                 continue
             stage_dir = out / "stages" / stage.name
             stage_dir.mkdir(parents=True, exist_ok=True)
+            if stage.clock is not None and stage.clock != current:
+                reply = await set_clock(stage.clock)
+                log(f"H -> {stage.clock[0]}/{stage.clock[1]} MHz: {reply}")
+                if not reply.get("ok"):
+                    raise RuntimeError(f"could not move H to {stage.clock}: {reply}")
+                current = stage.clock
+                (stage_dir / "clock.json").write_text(json.dumps(reply) + "\n")
+                await asyncio.sleep(settings.grid_settle_s)
             if workload.replay:
                 if stage.workload not in replays:
                     rows = replay_rows(workload.dataset)
@@ -578,7 +627,7 @@ async def run_stages(
             done.append((stage, (start, ended), result, code))
             log(f"{stage.name}: exit {code}, {duration:.0f} s of load")
             if code != 0:  # the rest of this workload is skipped, the next one runs
-                failed.add(stage.workload)
+                failed.add((stage.clock, stage.workload))
             if settings.gap_s > 0:
                 await asyncio.sleep(settings.gap_s)
         finished = sampler.now_s()
@@ -627,6 +676,11 @@ def main() -> int:
     policy = config["routing"]["policy"]
     if (mode != "baseline") != (policy == "cantune"):
         raise SystemExit(f"BENCH_MODE={mode} does not match routing.policy={policy}")
+    if settings.clock_grid and mode != "cantune":
+        raise SystemExit("BENCH_CLOCK_GRID needs BENCH_MODE=cantune (a published tier table)")
+    if settings.clock_grid and config.get("canary", {}).get("recalibrate", True):
+        log("warning: BENCH_CLOCK_GRID without canary.recalibrate=false: the Canary may move "
+            "the table (and reset H) during the grid")
     for workload in settings.workloads or (settings,):
         if not Path(workload.dataset).is_file():
             raise SystemExit(f"dataset {workload.dataset} is not a file")

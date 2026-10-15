@@ -242,6 +242,8 @@ canary:
   length_shift: 0.30          # median/p90 change that triggers a P relocation
   drift_min_samples: 200
   drain_timeout_s: 30
+  recalibrate: true           # false: no experiment after the first publish (evaluation runs
+                              # that set H themselves: POST /canatune/working, BENCH_CLOCK_GRID)
   locator:
     eps: 0.02                 # energy band: within 2 % of the minimum
     target_load_fraction: 0.8 # search at 0.8 C0 (consolidated operating point)
