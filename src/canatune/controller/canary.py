@@ -5,13 +5,17 @@ The Canary is an ordinary production group whenever it is not experimenting.
 Start (all of):
 * a trigger: cold start or a table without a cluster model (full calibration;
   production runs at MAX and admits everything meanwhile), production violations
-  drifting above theta (relocation), a verification (the length distribution
-  shifted by more than `length_shift`, or the Controller's plan runs a point at a
-  per-group rate the Canary has not confirmed), or the periodic neighbour check;
+  drifting above theta (relocation), the length distribution shifting by more than
+  `length_shift` since the last calibration (relocation with the real lengths; with
+  the solver on, a verification of its plan instead), the Controller's plan running
+  a point at a per-group rate the Canary has not confirmed (verification), or the
+  periodic neighbour check;
 * the rest of the pool can carry production: no pressure for `quiet_s`, and the
   solver finds the active groups without the Canary feasible for the demand;
 * budget: `min_interval_s` since the last experiment and at most `max_duty` of
-  the time spent experimenting.
+  the time spent experimenting (the cold-start calibration does not count: it runs
+  before there is a table to save energy with, and alone it would block every later
+  experiment for ten times its duration).
 The Canary then drains (no new requests; in-flight ones finish) and explores.
 
 A verification is one window at the plan's point and per-group rate with the
@@ -119,7 +123,10 @@ class CanaryScheduler:
             return "full", "no_model"
         if self._reference is not None and not self.lengths.using_default:
             if self.lengths.summary().shifted(self._reference, self.s.length_shift):
-                return "verify", "length_shift"
+                # Without the solver there is no plan to verify: measure H, C_H and
+                # the admission knees again with the real lengths (P relocation).
+                kind = "verify" if self.controller.settings.solver else "relocate"
+                return kind, "length_shift"
         if self._unverified() is not None:
             return "verify", "plan"
         outcomes = self.controller.router.outcomes
@@ -291,70 +298,79 @@ class CanaryScheduler:
         return sorted(picks)
 
     async def _experiment(self, kind: str, reason: str) -> None:
-        assert self.locator is not None
-        controller = self.controller
-        table = controller.tiers.table
-        outcome = "failed"
-        error_text = None
+        outcome, error_text = "failed", None
         try:
-            summary = self.lengths.summary()
-            if kind == "verify" and table is not None:
-                ok = await self._verify()
-                self._reference = summary
-                outcome = "verified" if ok else "verification_failed"
-                return
-            if kind == "recheck" and table is not None:
-                new = await self.locator.recheck(table, self._prompts())
-            else:
-                if kind == "relocate" or reason == "length_shift":
-                    self.locator.forget()  # old windows used another workload
-                new = await self.locator.locate(
-                    summary.prompt_mean,
-                    self._prompts(),
-                    previous=table if kind == "relocate" else None,
-                )
-            self._reference = summary
-            controller.router.outcomes.clear()
-            await controller.publish(new, reason)
-            self.verified = {}
-            capacity = new.evidence.get("capacity_rps")
-            if capacity:  # the fill windows confirmed H up to C_H
-                self.verified[new.h.key()] = float(capacity)
-            outcome = "published"
+            outcome = await self._measure(kind, reason)
         except asyncio.CancelledError:
             outcome = "aborted"
         except LocatorError as error:
             error_text = str(error)
-            controller.log.write({"event": "locator_error", "error": error_text})
+            self.controller.log.write({"event": "locator_error", "error": error_text})
         except Exception as error:  # probes hit real services: never kill the control loop
             error_text = repr(error)
-            controller.log.write({"event": "locator_error", "error": error_text})
+            self.controller.log.write({"event": "locator_error", "error": error_text})
         finally:
-            now = self._clock()
+            await self._finish(kind, reason, outcome, error_text)
+
+    async def _measure(self, kind: str, reason: str) -> str:
+        """Run the experiment and adopt its result; -> the outcome."""
+        table = self.controller.tiers.table
+        summary = self.lengths.summary()
+        if kind == "verify" and table is not None:
+            ok = await self._verify()
+            self._reference = summary
+            return "verified" if ok else "verification_failed"
+        new = await self._locate(kind, reason, table)
+        await self._adopt(new, summary, reason)
+        return "published"
+
+    async def _locate(self, kind: str, reason: str, table: Any) -> Any:
+        """A new tier table: the neighbour check of H, a relocation (P side with the
+        current lengths; park and D reused) or a full calibration."""
+        assert self.locator is not None
+        if kind == "recheck" and table is not None:
+            return await self.locator.recheck(table, self._prompts())
+        if kind == "relocate" or reason == "length_shift":
+            self.locator.forget()  # old windows used another workload
+        return await self.locator.locate(
+            self.lengths.summary().prompt_mean,
+            self._prompts(),
+            previous=table if kind == "relocate" else None,
+        )
+
+    async def _adopt(self, new: Any, summary: LengthSummary, reason: str) -> None:
+        controller = self.controller
+        self._reference = summary
+        controller.router.outcomes.clear()
+        await controller.publish(new, reason)
+        self.verified = {}
+        capacity = new.evidence.get("capacity_rps")
+        if capacity:  # the fill windows confirmed H up to C_H
+            self.verified[new.h.key()] = float(capacity)
+
+    async def _finish(self, kind: str, reason: str, outcome: str, error: str | None) -> None:
+        """Book the experiment and return the Canary to production."""
+        controller = self.controller
+        now = self._clock()
+        if reason != "cold_start":  # see the module docstring: not in the duty budget
             self.explore_s += now - (self._started_at or now)
-            self.last_end = now
-            self.history.append(
-                {
-                    "kind": kind,
-                    "reason": reason,
-                    "outcome": outcome,
-                    "end": now,
-                    "error": error_text,
-                }
-            )
-            canary = self.canary
-            if canary is not None and not controller.router.full_effort:
-                try:
-                    await self.reclaim()
-                except Exception as error:
-                    controller.log.write({"event": "canary_drain_error", "error": repr(error)})
-                else:
-                    await controller.set_tier(
-                        canary, Tier.H if (
-                            controller.tiers.table is not None and not controller.router.full_effort
-                        ) else Tier.MAX,
-                        f"canary_{outcome}",
-                    )
+        self.last_end = now
+        self.history.append(
+            {"kind": kind, "reason": reason, "outcome": outcome, "end": now, "error": error}
+        )
+        canary = self.canary
+        if canary is not None and not controller.router.full_effort:
+            try:
+                await self.reclaim()
+            except Exception as err:
+                controller.log.write({"event": "canary_drain_error", "error": repr(err)})
+            else:
+                await controller.set_tier(
+                    canary, Tier.H if (
+                        controller.tiers.table is not None and not controller.router.full_effort
+                    ) else Tier.MAX,
+                    f"canary_{outcome}",
+                )
 
     async def _verify(self) -> bool:
         """Layer 3: the plan's point at its per-group rate, current length mix."""

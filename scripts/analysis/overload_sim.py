@@ -65,6 +65,7 @@ from pathlib import Path
 
 from canatune import loadgen
 from canatune.config import load_config
+from canatune.controller.canary import CanaryScheduler, SchedulerSettings
 from canatune.controller.locator import (
     AdmissionInputs,
     Hardware,
@@ -314,8 +315,15 @@ class Sim:
         solver: bool = True,
         lengths=LENGTHS,
         seed: int = 0,
+        canary: dict | None = None,
     ):
+        """`canary`: run the real Canary scheduler on G0 during production (None:
+        the table stays as published); its settings override `canary.*` of the
+        config, e.g. {"recalibrate": False}."""
         self.phys = phys
+        self.canary_settings = canary
+        self.canary: SimCanary | None = None
+        self.experiments: list[dict] = []  # Canary experiments run in production
         self.overhead_ms = phys.overhead_ms if overhead_ms is None else overhead_ms
         self.solver = solver
         self.lengths = list(lengths)
@@ -357,6 +365,8 @@ class Sim:
         config["kv_transfer"]["kv_bytes_per_token"] = self.phys.kv_bytes_per_token
         config["router"].update(self.router_overrides)
         groups = [Group(p.name, f"P{i}", f"D{i}") for i, p in enumerate(self.pairs)]
+        if self.canary_settings is not None:
+            groups[0].canary = True  # G0, as in a deployment (routed last by fill)
         tiers = TierState(max_point=self.phys.max_point, table=table)
         risk = RiskTable.from_config(config["risk"], {"sim": True})
         clock = lambda: self.now  # noqa: E731
@@ -391,6 +401,25 @@ class Sim:
         for g, p in zip(groups, self.pairs):
             g.state, g.tier, g.effective = GroupState.ACTIVE, Tier.H, table.h
             p.clock = table.h
+        if self.canary_settings is not None:
+            raw = {**config.get("canary", {}), **self.canary_settings}
+            backend = SimBackend(self.phys, self.lengths, seed=self.rng.randrange(10**9))
+            locator = TierLocator(
+                backend,
+                LocatorSettings.from_config(config),
+                admission=AdmissionInputs(
+                    kv_bytes_per_token=self.phys.kv_bytes_per_token,
+                    kv_buffer_bytes=self.phys.kv_buffer_bytes,
+                ),
+            )
+            self.canary = SimCanary(
+                self, self.controller, locator, lengths, SchedulerSettings.from_config(
+                    {"canary": raw}), theta=float(config["router"]["theta"]), clock=clock,
+            )  # fmt: skip
+            # The table came from a cold-start calibration that just ended (run_canary):
+            # its lengths are the reference and the budget starts now.
+            self.canary._reference = lengths.summary()
+            self.canary.last_end = 0.0
 
     # ---- event loop ------------------------------------------------------------------
 
@@ -418,6 +447,8 @@ class Sim:
 
     def tick(self) -> None:
         asyncio.run(self.controller.tick())
+        if self.canary is not None:
+            asyncio.run(self.canary.sim_step())
         for p in self.pairs:
             g = self.groups[p.name]
             if g.effective is not None:
@@ -462,6 +493,8 @@ class Sim:
             else:
                 f_p, f_d = p.clock.prefill_mhz, p.clock.decode_mhz
             p_w, d_w = self.phys.p_power(f_p, p_util), self.phys.d_power(f_d, d_util)
+            if state == "exploring" and self.canary is not None and self.canary.power_w:
+                p_w, d_w = self.canary.power_w  # the Canary's probe windows
             self.energy_j += p_w + d_w
             row["w"] = row.get("w", 0.0) + p_w + d_w
             row["wp"] = row.get("wp", 0.0) + p_w
@@ -779,6 +812,7 @@ class SimBackend:
         self.limit: int | None = None
         self.windows = 0
         self.sim_seconds = 0.0
+        self.energy_j = 0.0
 
     def _pairs(self) -> list[tuple[int, int]]:
         pairs = [p for p in self.lengths if self.limit is None or p[0] <= self.limit]
@@ -843,6 +877,7 @@ class SimBackend:
         tpots = sorted(t for t in (s.tpot(r) for r in reqs) if t is not None)
         self.windows += 1
         self.sim_seconds += duration
+        self.energy_j += p_j + d_j
         busy = min(1.0, pair.d_busy_s / duration)
         running = pair.d_running_integral / duration if duration else 0.0
         return WindowResult(
@@ -915,6 +950,102 @@ class SimBackend:
 
     async def kv_capacity(self) -> int:
         return self.phys.d_kv_tokens
+
+
+class SimCanary(CanaryScheduler):
+    """The real Canary scheduler on the simulated timeline: trigger, start conditions,
+    drain and bookkeeping run unchanged. An experiment's windows run at once on
+    SimBackend (each its own simulated pair) and its table is adopted when their
+    simulated time has passed; meanwhile the Canary group serves no production and
+    draws its windows' average power. Settle times between windows are not counted,
+    so experiments are somewhat shorter than on hardware."""
+
+    def __init__(self, sim: Sim, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.sim = sim
+        self.until: float | None = None
+        self.power_w: tuple[float, float] | None = None
+        self._token = 0
+
+    @property
+    def running(self) -> bool:
+        return self.until is not None or super().running
+
+    async def sim_step(self) -> None:
+        await self.step()
+        if self.task is not None and not self.task.done():
+            await self.task  # the windows run now; adoption is scheduled below
+
+    async def _locate(self, kind, reason, table):
+        assert self.locator is not None
+        self.locator.backend.lengths = list(self.lengths.pairs())  # probes: current lengths
+        return await super()._locate(kind, reason, table)
+
+    async def _experiment(self, kind: str, reason: str) -> None:
+        assert self.locator is not None
+        backend = self.locator.backend
+        t0, e0, w0 = backend.sim_seconds, backend.energy_j, backend.windows
+        summary = self.lengths.summary()
+        table, new, outcome, error = self.controller.tiers.table, None, "failed", None
+        try:
+            if kind == "verify" and table is not None:
+                outcome = "verified" if await self._verify() else "verification_failed"
+            else:
+                new = await self._locate(kind, reason, table)
+                outcome = "published"
+        except LocatorError as err:
+            error = str(err)
+        duration = max(backend.sim_seconds - t0, 1.0)
+        half = (backend.energy_j - e0) / duration / 2  # P and D share it
+        self.power_w = (half, half)
+        self._token += 1
+        self.until = self.sim.now + duration
+        self.sim.experiments.append({
+            "kind": kind, "reason": reason, "start_s": round(self.sim.now, 1),
+            "duration_s": round(duration, 1), "windows": backend.windows - w0,
+            "energy_kj": round((backend.energy_j - e0) / 1000, 1), "outcome": outcome,
+            "error": error, "lengths": {"prompt_mean": round(summary.prompt_mean),
+                                        "output_mean": round(summary.output_mean)},
+            "h_before": None if table is None else table.h.key(),
+            "h_after": None if new is None else new.h.key(),
+            "c_h_rps_after": None if new is None else new.evidence.get("capacity_rps"),
+        })  # fmt: skip
+        self.sim.at(self.until, self.sim_done, self._token, new, summary, kind, reason, outcome,
+                    error)  # fmt: skip
+
+    def sim_done(self, token, new, summary, kind, reason, outcome, error) -> None:
+        if token != self._token or self.until is None:
+            return  # aborted meanwhile
+
+        async def done() -> None:
+            self.until, self.power_w = None, None
+            if new is not None:
+                await self._adopt(new, summary, reason)
+            await self._finish(kind, reason, outcome, error)
+
+        asyncio.run(done())
+
+    def abort(self, reason: str) -> bool:
+        stopped = super().abort(reason)
+        if self.until is not None:  # production pressure ends the experiment now
+            self._token += 1
+            self.until, self.power_w = None, None
+            self.sim.experiments[-1]["outcome"] = f"aborted ({reason})"
+            self.sim.at(self.sim.now, self._aborted, self.kind, self.reason)
+            stopped = True
+        return stopped
+
+    def _aborted(self, kind, reason) -> None:
+        asyncio.run(self._finish(kind, reason, "aborted", None))
+
+    async def reclaim(self) -> None:
+        if self.until is not None:  # the Controller takes the group back (full effort)
+            self._token += 1
+            self.until, self.power_w = None, None
+            self.sim.experiments[-1]["outcome"] = "reclaimed"
+            await self._finish(self.kind or "", self.reason or "", "aborted", None)
+            return
+        await super().reclaim()
 
 
 def run_canary(phys: Physics = REFERENCE, lengths=LENGTHS) -> tuple[TierTable, SimBackend]:

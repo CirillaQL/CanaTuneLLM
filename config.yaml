@@ -239,7 +239,8 @@ canary:
   min_interval_s: 600
   max_duty: 0.10              # at most 10 % of the time experimenting
   periodic_s: 1800            # neighbour check of H
-  length_shift: 0.30          # median/p90 change that triggers a P relocation
+  length_shift: 0.30          # mean/p90 change (prompt or output) since the last calibration
+                              # that triggers a P relocation (solver on: a verification)
   drift_min_samples: 200
   drain_timeout_s: 30
   recalibrate: true           # false: no experiment after the first publish (evaluation runs
