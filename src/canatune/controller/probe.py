@@ -486,15 +486,22 @@ class CanaryProbe:
         )
 
     async def open_window(
-        self, clock: ClockPoint, eq_tps: float, alpha: float, seconds: float, abort_above: float
+        self,
+        clock: ClockPoint,
+        eq_tps: float,
+        alpha: float,
+        seconds: float,
+        abort_above: float,
+        rep: int = 0,
     ) -> WindowResult:
         await self.lock(clock)
         # Same load -> same trace: every clock replays identical arrival times and
-        # lengths, so per-request energy is compared on identical work.
+        # lengths, so per-request energy is compared on identical work; `rep` draws
+        # another trace at the same load (a confirmation window or a retry).
         # Exactly round(rate x seconds) arrivals at uniform order statistics: a Poisson
         # process conditioned on its count, so the realised load equals the nominal
         # one (an unconditioned Poisson trace can deviate from it by tens of percent).
-        trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
+        trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)) + 7_919 * rep)
         rate = eq_tps / (self.lengths.mean_prompt(self.prompt_limit) + alpha)  # requests/s
         count = max(1, round(rate * seconds))
         pairs = self.lengths.sample(trace, count, self.prompt_limit)

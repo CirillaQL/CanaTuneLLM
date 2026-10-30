@@ -110,7 +110,7 @@ class SurrogateBackend:
         self.limit = max_prompt
         return PROMPT
 
-    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, rep=0):
         self._tick()
         f = clock.prefill_mhz
         rps = eq_tps / (PROMPT + alpha)
@@ -182,8 +182,9 @@ def test_locate_on_surrogate_matches_manual_experiments() -> None:
     # the power cap is found under load: nothing above 2040 is searched
     assert ev["f_eff"] == 2040
     # H inside the measured 2 % band (1590-2145 at 0.8 C0), not power-limited > 30 %
+    # unless only the ceiling holds the search load (C0 bisected to within 10 %)
     assert 1590 <= table.h.prefill_mhz <= 2040
-    assert backend.limited(table.h.prefill_mhz) <= 0.3
+    assert backend.limited(table.h.prefill_mhz) <= 0.3 or table.h.prefill_mhz == ev["f_eff"]
     # one working tier on this cluster (bands at 0.3 C0 and 0.8 C0 overlap)
     assert table.l is None
     # D: KV wall (B* equal at the chosen and the highest clock), low D clock chosen
@@ -366,8 +367,8 @@ def test_no_feasible_fill_load_publishes_nothing() -> None:
     locator = TierLocator(backend, settings())
     original = backend.open_window
 
-    async def fill_fails(clock, eq_tps, alpha, seconds, abort_above):
-        w = await original(clock, eq_tps, alpha, seconds, abort_above)
+    async def fill_fails(clock, eq_tps, alpha, seconds, abort_above, rep=0):
+        w = await original(clock, eq_tps, alpha, seconds, abort_above, rep=rep)
         if locator.run is not None and locator.run.phase == "fill":
             w.violations = w.requests
         return w
@@ -391,8 +392,8 @@ def test_joint_check_raises_d_when_slow_d_breaks_ttft_at_h() -> None:
     backend = SurrogateBackend(seed=13)
     original = backend.open_window
 
-    async def slow_d_delays_first_token(clock, eq_tps, alpha, seconds, abort_above):
-        w = await original(clock, eq_tps, alpha, seconds, abort_above)
+    async def slow_d_delays_first_token(clock, eq_tps, alpha, seconds, abort_above, rep=0):
+        w = await original(clock, eq_tps, alpha, seconds, abort_above, rep=rep)
         if clock.decode_mhz < 1000 and eq_tps > 0.6 * 4000:  # smoke r3: D 735 at 0.8 C0
             w.violations = w.requests // 4
         return w
@@ -409,8 +410,8 @@ def test_fill_bisects_capacity_between_fill_loads() -> None:
     locator = TierLocator(backend, settings())
     original = backend.open_window
 
-    async def wall_at_090(clock, eq_tps, alpha, seconds, abort_above):
-        w = await original(clock, eq_tps, alpha, seconds, abort_above)
+    async def wall_at_090(clock, eq_tps, alpha, seconds, abort_above, rep=0):
+        w = await original(clock, eq_tps, alpha, seconds, abort_above, rep=rep)
         c0 = (locator.run.evidence if locator.run else {}).get("capacity_c0")
         if locator.run is not None and locator.run.phase == "fill" and eq_tps > 0.9 * c0:
             w.violations = w.requests

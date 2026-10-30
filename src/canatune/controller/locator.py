@@ -7,9 +7,14 @@ Procedure (design v2 §6.2):
             prompt lengths whose TTFT misses the target even on an idle system are
             excluded from later probes (the Router rejects them; they would only
             make every load look infeasible)
-3. ramp     at the highest clock, double the load (equivalent tokens/s) until TTFT
-            p95 reaches the target, bisect twice -> C0; the clock actually reached
-            under load is the search ceiling f_eff (power cap)
+3. ramp     at the highest clock, double the load (equivalent tokens/s) until the
+            violation bound exceeds theta, bisect until the bracket is within
+            ramp_bisect_ratio -> C0; the clock actually reached under load is the
+            search ceiling f_eff (power cap). A load whose decision is borderline, or
+            that passed while D saturated (KV near full, preemptions), is measured
+            again on other arrival traces and decided on the pooled windows; the
+            search load 0.8 C0 must then hold at f_eff, else it backs off (and C0
+            with it) instead of failing the calibration
 4. coarse   5 clocks from f_eff down at 0.8*C0; stop descending at the first
             infeasible clock (violation upper confidence bound > theta)
 5. refine   golden section around the cheapest point, or bisection of the
@@ -150,10 +155,17 @@ class ProbeBackend(Protocol):
         ...
 
     async def open_window(
-        self, clock: ClockPoint, eq_tps: float, alpha: float, seconds: float, abort_above: float
+        self,
+        clock: ClockPoint,
+        eq_tps: float,
+        alpha: float,
+        seconds: float,
+        abort_above: float,
+        rep: int = 0,
     ) -> WindowResult:
         """Poisson probes at `eq_tps` equivalent tokens/s; may stop early once the
-        observed violation rate is clearly above `abort_above`."""
+        observed violation rate is clearly above `abort_above`. `rep` selects another
+        arrival trace at the same load (a confirmation or a retry)."""
         ...
 
     async def closed_window(
@@ -189,6 +201,13 @@ class LocatorSettings:
     idle_noise_w: float = 0.5
     ramp_start_rps: float = 1.0
     ramp_max_steps: int = 10
+    ramp_bisect_ratio: float = 1.1  # bisect C0 until high / low load is at most this
+    ramp_bisect_max: int = 4
+    ramp_confirm_margin: float = 0.03  # a bound this close to theta is measured again
+    ramp_confirm_kv: float = 0.95  # a pass with D's KV this full (or preempting) too
+    ramp_max_windows: int = 3  # windows pooled per ramp load at most (60 -> 180 requests)
+    target_backoff: float = 0.85  # f_eff misses the SLO at 0.8 C0: lower the load this much
+    target_backoff_steps: int = 4
     decode_probe_concurrency: int = 16
     decode_start_concurrency: int = 8
     decode_max_concurrency: int = 512
@@ -388,12 +407,15 @@ class TierLocator:
         self.run: LocatorRun | None = None
         self._previous: TierTable | None = None  # the table a relocation builds on
         self.mean_prompt = 512.0  # of the current probe length distribution
+        self.attempt = 0  # failed calibrations so far: a retry draws other traces
+        self._pooled: dict[tuple, WindowResult] = {}  # (clock, load) -> pooled decision
 
     # ---- cached measurements ------------------------------------------------------------
 
     def forget(self) -> None:
         """Drop cached windows (the workload changed; old windows are not comparable)."""
         self._cache.clear()
+        self._pooled.clear()
 
     def _phase(self, phase: str) -> None:
         assert self.run is not None
@@ -424,13 +446,52 @@ class TierLocator:
         needed = self.s.min_window_requests / rps if rps > 0 else self.s.max_window_s
         return min(self.s.max_window_s, max(self.s.window_s, needed))
 
-    async def open(self, clock: ClockPoint, eq_tps: float, alpha: float) -> WindowResult:
-        key = ("open", clock, round(eq_tps, 1), round(alpha, 1))
+    async def open(
+        self, clock: ClockPoint, eq_tps: float, alpha: float, rep: int = 0
+    ) -> WindowResult:
+        rep = rep + 100 * self.attempt  # a retry after a failed calibration: other traces
+        key = ("open", clock, round(eq_tps, 1), round(alpha, 1), rep)
         seconds = self.open_seconds(eq_tps, alpha)
+        extra = {"rep": rep} if rep else {}
         return await self._cached(
             key,
-            lambda: self.backend.open_window(clock, eq_tps, alpha, seconds, 2 * self.s.theta),
+            lambda: self.backend.open_window(
+                clock, eq_tps, alpha, seconds, 2 * self.s.theta, **extra
+            ),
         )
+
+    def _saturated(self, w: WindowResult) -> bool:
+        return w.decode_preemptions > 0 or (w.decode_kv_max or 0.0) >= self.s.ramp_confirm_kv
+
+    async def decided(
+        self, clock: ClockPoint, load: float, alpha: float
+    ) -> tuple[bool, WindowResult]:
+        """Capacity decision at one load: the first window, then windows on other
+        arrival traces, pooled, while the violation bound is within ramp_confirm_margin
+        of theta or a pass rests on a single window that saturated D (near the D wall
+        the outcome depends on the arrivals: job 275914 r3 passed 3905 with 2/60 at
+        98 % KV, then missed 3124 with 19/60). An aborted window fails at once.
+        -> (pass, the pooled window: the first window's measurements, pooled counts)."""
+        ws = [await self.open(clock, load, alpha)]
+        while True:
+            k, n = sum(w.violations for w in ws), sum(w.requests for w in ws)
+            bound = wilson_ucb(k, n, self.s.ucb_z) if n > 0 else 1.0
+            passed = n > 0 and bound <= self.s.theta and not any(w.aborted for w in ws)
+            unsure = not any(w.aborted for w in ws) and (
+                abs(bound - self.s.theta) <= self.s.ramp_confirm_margin
+                or (passed and len(ws) == 1 and self._saturated(ws[0]))
+            )
+            if not unsure or len(ws) >= self.s.ramp_max_windows:
+                pooled = replace(ws[0], violations=k, requests=n,
+                                 aborted=any(w.aborted for w in ws))  # fmt: skip
+                self._pooled[(clock, round(load, 1))] = pooled
+                if len(ws) > 1:
+                    self.log.write({
+                        "event": "locator_confirm", "clock": clock.key(), "load": round(load, 1),
+                        "windows": [[w.violations, w.requests] for w in ws], "pass": passed,
+                    })  # fmt: skip
+                return passed, pooled
+            ws.append(await self.open(clock, load, alpha, rep=len(ws)))
 
     async def closed(
         self, clock: ClockPoint, concurrency: int, rep: int = 0, mix: str = "all"
@@ -781,23 +842,25 @@ class TierLocator:
         self._phase("ramp")
         load = self.s.ramp_start_rps * (mean_prompt + alpha)
         good: WindowResult | None = None
-        bad: WindowResult | None = None
+        bad: float | None = None
         for _ in range(self.s.ramp_max_steps):
-            w = await self.open(top, load, alpha)
-            if self.meets_target(w):
+            ok, w = await self.decided(top, load, alpha)
+            if ok:
                 good, load = w, load * 2
             else:
-                bad = w
+                bad = load
                 if good is not None:
                     break
                 load /= 2  # even the start load is too much: go down
         if good is None:
             raise LocatorError("no load meets the SLO even at the highest clock")
         if bad is not None:
-            lo, hi = good.load, bad.load
-            for _ in range(2):
-                w = await self.open(top, (lo + hi) / 2, alpha)
-                if self.meets_target(w):
+            lo, hi = good.load, bad
+            for _ in range(self.s.ramp_bisect_max):
+                if hi / lo <= self.s.ramp_bisect_ratio:
+                    break
+                ok, w = await self.decided(top, (lo + hi) / 2, alpha)
+                if ok:
                     lo, good = w.load, w
                 else:
                     hi = w.load
@@ -812,6 +875,27 @@ class TierLocator:
         self.run.evidence.update({"capacity_c0": good.load, "f_eff": f_eff})
         return good.load, f_eff
 
+    async def hold_target(self, ceiling: ClockPoint, c0: float, alpha: float) -> float:
+        """The clock search needs a load the ceiling clock carries: when f_eff misses
+        the SLO at target_load_fraction x C0, C0 was too high (a lucky window at the
+        edge); lower it by target_backoff and test again, a few times, before giving
+        up. -> C0, possibly lowered (evidence: c0_backoffs)."""
+        backoffs = 0
+        while True:
+            load = self.s.target_load_fraction * c0
+            ok, _ = await self.decided(ceiling, load, alpha)
+            if ok:
+                break
+            if backoffs >= self.s.target_backoff_steps:
+                raise LocatorError(f"no feasible prefill clock at load {load:.0f}")
+            backoffs += 1
+            c0 *= self.s.target_backoff
+        assert self.run is not None
+        if backoffs:
+            self.run.evidence.update({"capacity_c0": c0, "c0_backoffs": backoffs})
+            self.log.write({"event": "locator_backoff", "c0": round(c0, 1), "steps": backoffs})
+        return c0
+
     async def search_prefill(
         self, hw: Hardware, f_eff: int, decode_mhz: int, load: float, alpha: float, tag: str
     ) -> tuple[int, dict[int, WindowResult]]:
@@ -823,7 +907,10 @@ class TierLocator:
         async def measure(f: int) -> WindowResult:
             f = snap(grid, f)
             if f not in meas:
-                meas[f] = await self.open(ClockPoint(f, decode_mhz), load, alpha)
+                point = ClockPoint(f, decode_mhz)
+                meas[f] = self._pooled.get((point, round(load, 1))) or await self.open(
+                    point, load, alpha
+                )
             return meas[f]
 
         self._phase(f"coarse_{tag}")
@@ -1178,7 +1265,19 @@ class TierLocator:
         self, mean_prompt: float, prompts: Sequence[int], previous: TierTable | None = None
     ) -> TierTable:
         """Full calibration. With `previous`, park and D results are reused
-        (a P-only relocation after a load or length shift)."""
+        (a P-only relocation after a load or length shift). A failed calibration makes
+        the next attempt draw other arrival traces: replaying the cached windows only
+        repeated the failure (job 275914 r3: three attempts within a second)."""
+        try:
+            return await self._locate(mean_prompt, prompts, previous)
+        except LocatorError:
+            self.attempt += 1
+            self._pooled.clear()
+            raise
+
+    async def _locate(
+        self, mean_prompt: float, prompts: Sequence[int], previous: TierTable | None
+    ) -> TierTable:
         self.run = LocatorRun(started_at=self._clock())
         self.mean_prompt = mean_prompt
         hw = await self.backend.hardware()
@@ -1196,6 +1295,7 @@ class TierLocator:
         alpha, limit = await self.alpha(top, prompts)
         mean_prompt = self.mean_prompt = self.backend.set_prompt_limit(limit)
         c0, f_eff = await self.ramp(hw, top, alpha, mean_prompt)
+        c0 = await self.hold_target(ClockPoint(f_eff, top.decode_mhz), c0, alpha)
         f_h, meas_hi = await self.search_prefill(
             hw, f_eff, top.decode_mhz, self.s.target_load_fraction * c0, alpha, "target"
         )
