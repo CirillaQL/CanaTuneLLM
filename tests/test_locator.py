@@ -29,7 +29,7 @@ from canatune.controller.locator import (
 from canatune.controller.router import CanaTuneRouter, RouterSettings
 from canatune.controller.tier_controller import ControllerSettings, TierController
 from canatune.domain.calibration import ProbeSample
-from canatune.domain.groups import ClockPoint, GroupState, Tier, TierState
+from canatune.domain.groups import ClockPoint, GroupState, Tier, TierState, TierTable
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable
 from canatune.infrastructure.clocks import GpuRef, NullClockActuator
@@ -497,6 +497,22 @@ def test_relocation_keeps_the_cluster_model() -> None:
     old = ClusterModel.from_json(first.evidence["model"])
     assert model.decode == old.decode and model.power_decode == old.power_decode
     assert model.power_prefill and model.b_star == old.b_star
+
+
+def test_relocation_starts_d_from_its_own_choice_not_the_raised_h() -> None:
+    """The previous joint step raised D (heavier lengths then); a relocation for a
+    lighter mix searches D again from the D-alone clock, so D can come back down."""
+    prompts = [128, 1024, 2048]
+    first = asyncio.run(TierLocator(SurrogateBackend(seed=3), settings()).locate(PROMPT, prompts))
+    alone = first.evidence["joint"]["decode_alone"]
+    hw = asyncio.run(SurrogateBackend(seed=3).hardware())
+    raised = TierTable.from_json(first.to_json())
+    raised.h = ClockPoint(raised.h.prefill_mhz, hw.decode_clocks[-1])  # as after long prompts
+    again = asyncio.run(
+        TierLocator(SurrogateBackend(seed=4), settings()).locate(PROMPT, prompts, previous=raised)
+    )
+    assert again.evidence["joint"]["decode_alone"] == alone
+    assert again.h.decode_mhz < hw.decode_clocks[-1]
 
 
 def test_full_effort_reclaims_canary_only_after_probe_drain_and_locks_max():

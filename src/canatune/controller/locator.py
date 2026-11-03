@@ -1307,8 +1307,13 @@ class TierLocator:
         await self.consistent_tables(top, prompts)
 
         if previous is not None:
+            # D's own choice from the run that measured D, not the previous H: the joint
+            # step may have raised D for that run's lengths, and starting the ladder
+            # there would keep D high after the mix got lighter (a relocation can
+            # only raise D).
+            alone = (previous.evidence.get("joint") or {}).get("decode_alone")
             f_d, b_star, wall = (
-                previous.h.decode_mhz,
+                int(alone) if alone in hw.decode_clocks else previous.h.decode_mhz,
                 previous.decode_max_running,
                 previous.decode_wall,
             )
