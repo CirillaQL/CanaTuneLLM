@@ -49,6 +49,13 @@ class SchedulerSettings:
     max_duty: float = 0.10
     periodic_s: float = 1800.0
     length_shift: float = 0.30
+    # A length shift counts once settled: the latest two blocks of `length_window`
+    # requests both differ from the last calibration's lengths and agree with each
+    # other (all by `length_shift`). The experiment then keeps those 2 x length_window
+    # requests, so it measures the new mix, not a window still half the old one. 500:
+    # BurstGPT's heavy-tailed output lengths make 200-request blocks differ by 30 %
+    # by chance alone (no false trigger in 200 two-hour runs at 500).
+    length_window: int = 500
     drift_min_samples: int = 200
     drain_timeout_s: float = 30.0
     # False: no experiment after the first publish (no recheck, drift relocation or
@@ -121,12 +128,11 @@ class CanaryScheduler:
             return None
         if self.controller.settings.solver and self.controller.tiers.model_json() is None:
             return "full", "no_model"
-        if self._reference is not None and not self.lengths.using_default:
-            if self.lengths.summary().shifted(self._reference, self.s.length_shift):
-                # Without the solver there is no plan to verify: measure H, C_H and
-                # the admission knees again with the real lengths (P relocation).
-                kind = "verify" if self.controller.settings.solver else "relocate"
-                return kind, "length_shift"
+        if self._reference is not None and self._length_shift_settled():
+            # Without the solver there is no plan to verify: measure H, C_H and
+            # the admission knees again with the real lengths (P relocation).
+            kind = "verify" if self.controller.settings.solver else "relocate"
+            return kind, "length_shift"
         if self._unverified() is not None:
             return "verify", "plan"
         outcomes = self.controller.router.outcomes
@@ -142,6 +148,18 @@ class CanaryScheduler:
         if self._clock() - last >= self.s.periodic_s:
             return "recheck", "periodic"
         return None
+
+    def _length_shift_settled(self) -> bool:
+        assert self._reference is not None
+        w, threshold = self.s.length_window, self.s.length_shift
+        latest, before = self.lengths.recent(w), self.lengths.recent(w, skip=w)
+        if latest is None or before is None:
+            return False
+        return (
+            latest.shifted(self._reference, threshold)
+            and before.shifted(self._reference, threshold)
+            and not latest.shifted(before, threshold)
+        )
 
     def may_start(self) -> tuple[bool, str]:
         if self.controller.mode != "energy":
@@ -280,6 +298,8 @@ class CanaryScheduler:
         assert self._pending is not None
         kind, reason = self._pending
         self._pending = None
+        if reason == "length_shift":
+            self.lengths.keep_last(2 * self.s.length_window)  # the new mix only
         canary.state = GroupState.EXPLORING
         self.kind, self.reason = kind, reason
         self._started_at = self._clock()
@@ -321,7 +341,9 @@ class CanaryScheduler:
             self._reference = summary
             return "verified" if ok else "verification_failed"
         new = await self._locate(kind, reason, table)
-        await self._adopt(new, summary, reason)
+        # A recheck tests H's neighbours, not C_H: the lengths it ran with are not a
+        # calibration, so a pending length shift still triggers a relocation.
+        await self._adopt(new, None if kind == "recheck" else summary, reason)
         return "published"
 
     async def _locate(self, kind: str, reason: str, table: Any) -> Any:
@@ -338,9 +360,12 @@ class CanaryScheduler:
             previous=table if kind == "relocate" else None,
         )
 
-    async def _adopt(self, new: Any, summary: LengthSummary, reason: str) -> None:
+    async def _adopt(self, new: Any, summary: LengthSummary | None, reason: str) -> None:
+        """Publish `new`; `summary`: the lengths it was calibrated with (None: keep the
+        reference)."""
         controller = self.controller
-        self._reference = summary
+        if summary is not None:
+            self._reference = summary
         controller.router.outcomes.clear()
         await controller.publish(new, reason)
         self.verified = {}

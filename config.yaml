@@ -241,6 +241,9 @@ canary:
   periodic_s: 1800            # neighbour check of H
   length_shift: 0.30          # mean/p90 change (prompt or output) since the last calibration
                               # that triggers a P relocation (solver on: a verification)
+  length_window: 500          # ... once settled: the latest two blocks of 500 requests both
+                              # differ and agree with each other; the experiment then uses
+                              # those 1000 only
   drift_min_samples: 200
   drain_timeout_s: 30
   recalibrate: true           # false: no experiment after the first publish (evaluation runs

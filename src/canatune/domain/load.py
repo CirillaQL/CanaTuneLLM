@@ -4,7 +4,9 @@ The Router records (prompt tokens, generated tokens) of every finished
 production request. The Canary draws probe lengths from these pairs (joint, so
 the prompt/output correlation is kept) instead of copying requests, and a
 change of the mean or p90 against the distribution used for the last
-calibration triggers a new one.
+calibration triggers a new one once the change has settled (the latest block
+of requests agrees with the block before it), and the old requests are then
+dropped so the new calibration sees only the new mix.
 """
 
 import random
@@ -103,15 +105,33 @@ class LengthStats:
         return sum(p for p, _ in pairs) / len(pairs)
 
     def summary(self) -> LengthSummary:
-        pairs = self.pairs()
-        prompts = [p for p, _ in pairs]
-        outputs = [o for _, o in pairs]
-        return LengthSummary(
-            samples=len(pairs),
-            prompt_p50=_quantile(prompts, 0.5),
-            prompt_p90=_quantile(prompts, 0.9),
-            output_p50=_quantile(outputs, 0.5),
-            output_p90=_quantile(outputs, 0.9),
-            prompt_mean=sum(prompts) / len(prompts),
-            output_mean=sum(outputs) / len(outputs),
-        )
+        return _summarize(self.pairs())
+
+    def recent(self, n: int, skip: int = 0) -> LengthSummary | None:
+        """Summary of the `n` real pairs before the latest `skip`; None while fewer
+        than n + skip real requests have finished."""
+        with self._lock:
+            real = list(self._pairs)
+        if n < 1 or len(real) < n + skip:
+            return None
+        return _summarize(real[len(real) - skip - n : len(real) - skip])
+
+    def keep_last(self, n: int) -> None:
+        """Drop all but the latest `n` real pairs (they belong to an earlier mix)."""
+        with self._lock:
+            while len(self._pairs) > n:
+                self._pairs.popleft()
+
+
+def _summarize(pairs: Sequence[tuple[int, int]]) -> LengthSummary:
+    prompts = [p for p, _ in pairs]
+    outputs = [o for _, o in pairs]
+    return LengthSummary(
+        samples=len(pairs),
+        prompt_p50=_quantile(prompts, 0.5),
+        prompt_p90=_quantile(prompts, 0.9),
+        output_p50=_quantile(outputs, 0.5),
+        output_p90=_quantile(outputs, 0.9),
+        prompt_mean=sum(prompts) / len(prompts),
+        output_mean=sum(outputs) / len(outputs),
+    )

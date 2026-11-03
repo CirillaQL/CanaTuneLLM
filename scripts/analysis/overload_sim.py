@@ -1020,7 +1020,7 @@ class SimCanary(CanaryScheduler):
         async def done() -> None:
             self.until, self.power_w = None, None
             if new is not None:
-                await self._adopt(new, summary, reason)
+                await self._adopt(new, None if kind == "recheck" else summary, reason)
             await self._finish(kind, reason, outcome, error)
 
         asyncio.run(done())
