@@ -85,6 +85,71 @@ def test_agent_http_api() -> None:
     asyncio.run(run())
 
 
+def test_agent_shutdown_resets_every_gpu() -> None:
+    class Flaky(DryRunBackend):
+        def reset(self, index):
+            if index == 0:
+                raise RuntimeError("sudo: nvidia-smi failed")
+            super().reset(index)
+
+    backend = Flaky([0, 1])
+    app = create_agent_app(ClockService(backend, [0, 1], [1050]))
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            ClockService(backend, [0, 1], [1050]).lock(1, 1050)
+            assert backend.clocks[1] == 1050
+        assert backend.clocks[1] == 1500  # reset although GPU 0's reset failed
+
+    asyncio.run(run())
+
+
+def test_agent_resets_clocks_on_sigterm(tmp_path) -> None:
+    # Regression: uvicorn re-raises SIGTERM after its graceful shutdown, so a reset
+    # placed after uvicorn.run() never ran and clocks stayed locked (job 10641757).
+    import os
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import time
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    resets = tmp_path / "resets"
+    script = tmp_path / "agent.py"
+    script.write_text(
+        "import sys, uvicorn\n"
+        "from canatune.infrastructure.gpu_agent import ClockService, DryRunBackend,"
+        " create_agent_app\n"
+        "class Recording(DryRunBackend):\n"
+        "    def reset(self, index):\n"
+        "        with open(sys.argv[1], 'a') as f:\n"
+        "            f.write(f'{index}\\n')\n"
+        "service = ClockService(Recording([0, 1]), [0, 1])\n"
+        "uvicorn.run(create_agent_app(service), host='127.0.0.1', port=int(sys.argv[2]),"
+        " log_level='warning')\n"
+    )
+    agent = subprocess.Popen([sys.executable, str(script), str(resets), str(port)])
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                if httpx.get(f"http://127.0.0.1:{port}/health", timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            assert agent.poll() is None and time.monotonic() < deadline, "agent did not start"
+            time.sleep(0.1)
+        os.kill(agent.pid, signal.SIGTERM)
+        agent.wait(timeout=30)
+    finally:
+        if agent.poll() is None:
+            agent.kill()
+    assert resets.read_text().split() == ["0", "1"]
+
+
 def test_agent_allows_supported_clocks_above_min_and_lists_them() -> None:
     backend = DryRunBackend([0], supported=range(210, 2521, 15))
     service = ClockService(backend, [0], min_mhz=600)

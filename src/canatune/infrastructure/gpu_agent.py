@@ -23,7 +23,8 @@ import os
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -256,8 +257,27 @@ def net_counters(root: str = "/sys/class/net") -> dict[str, dict[str, int]]:
     return out
 
 
+def reset_all(service: ClockService) -> None:
+    """Reset every managed GPU; one failing GPU does not stop the others."""
+    for gpu in sorted(service.gpus):
+        try:
+            service.reset(gpu)
+        except Exception:
+            pass
+
+
 def create_agent_app(service: ClockService, net_root: str = "/sys/class/net") -> FastAPI:
-    app = FastAPI(title="CanaTune GPU agent")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            # Never leave clocks locked after the job. This runs inside uvicorn's
+            # graceful shutdown; code after uvicorn.run() does not run on SIGTERM,
+            # because uvicorn (>= 0.29) re-raises the signal once it has shut down.
+            await asyncio.to_thread(reset_all, service)
+
+    app = FastAPI(title="CanaTune GPU agent", lifespan=lifespan)
 
     @app.get("/net")
     async def net() -> dict[str, Any]:
@@ -327,12 +347,9 @@ def main() -> None:
             access_log=False,  # the controller polls /gpus every second
         )
     finally:
-        # Never leave clocks locked after the job: reset every managed GPU.
-        for gpu in sorted(service.gpus):
-            try:
-                service.reset(gpu)
-            except Exception:
-                pass
+        # Exits that skip the app's shutdown (e.g. the port is taken). On SIGTERM this
+        # is never reached; the lifespan in create_agent_app has reset already.
+        reset_all(service)
 
 
 if __name__ == "__main__":
