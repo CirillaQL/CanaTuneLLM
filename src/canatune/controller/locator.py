@@ -48,6 +48,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
+from canatune.config import NIXL_CONNECTOR, kv_connector
 from canatune.domain.admission import CostBook
 from canatune.domain.calibration import calibrate_admission, fit_plateau_slope
 from canatune.domain.groups import ClockPoint, TierTable
@@ -195,6 +196,12 @@ class LocatorSettings:
     decode_wall_tolerance: float = 0.25  # frequency step only if B* grows >= 25 %
     decode_load_fraction: float = 0.7  # choose the D clock at 0.7 B* (near full load)
     decode_kv_limit: float = 0.90
+    # NixlConnector: vLLM (0.15) keeps requests that wait for their KV pull from P
+    # (WAITING_FOR_REMOTE_KVS) in its waiting queue, so num_requests_waiting > 0 whenever
+    # requests arrive, even on an idle D. A D queue then counts as clean while its KV
+    # use stays below decode_kv_limit (a capacity queue on D fills the KV first).
+    # Default from_config: true for kv_transfer.connector NixlConnector.
+    decode_waiting_includes_kv_pull: bool = False
     decode_window_s: float = 60.0  # closed windows: several requests per worker
     decode_clock_repeats: int = 2  # D clock choice: median J/token of this many windows
     decode_model: str = "length"  # length (alpha + beta X + gamma K) or count (B* search)
@@ -211,6 +218,9 @@ class LocatorSettings:
         raw = dict(config.get("canary", {}).get("locator", {}))
         slo = config["experiment"]["slo"]
         raw.setdefault("theta", config.get("router", {}).get("theta", 0.1))
+        raw.setdefault(
+            "decode_waiting_includes_kv_pull", kv_connector(config) == NIXL_CONNECTOR
+        )
         raw["ttft_slo_ms"] = float(slo["ttft_ms"])
         raw["tpot_slo_ms"] = float(slo["tpot_ms"])
         for key in ("fill_load_fractions", "service_lengths"):
@@ -483,7 +493,18 @@ class TierLocator:
             and w.tpot_p95_ms is not None
             and w.tpot_p95_ms <= self.s.tpot_slo_ms
             and w.decode_preemptions == 0
-            and w.decode_waiting_max == 0
+            and self.decode_queue_free(w)
+        )
+
+    def decode_queue_free(self, w: WindowResult) -> bool:
+        """No requests queued on D for capacity. Under NIXL the waiting gauge also counts
+        requests pulling their KV from P, so there a KV use below decode_kv_limit counts."""
+        if w.decode_waiting_max == 0:
+            return True
+        return (
+            self.s.decode_waiting_includes_kv_pull
+            and w.decode_kv_max is not None
+            and w.decode_kv_max < self.s.decode_kv_limit
         )
 
     # ---- steps ------------------------------------------------------------------------------
@@ -926,7 +947,7 @@ class TierLocator:
             plan[mix] = {"context": context, "concurrency": [max(1, high // 4), high]}
             for c in plan[mix]["concurrency"]:
                 windows.append(await self.closed(point, c, mix=mix))
-        used = [w for w in windows if w.decode_preemptions == 0 and w.decode_waiting_max == 0]
+        used = [w for w in windows if w.decode_preemptions == 0 and self.decode_queue_free(w)]
         points = [p for w in used for p in w.decode_points]
         coef = fit_decode_length(points) if len(points) >= self.s.decode_fit_min_points else None
         if coef is None:

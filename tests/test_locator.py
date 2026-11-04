@@ -671,3 +671,54 @@ def test_length_model_without_d_telemetry_falls_back_to_the_count_model() -> Non
         TierLocator(NoTelemetry(seed=7), settings()).locate(PROMPT, [128, 512, 1024, 2048])
     )
     assert table.decode_length is None and table.decode_max_running > 0
+
+
+class NixlLengthBackend(LengthBackend):
+    """NixlConnector on vLLM 0.15: requests pulling their KV from P sit in D's waiting
+    queue, so num_requests_waiting > 0 in every window; KV use shows the real queue."""
+
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+        w = await super().closed_window(clock, concurrency, seconds, rep, mix)
+        kv = min(1.0, concurrency * self.CONTEXT[mix] / self.KV)
+        waiting = w.decode_waiting_max + 2.0
+        return dataclasses.replace(w, decode_waiting_max=waiting, decode_kv_max=kv)
+
+
+def test_nixl_kv_pulls_in_the_waiting_queue_do_not_make_d_unclean() -> None:
+    nixl = settings(decode_waiting_includes_kv_pull=True)
+    locator = TierLocator(SurrogateBackend(), nixl)
+    window = WindowResult(
+        ClockPoint(1410, 1410), "closed", 8, 60.0, requests=40, tpot_p95_ms=80.0,
+        decode_waiting_max=3.0, decode_kv_max=0.4,
+    )
+    assert locator.decode_clean(window)
+    assert not locator.decode_clean(dataclasses.replace(window, decode_kv_max=0.95))
+    assert not locator.decode_clean(dataclasses.replace(window, decode_kv_max=None))
+    assert not locator.decode_clean(dataclasses.replace(window, decode_preemptions=1.0))
+    # P2pNccl (KV pushed before the request reaches D): any waiting request is a queue
+    assert not TierLocator(SurrogateBackend(), settings()).decode_clean(window)
+
+    table = asyncio.run(
+        TierLocator(NixlLengthBackend(seed=3), nixl).locate(PROMPT, [128, 512, 1024, 2048])
+    )
+    assert table.evidence["decode"]["decode_model"] == "length"
+    assert table.decode_wall and table.decode_max_running == 30
+    # Without the setting the same D is never clean (job 10641935 on Vera)
+    with pytest.raises(LocatorError, match="not clean"):
+        asyncio.run(
+            TierLocator(NixlLengthBackend(seed=3), settings()).locate(
+                PROMPT, [128, 512, 1024, 2048]
+            )
+        )
+
+
+def test_kv_pull_waiting_setting_follows_the_kv_connector() -> None:
+    config = load_config()
+    config.setdefault("kv_transfer", {})["connector"] = "NixlConnector"
+    assert LocatorSettings.from_config(config).decode_waiting_includes_kv_pull
+    config["kv_transfer"]["connector"] = "P2pNcclConnector"
+    assert not LocatorSettings.from_config(config).decode_waiting_includes_kv_pull
+    config.setdefault("canary", {}).setdefault("locator", {})[
+        "decode_waiting_includes_kv_pull"
+    ] = True
+    assert LocatorSettings.from_config(config).decode_waiting_includes_kv_pull

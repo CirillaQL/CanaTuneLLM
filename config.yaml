@@ -252,6 +252,8 @@ canary:
     decode_fit_max_concurrency: 64
     decode_wall_tolerance: 0.25
     decode_kv_limit: 0.90
+    # decode_waiting_includes_kv_pull: default true with NixlConnector (D's waiting queue
+    #   holds KV pulls from P; D counts as queue-free while KV use < decode_kv_limit)
     decode_window_s: 60       # closed windows: several requests per worker (r4 used 20 s)
     decode_clock_repeats: 2   # D clock choice: median J/token of 2 windows
   probe:
