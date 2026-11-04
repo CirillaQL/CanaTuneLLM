@@ -448,8 +448,33 @@ def create_proxy_router(
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
         raise ProxyConfigError("experiment.workload.request_timeout_s must be positive")
     factory = client_factory or (
-        lambda: httpx.AsyncClient(timeout=httpx.Timeout(timeout_s, connect=10), trust_env=False)
+        lambda: httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout_s, connect=10),
+            # No pool cap (a cap would queue requests here, unseen by the Router); idle
+            # connections expire before vLLM's uvicorn drops them (keep-alive 5 s).
+            limits=httpx.Limits(
+                max_connections=None, max_keepalive_connections=512, keepalive_expiry=4.0
+            ),
+            trust_env=False,
+        )
     )
+    # A pooled client per P/D endpoint, kept for the proxy's lifetime. A client per call
+    # built an SSL context (CA bundle) and a new TCP connection each time: ~28 % of the
+    # event loop's CPU at 28 req/s, the loop being the service's throughput limit (Vera
+    # job 10643648). One client for all endpoints then spent ~28 % in httpcore's pool,
+    # which scans every connection of the pool on each request and response (job
+    # 10643722); a pool per endpoint holds only that endpoint's connections.
+    clients: dict[str, httpx.AsyncClient] = {}
+
+    def upstream(endpoint: str) -> httpx.AsyncClient:
+        client = clients.get(endpoint)
+        if client is None or client.is_closed:
+            client = clients[endpoint] = factory()
+        return client
+
+    async def close_upstream() -> None:
+        while clients:
+            await clients.popitem()[1].aclose()
     selector = PairSelector(config)
     record_dir = os.environ.get("CANATUNE_RECORD_DIR")
     baseline_log = JsonlLog(
@@ -590,17 +615,16 @@ def create_proxy_router(
         # Admitted but not yet streaming: a cancellation (client gone, timeout,
         # shutdown) is no HTTPError, so the reservation is released here.
         handed_off = False
-        clients: list[httpx.AsyncClient] = []
+        client = upstream(prefill.name)
         try:
             try:
-                async with factory() as client:
-                    stamps["prefill_sent"] = time.monotonic()
-                    prefill_response = await client.post(
-                        prefill.chat_url if kind == "chat" else prefill.completions_url,
-                        json=prefill_body,
-                        headers=headers,
-                    )
-                    stamps["prefill_done"] = time.monotonic()
+                stamps["prefill_sent"] = time.monotonic()
+                prefill_response = await client.post(
+                    prefill.chat_url if kind == "chat" else prefill.completions_url,
+                    json=prefill_body,
+                    headers=headers,
+                )
+                stamps["prefill_done"] = time.monotonic()
                 if prefill_response.status_code == 200 and ticket is not None:
                     runtime.router.prefill_done(ticket)
                 if prefill_response.status_code != 200:
@@ -622,9 +646,8 @@ def create_proxy_router(
                     {"error": "prefill request failed"}, status_code=502, headers=response_headers
                 )
 
-            client = factory()
-            clients.append(client)
             try:
+                client = upstream(decode.name)
                 decode_call = client.build_request(
                     "POST",
                     decode.chat_url if kind == "chat" else decode.completions_url,
@@ -635,7 +658,6 @@ def create_proxy_router(
                 decode_response = await client.send(decode_call, stream=True)
                 if decode_response.status_code != 200:
                     await decode_response.aclose()
-                    await client.aclose()
                     finish("decode_error", None)
                     return JSONResponse(
                         {"error": f"decode returned HTTP {decode_response.status_code}"},
@@ -646,7 +668,6 @@ def create_proxy_router(
                 if body.get("stream") is True:
                     if "text/event-stream" not in content_type.lower():
                         await decode_response.aclose()
-                        await client.aclose()
                         finish("decode_error", None)
                         return JSONResponse(
                             {"error": "decode did not return an SSE stream"},
@@ -674,7 +695,6 @@ def create_proxy_router(
                                 reporter.flush()  # the last batch, before the outcome
                             finish(status, timer)
                             await decode_response.aclose()
-                            await client.aclose()
 
                     handed_off = True  # stream() finishes the request from here on
                     return StreamingResponse(
@@ -683,12 +703,10 @@ def create_proxy_router(
 
                 result = await decode_response.aread()
                 await decode_response.aclose()
-                await client.aclose()
                 # Non-streaming: TTFT is unknown, so the outcome never enters the risk table.
                 finish("ok", None)
                 return Response(content=result, media_type=content_type, headers=response_headers)
             except httpx.HTTPError:
-                await client.aclose()
                 finish("decode_error", None)
                 return JSONResponse(
                     {"error": "decode request failed"}, status_code=502, headers=response_headers
@@ -696,9 +714,6 @@ def create_proxy_router(
 
         finally:
             if not handed_off:
-                for c in clients:
-                    if not c.is_closed:
-                        await c.aclose()
                 finish("client_disconnected", None)  # no-op once finished
 
     @router.post(path)
@@ -718,8 +733,9 @@ def create_proxy_router(
             """Every pair serves the same model: the first production D that answers."""
             for _, decode_name in selector.production_pairs:
                 try:
-                    async with factory() as client:
-                        response = await client.get(selector.endpoints[decode_name].models_url)
+                    response = await upstream(decode_name).get(
+                        selector.endpoints[decode_name].models_url
+                    )
                 except httpx.HTTPError:
                     continue
                 if response.status_code == 200:
@@ -729,4 +745,5 @@ def create_proxy_router(
                     )
             return JSONResponse({"error": "no decode endpoint answered"}, status_code=502)
 
+    router.close_upstream = close_upstream  # type: ignore[attr-defined]  # app shutdown
     return router

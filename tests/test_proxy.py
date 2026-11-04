@@ -686,6 +686,54 @@ def test_an_error_event_in_the_decode_stream_is_a_decode_error() -> None:
     asyncio.run(run())
 
 
+def test_pooled_upstream_clients_one_per_endpoint_close_at_shutdown() -> None:
+    """A client per P/D call built an SSL context and a TCP connection each time (~28 % of
+    the event loop at 28 req/s on Vera): the proxy keeps one pooled client per endpoint
+    (httpcore scans a whole pool per request) for its lifetime."""
+    config = load_config()
+    config["kv_transfer"]["connector"] = "P2pNcclConnector"
+    config["topology"]["prefill_nodegroup"]["node"] = "127.0.0.1"
+    config["topology"]["decode_nodegroup"]["node"] = "127.0.0.2"
+
+    class SSEStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'data: {"choices":[{"text":"a"}]}\n\ndata: [DONE]\n\n'
+
+    def handler(request):
+        if request.url.port in (8101, 8102, 8103):
+            return httpx.Response(200, json={"choices": []})
+        if json.loads(request.read()).get("stream"):
+            return httpx.Response(
+                200, stream=SSEStream(), headers={"content-type": "text/event-stream"}
+            )
+        return httpx.Response(200, json={"choices": [{"text": "done"}]})
+
+    transport = httpx.MockTransport(handler)
+    made = []
+
+    def factory():
+        made.append(httpx.AsyncClient(transport=transport))
+        return made[-1]
+
+    app = create_app(config, client_factory=factory)
+
+    async def run():
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+            ) as client:
+                for i in range(12):  # round robin over P1/D1..P3/D3, twice over
+                    response = await client.post(
+                        "/v1/completions",
+                        json={"model": "m", "prompt": "hi", "max_tokens": 4, "stream": i % 2 == 0},
+                    )
+                    assert response.status_code == 200
+            assert len(made) == 6 and not any(c.is_closed for c in made)
+        assert all(c.is_closed for c in made)
+
+    asyncio.run(run())
+
+
 class _ReportRouter:
     def __init__(self, period_s):
         self.stream_report_period_s = period_s

@@ -52,6 +52,7 @@ def create_app(
         finally:
             if runtime is not None:
                 await runtime.shutdown()
+            await proxy_router.close_upstream()
 
     app = FastAPI(
         title="CanaTune",
@@ -60,9 +61,8 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.runtime = runtime
-    app.include_router(
-        create_proxy_router(settings, client_factory=client_factory, runtime=runtime)
-    )
+    proxy_router = create_proxy_router(settings, client_factory=client_factory, runtime=runtime)
+    app.include_router(proxy_router)
     if runtime is not None:
         app.include_router(create_control_router(runtime))
     return app
