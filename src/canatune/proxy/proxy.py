@@ -285,6 +285,48 @@ class StreamTimer:
         return (times[-1] - times[0]) * 1000.0 / (len(times) - 1)
 
 
+class StreamReporter:
+    """A production stream's tokens, reported to the Router in batches: the first
+    token at once (TTFT, the request's decode stage), then the token gaps at most
+    `period_s` apart, a gap of `stall_ms` or more at once, and the rest at the end
+    (flush). The per-token work stays here; the Router sees one call per batch."""
+
+    def __init__(self, router: Any, ticket: Any, timer: StreamTimer,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self.router = router
+        self.ticket = ticket
+        self.timer = timer
+        self.period_s = router.stream_report_period_s
+        settings = router.settings
+        self.stall_ms = settings.tpot_stall_factor * settings.tpot_slo_ms
+        self._clock = clock
+        self._gaps: list[float] = []
+        self._sent_at = float("-inf")
+        self._started = False
+
+    def tokens(self, new_tokens: int) -> None:
+        """`new_tokens` arrived in the chunk just fed to the timer."""
+        times = self.timer.token_times
+        if not self._started:
+            self._started = True
+            self.router.first_token(self.ticket)
+        if len(times) > new_tokens:
+            # One sample per chunk: its tokens' mean spacing. Recent spacing responds
+            # to changed clocks/load; a whole-request average retains old delays.
+            self._gaps.append((times[-1] - times[-new_tokens - 1]) * 1000 / new_tokens)
+        now = self._clock()
+        if (now - self._sent_at >= self.period_s
+                or (self._gaps and self._gaps[-1] >= self.stall_ms)):
+            self.flush(now)
+
+    def flush(self, now: float | None = None) -> None:
+        if not self._started:
+            return
+        self._sent_at = self._clock() if now is None else now
+        gaps, self._gaps = self._gaps, []
+        self.router.stream_report(self.ticket, gaps)
+
+
 def load_tokenizer(config: Mapping[str, Any]) -> Any:
     """HF tokenizer of the served model (router.tokenizer, CANATUNE_TOKENIZER or
     MODEL_PATH); None when unavailable: text prompts are then estimated and never
@@ -613,27 +655,23 @@ def create_proxy_router(
                         )
 
                     timer = StreamTimer()
+                    reporter = (None if ticket is None
+                                else StreamReporter(runtime.router, ticket, timer))
 
                     async def stream() -> AsyncIterator[bytes]:
                         status = "client_disconnected"
                         try:
                             async for chunk in decode_response.aiter_raw():
                                 new_tokens = timer.feed(chunk)
-                                if new_tokens and ticket is not None:
-                                    runtime.router.first_token(ticket)
-                                    times = timer.token_times
-                                    # Recent spacing responds to changed clocks/load;
-                                    # a whole-request average retains pre-expansion delays.
-                                    recent_tpot = (
-                                        (times[-1] - times[-new_tokens - 1]) * 1000 / new_tokens
-                                        if len(times) > new_tokens else None
-                                    )
-                                    runtime.router.token_progress(ticket, recent_tpot)
+                                if new_tokens and reporter is not None:
+                                    reporter.tokens(new_tokens)
                                 yield chunk
                             status = "ok" if timer.error is None else "decode_error"
                         except httpx.HTTPError:
                             status = "decode_error"
                         finally:
+                            if reporter is not None:
+                                reporter.flush()  # the last batch, before the outcome
                             finish(status, timer)
                             await decode_response.aclose()
                             await client.aclose()

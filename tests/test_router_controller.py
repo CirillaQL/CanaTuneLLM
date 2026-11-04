@@ -1458,3 +1458,91 @@ def test_window_feedback_drops_completion_tpot():
                   output_tokens=64)
     f = router.production_feedback(10, 1, 0.9)
     assert f["samples"] == 1 and not f["pressure"]
+
+
+def test_batched_stream_reports_give_the_feedback_of_per_token_reports():
+    # the proxy batches a stream's gaps (stream_report): the window, the samples and
+    # the stall see what one report per token gave
+    slo = 200.0
+    gaps = [0.5 * slo] * 15 + [1.1 * slo] * 5
+    results = []
+    for batch in (1, 4):
+        clock, _, groups, _, router, _, _ = window_setup()
+        activate(groups[1:2])
+        ticket = router.try_admit(128, True)
+        router.first_token(ticket)
+        router.stream_report(ticket)
+        for i in range(0, len(gaps), batch):
+            clock.now += sum(gaps[i:i + batch]) / 1000
+            router.stream_report(ticket, gaps[i:i + batch])
+        clock.now += 0.5
+        f = router.production_feedback(10, 1, 0.9)
+        results.append((f["samples"], f["tpot_window_ratio"], f["stall_ratio"]))
+    assert results[0] == results[1] and results[0][1] >= 1
+
+
+def test_stream_reports_compute_the_ttft_feedback_once_and_keep_waking_control():
+    clock, _, groups, _, router, _, _ = window_setup()
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    clock.now += 0.95 * router.settings.ttft_slo_ms / 1000  # a late first token
+    router.first_token(ticket)
+    calls = []
+    observe = router.observe_latency
+    router.observe_latency = lambda *a, **k: (calls.append(a), observe(*a, **k))[1]
+    for _ in range(5):
+        router.pressure_event.clear()
+        router.stream_report(ticket, [50.0])
+        assert router.pressure_event.is_set()  # near the SLO: control is woken
+    assert len(calls) == 1
+
+
+def test_a_stall_gap_wakes_control_and_reports_after_finish_are_ignored():
+    _, _, groups, _, router, _, _ = window_setup()
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    router.stream_report(ticket)
+    router.pressure_event.clear()
+    stall = router.settings.tpot_stall_factor * router.settings.tpot_slo_ms
+    router.stream_report(ticket, [10.0, stall])
+    assert router.pressure_event.is_set()
+    router.finish(ticket, status="client_disconnected", ttft_ms=None, tpot_ms=None, output_tokens=0)
+    router.stream_report(ticket, [10.0])
+    assert not router._live and not router._production
+
+
+def test_gap_feedback_reports_every_token():
+    *_, router, _, _ = setup(table=published(), admission="slack", overload="best_effort",
+                             router={"tpot_feedback": "gap"})
+    assert router.stream_report_period_s == 0.0
+    *_, router, _, _ = window_setup(stream_report_s=0.25)
+    assert router.stream_report_period_s == 0.25
+
+
+def test_window_quantile_matches_the_full_sort():
+    import math
+    import random
+
+    from canatune.controller.router import window_quantile
+
+    rng = random.Random(7)
+    for n in (1, 2, 19, 20, 50, 1000, 7001):
+        gaps = [(i, rng.expovariate(1 / 30)) for i in range(n)]
+        for q in (0.5, 0.9, 0.95, 0.99, 1.0):
+            ordered = sorted(ms for _, ms in gaps)
+            assert window_quantile(gaps, q) == ordered[min(n - 1, math.ceil(q * n) - 1)]
+
+
+def test_tpot_window_is_recomputed_at_most_once_per_period():
+    clock, _, groups, _, router, _, _ = window_setup(tpot_window_period_s=0.25)
+    activate(groups)
+    ticket = router.try_admit(128, True)
+    router.first_token(ticket)
+    slo = router.settings.tpot_slo_ms
+    stream(router, clock, ticket, [0.5 * slo] * 20)
+    healthy = router.tpot_window()
+    router.stream_report(ticket, [2 * slo] * 20)
+    assert router.tpot_window() == healthy  # inside the period: the cached value
+    clock.now += 0.25
+    assert router.tpot_window()[0] >= 1  # recomputed with the slow gaps

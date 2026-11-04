@@ -2,12 +2,14 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from canatune.app import create_app
 from canatune.config import load_config
+from canatune.proxy.proxy import StreamReporter, StreamTimer
 
 # NixlConnector: P names the blocks D reads (vLLM's kv_transfer_params).
 KV_PARAMS = {
@@ -682,3 +684,59 @@ def test_an_error_event_in_the_decode_stream_is_a_decode_error() -> None:
         await asyncio.gather(*runtime.tasks, return_exceptions=True)
 
     asyncio.run(run())
+
+
+class _ReportRouter:
+    def __init__(self, period_s):
+        self.stream_report_period_s = period_s
+        self.settings = SimpleNamespace(tpot_stall_factor=5.0, tpot_slo_ms=200.0)
+        self.calls = []
+
+    def first_token(self, ticket):
+        self.calls.append("first")
+
+    def stream_report(self, ticket, gaps):
+        self.calls.append(list(gaps))
+
+
+def _token(text="a"):
+    return ("data: " + json.dumps({"choices": [{"index": 0, "text": text}]}) + "\n\n").encode()
+
+
+def test_stream_reporter_batches_gaps_and_sends_first_token_stalls_and_end_at_once():
+    now = [0.0]
+    timer = StreamTimer(clock=lambda: now[0])
+    router = _ReportRouter(0.1)
+    reporter = StreamReporter(router, object(), timer, clock=lambda: now[0])
+
+    def chunk(after_s, n=1):
+        now[0] += after_s
+        reporter.tokens(timer.feed(_token() * n))
+
+    chunk(0.0)  # first token: at once
+    assert router.calls == ["first", []]
+    for _ in range(4):  # 4 x 20 ms: inside one period
+        chunk(0.02)
+    assert router.calls == ["first", []]
+    chunk(0.03)  # 110 ms since the last report
+    assert router.calls[-1] == pytest.approx([20.0] * 4 + [30.0])
+    chunk(0.02)
+    chunk(1.2)  # a stall gap (>= 5 x 200 ms): at once
+    assert router.calls[-1] == pytest.approx([20.0, 1200.0])
+    chunk(0.02, n=2)  # two tokens in one chunk: one sample, their mean spacing
+    reporter.flush()
+    assert router.calls[-1] == pytest.approx([10.0])
+    assert router.calls.count("first") == 1
+
+
+def test_stream_reporter_reports_every_chunk_with_period_zero_and_nothing_before_a_token():
+    now = [0.0]
+    timer = StreamTimer(clock=lambda: now[0])
+    router = _ReportRouter(0.0)
+    reporter = StreamReporter(router, object(), timer, clock=lambda: now[0])
+    reporter.flush()  # no token yet: nothing to report
+    assert router.calls == []
+    for _ in range(3):
+        now[0] += 0.01
+        reporter.tokens(timer.feed(_token()))
+    assert router.calls == ["first", [], pytest.approx([10.0]), pytest.approx([10.0])]

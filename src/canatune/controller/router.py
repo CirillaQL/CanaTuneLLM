@@ -42,6 +42,7 @@ never both see the same free slot.
 """
 
 import asyncio
+import heapq
 import itertools
 import math
 import os
@@ -139,6 +140,16 @@ class RouterSettings:
     tpot_window_quantile: float = 0.95
     tpot_window_min_gaps: int = 50
     tpot_stall_factor: float = 5.0
+    # The proxy reports a stream's token gaps in batches (stream_report), at most this
+    # far apart (window feedback; gap feedback reports every token). Per-token calls
+    # into the Router made the token relay the service's CPU bound; a batch only delays
+    # the window by this much and a stall's last-token time by at most this much. The
+    # first token, a gap of tpot_stall_factor x the SLO and the stream's end are
+    # reported at once.
+    stream_report_s: float = 0.1
+    # The window quantile is recomputed at most this often (Controller ticks come every
+    # 0.1 s under pressure; a window holds thousands of gaps per D at high load).
+    tpot_window_period_s: float = 0.25
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "RouterSettings":
@@ -184,7 +195,25 @@ class RouterSettings:
             tpot_window_quantile=_fraction(raw, "tpot_window_quantile", 0.95),
             tpot_window_min_gaps=int(_positive(raw, "tpot_window_min_gaps", 50)),
             tpot_stall_factor=_positive(raw, "tpot_stall_factor", 5.0),
+            stream_report_s=_non_negative(raw, "stream_report_s", 0.1),
+            tpot_window_period_s=_non_negative(raw, "tpot_window_period_s", 0.25),
         )
+
+
+def window_quantile(gaps: Sequence[tuple[float, float]], quantile: float) -> float:
+    """The `quantile` of the gaps' values (the ceil(q n)-th smallest, as a full sort
+    would give): only the top n - that rank + 1 values are selected (heapq), since a
+    window holds thousands of gaps per D at high load and is read every tick."""
+    n = len(gaps)
+    rank = min(n - 1, math.ceil(quantile * n) - 1)
+    return heapq.nlargest(n - rank, (ms for _, ms in gaps))[-1]
+
+
+def _non_negative(raw: Mapping[str, Any], key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise RouterConfigError(f"router.{key} must be >= 0")
+    return float(value)
 
 
 def _fraction(raw: Mapping[str, Any], key: str, default: float) -> float:
@@ -380,6 +409,8 @@ class CanaTuneRouter:
         self.cooled: dict[str, float] = {}  # fill: group -> clock time until it has no room
         # window TPOT feedback: recent token gaps (time, ms) per D
         self._gaps: dict[str, deque[tuple[float, float]]] = {}
+        self._tpot_window_at = float("-inf")
+        self._tpot_window_value: tuple[float, str | None] = (0.0, None)
 
     def signal_pressure(self, reason: str) -> None:
         """Wake control immediately; this signal never changes GPU clocks here."""
@@ -1133,37 +1164,64 @@ class CanaTuneRouter:
             self.pressure_event.set()  # feedback wakes control without becoming a prediction
 
     def token_progress(self, ticket: Ticket, tpot_ms: float | None) -> None:
-        now = ticket.last_token_at = self._clock()
-        ttft = ((ticket.first_token_at - ticket.admitted_at) * 1000 + ticket.wait_ms
-                if ticket.first_token_at is not None else None)
-        if self.settings.tpot_feedback == "gap":
-            self.observe_latency(ticket, ttft, tpot_ms)
+        """One token's report (tpot_ms: its gap, None for the first)."""
+        self.stream_report(ticket, () if tpot_ms is None else (tpot_ms,))
+
+    @property
+    def stream_report_period_s(self) -> float:
+        """How far apart the proxy may batch a stream's reports (0: every token)."""
+        s = self.settings
+        return 0.0 if s.tpot_feedback == "gap" else s.stream_report_s
+
+    def stream_report(self, ticket: Ticket, gaps_ms: Sequence[float] = ()) -> None:
+        """A stream's tokens since its last report: `gaps_ms` their spacings (ms). The
+        stream was live at this call (the last-token time). Its TTFT feedback is fixed
+        at the first token, so it is computed once; later reports only re-wake control
+        while that feedback stays near the SLO (as a per-token report did)."""
+        if ticket.finished:
             return
-        # window: the gap joins its D's window (TPOT feedback is the windows' quantile)
-        if tpot_ms is not None:
+        now = ticket.last_token_at = self._clock()
+        if self.settings.tpot_feedback == "gap":
+            latest = gaps_ms[-1] if gaps_ms else None
+            self.observe_latency(ticket, self._ticket_ttft(ticket), latest)
+            return
+        # window: the gaps join their D's window (TPOT feedback is the windows' quantile)
+        if gaps_ms:
             gaps = self._gaps.setdefault(ticket.dgroup.name, deque())
-            gaps.append((now, tpot_ms))
+            gaps.extend((now, ms) for ms in gaps_ms)
             while gaps and gaps[0][0] < now - self.settings.tpot_window_s:
                 gaps.popleft()
-            if tpot_ms >= self.settings.tpot_stall_factor * self.settings.tpot_slo_ms:
+            if max(gaps_ms) >= self.settings.tpot_stall_factor * self.settings.tpot_slo_ms:
                 self.pressure_event.set()
-        self.observe_latency(ticket, ttft, None)
+        seen = self._production.get(ticket.id)
+        if seen is None:
+            self.observe_latency(ticket, self._ticket_ttft(ticket), None)
+        elif self.settings.overload == "best_effort" and max(seen[1], seen[3]) >= 0.9:
+            self.pressure_event.set()
+
+    @staticmethod
+    def _ticket_ttft(ticket: Ticket) -> float | None:
+        if ticket.first_token_at is None:
+            return None
+        return (ticket.first_token_at - ticket.admitted_at) * 1000 + ticket.wait_ms
 
     def tpot_window(self) -> tuple[float, str | None]:
         """-> (the largest windowed gap quantile over the TPOT SLO, its D group); D
         groups with fewer than tpot_window_min_gaps recent gaps do not count."""
         s = self.settings
         now = self._clock()
+        if 0 <= now - self._tpot_window_at < s.tpot_window_period_s:
+            return self._tpot_window_value
         worst, where = 0.0, None
         for name, gaps in self._gaps.items():
             while gaps and gaps[0][0] < now - s.tpot_window_s:
                 gaps.popleft()
             if len(gaps) < s.tpot_window_min_gaps:
                 continue
-            ordered = sorted(ms for _, ms in gaps)
-            q = ordered[min(len(ordered) - 1, math.ceil(s.tpot_window_quantile * len(ordered)) - 1)]
+            q = window_quantile(gaps, s.tpot_window_quantile)
             if q / s.tpot_slo_ms > worst:
                 worst, where = q / s.tpot_slo_ms, name
+        self._tpot_window_at, self._tpot_window_value = now, (worst, where)
         return worst, where
 
     def production_feedback(

@@ -161,6 +161,9 @@ router:
   tpot_window_quantile: 0.95
   tpot_window_min_gaps: 50
   tpot_stall_factor: 5
+  stream_report_s: 0.1        # the proxy batches a stream's token gaps this far apart
+                              # (first token, stall gaps and the stream's end at once)
+  tpot_window_period_s: 0.25  # the window quantile is recomputed at most this often
 
 telemetry:
   enabled: true
