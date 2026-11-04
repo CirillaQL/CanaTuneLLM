@@ -1056,10 +1056,11 @@ class CanaTuneRouter:
         except ValueError:
             pass
 
-    async def admit(self, tokens: int, exact: bool) -> Ticket | None:
+    async def admit(self, tokens: int, exact: bool, *, streaming: bool = True) -> Ticket | None:
         """Admit now, or retry until the wait budget is spent, then reject (or, in
         serve mode, overflow / hold). The budget runs on real time because the
-        retries really sleep."""
+        retries really sleep. `streaming`: the response is an SSE stream (its first
+        token is observed)."""
         start = time.monotonic()
         retry_s = self.settings.retry_period_ms / 1000.0
         waiter = self.new_waiter()
@@ -1068,6 +1069,7 @@ class CanaTuneRouter:
                 waited_ms = (time.monotonic() - start) * 1000.0
                 result = self.step(waiter, tokens, exact, waited_ms)
                 if isinstance(result, Ticket):
+                    result.streaming = streaming
                     return result
                 if result == "reject":
                     return None

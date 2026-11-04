@@ -99,6 +99,10 @@ proxy:
   chat_endpoint: /v1/chat/completions   # null disables; P/D receive /v1/chat/completions
   models_endpoint: /v1/models           # null disables; answered by a production D
   diagnostics_log: "${raw_root}/launcher/proxy_diagnostics.jsonl"
+  # Proxy worker processes (CANATUNE_PROXY_WORKERS overrides): 0 = one process serves
+  # everything; N > 0 = a decision process (Router, Controller, Canary) and N processes
+  # relaying the requests (canatune.proxy.workers).
+  workers: 0
 
 routing:
   # round_robin: baseline (production pairs in turn, no admission, no clock control).

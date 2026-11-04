@@ -12,7 +12,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -423,13 +423,20 @@ def stage_ms(arrived: float, stamps: Mapping[str, float]) -> dict[str, float | N
 def create_proxy_router(
     config: Mapping[str, Any],
     client_factory: Callable[[], httpx.AsyncClient] | None = None,
-    runtime: "Runtime | None" = None,
+    runtime: "Runtime | Any | None" = None,
+    *,
+    choose_production: Callable[[], Awaitable[tuple[str, str]]] | None = None,
+    request_log: Any = None,
 ) -> APIRouter:
     """Build a completions endpoint from configured P/D pairs.
 
     With a `runtime` (routing policy `cantune`) each request goes through risk-based
     admission; otherwise production pairs are used round robin. Both paths log one
     record per request when `CANATUNE_RECORD_DIR` is set.
+
+    A proxy worker process (canatune.proxy.workers) passes a runtime whose router
+    lives in the decision process; for the baseline, `choose_production` (the
+    decision process's round robin: P and D names) and `request_log` (its record).
     """
     proxy = _mapping(config.get("proxy"), "proxy")
     if proxy.get("enabled") is not True:
@@ -477,7 +484,7 @@ def create_proxy_router(
             await clients.popitem()[1].aclose()
     selector = PairSelector(config)
     record_dir = os.environ.get("CANATUNE_RECORD_DIR")
-    baseline_log = JsonlLog(
+    baseline_log = request_log or JsonlLog(
         None
         if runtime is not None or not record_dir
         else os.path.join(record_dir, "requests.jsonl")
@@ -537,7 +544,8 @@ def create_proxy_router(
 
         ticket = None
         if runtime is not None and route == "production":
-            ticket = await runtime.router.admit(tokens, exact)
+            streaming = body.get("stream") is True
+            ticket = await runtime.router.admit(tokens, exact, streaming=streaming)
             if ticket is None:
                 return JSONResponse(
                     {"error": (
@@ -548,13 +556,16 @@ def create_proxy_router(
                     status_code=503,
                     headers={"X-CanaTune-Rejected": "1"},
                 )
-            ticket.streaming = body.get("stream") is True
             stamps["admitted"] = time.monotonic()
             prefill = selector.endpoints[ticket.group.prefill]
             decode = selector.endpoints[ticket.dgroup.decode]
         else:
             # Explicit Canary probes bypass admission: they are experiments.
-            prefill, decode = await selector.choose(canary=route == "canary")
+            if route == "production" and choose_production is not None:
+                p_name, d_name = await choose_production()
+                prefill, decode = selector.endpoints[p_name], selector.endpoints[d_name]
+            else:
+                prefill, decode = await selector.choose(canary=route == "canary")
         try:
             transport_id = pd_transport_id(request.headers.get("X-Request-Id"), prefill, decode)
         except ValueError as error:

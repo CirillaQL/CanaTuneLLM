@@ -11,6 +11,12 @@ def main() -> None:
     """Run the configured ASGI server."""
     config = load_config(os.environ.get("CANATUNE_CONFIG", "config.yaml"))
     proxy = config["proxy"]
+    from canatune.proxy.workers import proxy_workers, run_decision
+
+    workers = proxy_workers(config)
+    if workers > 0:  # the decision process; N processes relay the requests
+        run_decision(config, workers)
+        return
     uvicorn.run(
         "canatune.app:create_app",
         factory=True,

@@ -13,35 +13,45 @@ from canatune.config import load_config
 from canatune.proxy.proxy import create_proxy_router, parse_endpoints
 
 
+def build_service_runtime(
+    settings: Mapping[str, Any],
+    client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    runtime_factory: Callable[..., Any] | None = None,
+) -> Any:
+    """The `cantune` policy's Runtime (Router, Controller, Canary, telemetry); None
+    for `round_robin`."""
+    policy = settings.get("routing", {}).get("policy", "round_robin")
+    if policy not in ("round_robin", "cantune"):
+        raise ValueError("routing.policy must be round_robin or cantune")
+    if policy != "cantune":
+        return None
+    from canatune.service import build_runtime
+
+    factory = client_factory or (
+        lambda: httpx.AsyncClient(timeout=httpx.Timeout(5, connect=2), trust_env=False)
+    )
+    metrics_urls = {
+        name: f"http://{e.http_host}:{e.http_port}/metrics"
+        for name, e in parse_endpoints(settings).items()
+    }
+    return (runtime_factory or build_runtime)(settings, metrics_urls, factory)
+
+
 def create_app(
     config: Mapping[str, Any] | None = None,
     client_factory: Callable[[], httpx.AsyncClient] | None = None,
     runtime_factory: Callable[..., Any] | None = None,
 ) -> FastAPI:
-    """Create the CanaTune ASGI application.
+    """Create the CanaTune ASGI application (one process: proxy, Router, Controller).
 
     `routing.policy` selects `round_robin` (baseline, no clock control) or `cantune`
-    (risk-based admission, tier Controller, telemetry and Canary API).
+    (risk-based admission, tier Controller, telemetry and Canary API). With
+    `proxy.workers` > 0 `python -m canatune` runs canatune.proxy.workers instead.
     """
     settings = config
     if settings is None:
         settings = load_config(os.environ.get("CANATUNE_CONFIG", "config.yaml"))
-    policy = settings.get("routing", {}).get("policy", "round_robin")
-    if policy not in ("round_robin", "cantune"):
-        raise ValueError("routing.policy must be round_robin or cantune")
-
-    runtime = None
-    if policy == "cantune":
-        from canatune.service import build_runtime
-
-        factory = client_factory or (
-            lambda: httpx.AsyncClient(timeout=httpx.Timeout(5, connect=2), trust_env=False)
-        )
-        metrics_urls = {
-            name: f"http://{e.http_host}:{e.http_port}/metrics"
-            for name, e in parse_endpoints(settings).items()
-        }
-        runtime = (runtime_factory or build_runtime)(settings, metrics_urls, factory)
+    runtime = build_service_runtime(settings, client_factory, runtime_factory)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
