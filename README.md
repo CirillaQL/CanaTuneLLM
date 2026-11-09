@@ -99,6 +99,13 @@ model       S(L) per P clock (plateau + slope); residence per length; D iteratio
 Windows are cached, so an aborted run resumes; feasibility is the one-sided 90 %
 Wilson bound of the violation rate <= theta.
 
+Probe windows retain partial TTFT evidence at their cutoff: a missing first token
+already past its SLO counts as a violation (with a latency lower bound, not a
+fabricated exact TTFT). Other unfinished outcomes remain unknown. Truncated
+windows cannot validate a clock or capacity, but known violations still inform
+the measured D congestion knee. `probe_censored` events and the room evidence's
+`d_window` report completed, failed, censored and unknown request counts.
+
 ### Router (`controller/router.py`, per request; never changes clocks)
 
 Per group it tracks, from the proxy's stage events, the pending P work (sum of
@@ -126,6 +133,16 @@ overload      best_effort (default): prediction warns; Production confirms;
 
 Prediction signals are warnings. Actual latency and physical-capacity waits
 confirm pressure before resources increase.
+
+For `router.group_choice: room`, an absent/null measured `d_sequences` falls back
+to `runtime.decode_max_num_seqs`; a measured limit is also capped by that engine
+limit. This defaults to **256**, matching vLLM 0.15.1's A100 API-server default.
+The Decode launcher passes the same value explicitly as `--max-num-seqs`, so the
+engine and Router agree; set this configuration key to use another limit. The
+`room_limits` event distinguishes the measured value from the effective fallback.
+Old tier tables can retain null measurement evidence without disabling D spilling.
+This governs concentration/spilling, not hard rejection: best-effort still spreads
+requests when every group is full and the existing pressure controller responds.
 
 ### Solver and Controller (`domain/models.py`, `controller/tier_controller.py`)
 

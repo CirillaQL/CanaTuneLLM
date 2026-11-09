@@ -135,7 +135,9 @@ class Physics:
     d_delta_ms: float = 1.41
     d_f_knee: int = 1150  # below it D iterations stretch
     d_kv_tokens: int = 26000
+    d_max_running: int | None = None  # vLLM's sequence limit: more wait for a slot
     d_first_extra_ms: float = 60.0
+    d_first_per_running_ms: float = 0.0  # first-token delay per sequence running on D
     overhead_ms: float = 40.0
     p_clocks: tuple[int, ...] = (1080, 1290, 1545, 1755, 2010, 2265, 2520)
     d_clocks: tuple[int, ...] = (735, 960, 1170, 1395, 1605, 2040)
@@ -290,6 +292,7 @@ class Pair:
     at_p: dict = field(default_factory=dict)  # request id -> prompt (dispatch .. P done)
     inflight_tokens: int = 0  # P done .. first token
     decoding: int = 0
+    awaiting: int = 0  # dispatched, no first token yet (the router's and the probe's count)
     p_busy_s: float = 0.0
     d_busy_s: float = 0.0
     d_running_integral: float = 0.0  # running sequences x seconds (mean while busy)
@@ -498,7 +501,9 @@ class Sim:
     def dispatch(self, r: Req, pair: Pair, d_pair: Pair | None = None) -> None:
         r.pair = pair
         r.d_pair = pair if d_pair is None else d_pair
-        r.state = (tuple(pair.at_p.values()), pair.inflight_tokens, r.d_pair.decoding)
+        r.state = (tuple(pair.at_p.values()), pair.inflight_tokens, r.d_pair.decoding,
+                   r.d_pair.awaiting)  # fmt: skip
+        r.d_pair.awaiting += 1
         pair.at_p[r.id] = r.prompt
         delay = self.overhead_ms
         if self.phys.overhead_jitter_ms and self.overhead_ms > 0:
@@ -581,7 +586,10 @@ class Sim:
             def need(r):
                 return r.prompt + r.output
 
-        while pair.d_ready and used + need(pair.d_ready[0]) <= limit:
+        slots = self.phys.d_max_running
+        while pair.d_ready and used + need(pair.d_ready[0]) <= limit and (
+            slots is None or len(pair.d_running) + len(joined) < slots
+        ):
             r = pair.d_ready.popleft()
             used += need(r)
             if not r.pulled:
@@ -636,9 +644,12 @@ class Sim:
     def d_end(self, pair: Pair, joined: list) -> None:
         for r in list(pair.d_running):
             if r in joined and r.first is None:
-                r.first = self.now + self.phys.d_first_extra_ms / 1000.0
+                extra_ms = (self.phys.d_first_extra_ms
+                            + self.phys.d_first_per_running_ms * len(pair.d_running))  # fmt: skip
+                r.first = self.now + extra_ms / 1000.0
                 r.pair.inflight_tokens -= r.prompt
                 pair.decoding += 1
+                pair.awaiting -= 1
                 if r.ticket is not None:
                     self.router.first_token(r.ticket)
             elif r.ticket is not None and r.last_token is not None:
@@ -670,7 +681,7 @@ class Sim:
         return (r.done - r.first) * 1000.0 / (r.output - 1) + r.jitter
 
     def probe_sample(self, r: Req) -> ProbeSample:
-        at_p, inflight, decoding = r.state
+        at_p, inflight, decoding, awaiting = r.state
         ttft = None if r.first is None else (r.first - r.at) * 1000.0
         return ProbeSample(
             r.pair.clock.prefill_mhz,
@@ -681,6 +692,7 @@ class Sim:
             decoding,
             ttft,
             None if r.status != "ok" else violated(r),
+            awaiting + decoding,
         )
 
 
@@ -787,11 +799,16 @@ class SimBackend:
     def _mix(self, mix: str) -> list[int]:
         """Prompts of a closed-window mix, as the probe: lower / upper half."""
         prompts = sorted(p for p, _ in self._pairs())
+        if mix == "shortest":
+            return prompts[:1]
         if mix == "short":
             return prompts[: (len(prompts) + 1) // 2]
         if mix == "long":
             return prompts[len(prompts) // 2 :]
         return prompts
+
+    def shortest_prompt(self) -> int:
+        return self._mix("shortest")[0]
 
     def mix_context(self, mix: str = "all") -> float:
         prompts = self._mix(mix)
@@ -879,9 +896,11 @@ class SimBackend:
         return Sim(1, "baseline", clock, phys=self.phys, overhead_ms=self.phys.probe_overhead_ms,
                    seed=self.rng.randrange(10**9))  # fmt: skip
 
-    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, output_tokens=None):
         trace = random.Random(int(eq_tps * 10) + 17 + 1_000_003 * self.salt)
         pairs = self._pairs()
+        if output_tokens is not None:
+            pairs = [(p, output_tokens) for p, _ in pairs]
         mean = sum(p for p, _ in pairs) / len(pairs)
         count = max(1, round(eq_tps / (mean + alpha) * seconds))
         arrivals = [
@@ -892,20 +911,21 @@ class SimBackend:
         s.run(arrivals, seconds)
         return self._result(s, clock, "open", eq_tps)
 
-    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
-        salt = {"all": 0, "short": 1, "long": 2}[mix]
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all",
+                            output_tokens=None, stagger_s=None, drain_s=None):  # fmt: skip
+        salt = {"all": 0, "short": 1, "long": 2, "shortest": 3}[mix]
         trace = random.Random(concurrency * 101 + rep + 1_000_003 * salt + 7_919 * self.salt)
         prompts = self._mix(mix)
         s = self._window_sim(clock)
         ids = iter(range(10**9))
-        stagger = min(15.0, seconds / 3)
+        stagger = min(15.0, seconds / 3) if stagger_s is None else stagger_s
+        output = self.decode_output_tokens if output_tokens is None else output_tokens
 
         def send(worker: int, at: float) -> None:
             if at >= seconds:
                 return
             prompt = prompts[trace.randrange(len(prompts))]
-            out = self.decode_output_tokens
-            s.at(at, s.arrive, Req(next(ids), at, "w", prompt, out, worker=worker))
+            s.at(at, s.arrive, Req(next(ids), at, "w", prompt, output, worker=worker))
 
         s.on_done = lambda r: send(r.worker, s.now)
         for w in range(concurrency):

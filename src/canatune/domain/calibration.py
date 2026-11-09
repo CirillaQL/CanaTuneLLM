@@ -48,6 +48,7 @@ class ProbeSample:
     decoding: int
     ttft_ms: float | None
     violated: bool | None
+    on_decode: int = 0  # requests sent and without a first token + decoding (the router's count)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -59,6 +60,7 @@ class ProbeSample:
             "decoding": self.decoding,
             "ttft_ms": self.ttft_ms,
             "violated": self.violated,
+            "on_decode": self.on_decode,
         }
 
 
@@ -233,6 +235,30 @@ def p_slot_cap(
     for s in samples:
         if s.violated is not None:
             counts.record(p_slot_bin(len(s.at_prefill)), s.violated)
+    b = counts.knee(theta, min_samples)
+    if b is None:
+        return None, "none", counts.to_json()
+    return max(1, b), "measured", counts.to_json()
+
+
+def d_sequence_cap(
+    samples: Sequence[ProbeSample],
+    *,
+    theta: float,
+    p_slot: int | None = None,
+    min_samples: int = 20,
+) -> tuple[int | None, str, dict[str, list[int]]]:
+    """-> (cap, source, bins). A group takes a request while its D holds fewer than
+    `cap` sequences: the knee of the violations by the sequences on D when each was
+    sent, whatever sets it (the engine's sequence limit, or a first token that slows
+    with the sequences until it misses the SLO). Requests sent into a congested P
+    (`p_slot` or more at P) are left out: P is what they measure. None (source "none"):
+    no knee within the sequences reached."""
+    counts = KneeCounts()
+    for s in samples:
+        if s.violated is None or (p_slot is not None and len(s.at_prefill) >= p_slot):
+            continue
+        counts.record(s.on_decode, s.violated)
     b = counts.knee(theta, min_samples)
     if b is None:
         return None, "none", counts.to_json()

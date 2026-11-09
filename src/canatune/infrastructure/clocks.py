@@ -18,6 +18,8 @@ class GpuRef:
 class ClockActuator(Protocol):
     async def lock(self, ref: GpuRef, mhz: int) -> dict[str, Any]: ...
 
+    async def reset(self, ref: GpuRef) -> dict[str, Any]: ...
+
     async def readings(self, agent_url: str) -> list[dict[str, Any]]: ...
 
     async def supported_clocks(self, ref: GpuRef) -> list[int]: ...
@@ -30,6 +32,12 @@ class AgentClockActuator:
     async def lock(self, ref: GpuRef, mhz: int) -> dict[str, Any]:
         async with self._client_factory() as client:
             response = await client.post(f"{ref.agent_url}/gpus/{ref.gpu}/lock", json={"mhz": mhz})
+            response.raise_for_status()
+            return response.json()
+
+    async def reset(self, ref: GpuRef) -> dict[str, Any]:
+        async with self._client_factory() as client:
+            response = await client.post(f"{ref.agent_url}/gpus/{ref.gpu}/reset")
             response.raise_for_status()
             return response.json()
 
@@ -52,10 +60,15 @@ class NullClockActuator:
 
     def __init__(self) -> None:
         self.calls: list[tuple[GpuRef, int]] = []
+        self.resets: list[GpuRef] = []
 
     async def lock(self, ref: GpuRef, mhz: int) -> dict[str, Any]:
         self.calls.append((ref, mhz))
         return {"ok": True, "gpu": ref.gpu, "target_mhz": mhz, "reach_ms": 0.0, "sm_mhz": mhz}
+
+    async def reset(self, ref: GpuRef) -> dict[str, Any]:
+        self.resets.append(ref)
+        return {"ok": True, "gpu": ref.gpu}
 
     async def readings(self, agent_url: str) -> list[dict[str, Any]]:
         return []

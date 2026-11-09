@@ -9,6 +9,7 @@ import pytest
 from canatune.config import load_config
 from canatune.controller.router import CanaTuneRouter, RouterSettings, prompt_tokens
 from canatune.controller.tier_controller import ControllerSettings, TierController
+from canatune.domain.calibration import ProbeSample, d_sequence_cap
 from canatune.domain.groups import (
     ClockPoint,
     Group,
@@ -739,6 +740,39 @@ def test_router_pressure_wakes_controller_before_period():
         stop.set()
         await asyncio.wait_for(task, 1)
         assert controller.mode == "warning" and not router.full_effort
+    asyncio.run(run())
+
+
+def test_constant_pressure_keeps_controller_ticks_min_tick_apart():
+    """In overload every streamed token sets the pressure event: control still wakes
+    early, but ticks stay min_tick_s apart instead of running back to back."""
+    async def run():
+        _, _, groups, _, router, controller, _ = setup(
+            table=published(), admission="slack", overload="best_effort"
+        )
+        activate(groups)
+        controller.settings = dataclasses.replace(controller.settings, period_s=30, min_tick_s=0.1)
+        ticks = []
+
+        async def tick():
+            ticks.append(asyncio.get_running_loop().time())
+
+        controller.tick = tick
+        stop = asyncio.Event()
+
+        async def tokens():
+            while not stop.is_set():
+                router.pressure_event.set()
+                await asyncio.sleep(0.001)
+
+        feeder = asyncio.create_task(tokens())
+        task = asyncio.create_task(controller.run(stop))
+        await asyncio.sleep(0.55)
+        stop.set()
+        await asyncio.wait_for(task, 1)
+        await feeder
+        assert 4 <= len(ticks) <= 7  # woken early (period 30 s), at most one per 0.1 s
+        assert min(b - a for a, b in zip(ticks, ticks[1:])) >= 0.095
     asyncio.run(run())
 
 
@@ -1546,3 +1580,181 @@ def test_tpot_window_is_recomputed_at_most_once_per_period():
     assert router.tpot_window() == healthy  # inside the period: the cached value
     clock.now += 0.25
     assert router.tpot_window()[0] >= 1  # recomputed with the slow gaps
+
+
+def room_setup(d_sequences=None, p_rho=None, **router):
+    table = published()
+    table.evidence["room"] = {"p_rho": p_rho, "d_sequences": d_sequences}
+    clock, _, groups, _, r, controller, _ = setup(
+        table=table, admission="slack", overload="best_effort",
+        router={"group_choice": "room", **router},
+    )  # fmt: skip
+    activate(groups[1:3])  # G1 then G2 serve; the others are out on an experiment
+    groups[0].state = groups[3].state = GroupState.EXPLORING
+    return clock, groups, r, controller
+
+
+def test_room_keeps_concentrating_below_its_limits():
+    _, _, router, _ = room_setup(d_sequences=100)
+    names = {router.try_admit(128, True, best_effort=True).group.name for _ in range(8)}
+    assert names == {"G1"}  # far past any P slot cap: P and D still have room
+
+
+def test_room_without_measured_limits_concentrates_below_the_engine_cap():
+    _, _, router, _ = room_setup()  # old tables still use the engine's finite D cap
+    names = {router.try_admit(128, True, best_effort=True).group.name for _ in range(8)}
+    assert names == {"G1"}
+    assert router.room_d_sequences == router.settings.decode_max_num_seqs
+
+
+def test_room_spills_when_d_holds_the_limit_and_returns_once_it_drains():
+    _, _, router, _ = room_setup(d_sequences=3)
+    tickets = [router.try_admit(128, True, best_effort=True) for _ in range(3)]
+    assert {t.group.name for t in tickets} == {"G1"}
+    assert router.try_admit(128, True, best_effort=True).group.name == "G2"
+    router.finish(tickets[0], status="ok", ttft_ms=100, tpot_ms=10, output_tokens=64)
+    assert router.try_admit(128, True, best_effort=True).group.name == "G1"
+
+
+def test_room_spills_on_p_busy_share_until_the_window_passes():
+    clock, groups, router, _ = room_setup(p_rho=0.01, room_rho_window_s=10)
+    # S(128) = 40 ms: 100 ms is 1 % of a 10 s window.
+    assert [router.try_admit(128, True, best_effort=True).group.name for _ in range(4)] == [
+        "G1", "G1", "G1", "G2",
+    ]  # fmt: skip
+    assert router.p_rho(groups[1]) == pytest.approx(0.012)
+    clock.now += 10.0
+    assert router.p_rho(groups[1]) == 0.0
+    assert router.try_admit(128, True, best_effort=True).group.name == "G1"
+
+
+def test_room_spreads_to_the_least_loaded_when_no_group_has_room():
+    _, _, router, _ = room_setup(d_sequences=1)
+    names = [router.try_admit(128, True, best_effort=True).group.name for _ in range(4)]
+    assert names[:2] == ["G1", "G2"] and sorted(names) == ["G1", "G1", "G2", "G2"]
+
+
+def test_cooled_group_has_no_room():
+    clock, groups, router, _ = room_setup()
+    router.cool("G1", clock.now + 5.0)
+    assert not router.has_room(groups[1]) and router.has_room(groups[2])
+    assert router.try_admit(128, True, best_effort=True).group.name == "G2"
+
+
+def live_feedback(router):
+    return router.production_feedback(10.0, 5, 0.9)
+
+
+def test_a_single_live_request_is_pressure_only_with_the_default_settings():
+    clock, _, router, _ = room_setup()
+    router.try_admit(128, True, best_effort=True)
+    clock.now += 0.95
+    assert live_feedback(router)["pressure"]
+
+
+def test_live_pressure_needs_the_configured_number_and_share_of_requests():
+    clock, _, router, _ = room_setup(live_pressure_min_requests=3)
+    for _ in range(2):
+        router.try_admit(128, True, best_effort=True)
+    clock.now += 0.95
+    f = live_feedback(router)
+    assert not f["pressure"] and f["live_ratio"] >= 0.9 and f["pressured_groups"] == []
+    router.try_admit(128, True, best_effort=True)  # young: still two near the SLO
+    assert not live_feedback(router)["pressure"]
+    clock.now += 0.95
+    f = live_feedback(router)
+    assert f["pressure"] and f["pressured_groups"] == ["G1"]
+
+    clock, _, router, _ = room_setup(live_pressure_min_requests=1, live_pressure_fraction=0.5)
+    router.try_admit(128, True, best_effort=True)
+    clock.now += 0.95
+    for _ in range(2):
+        router.try_admit(128, True, best_effort=True)  # 1 of 3 live is near the SLO
+    assert not live_feedback(router)["pressure"]
+
+
+def test_one_stuck_request_is_not_severe_with_a_live_minimum():
+    clock, _, router, _ = room_setup(live_pressure_min_requests=2)
+    router.try_admit(128, True, best_effort=True)
+    clock.now += 2.5
+    assert not live_feedback(router)["severe"]
+    router.try_admit(128, True, best_effort=True)
+    clock.now += 2.5
+    assert live_feedback(router)["severe"]
+
+
+def confirm_pressure(clock, controller):
+    asyncio.run(controller.tick())
+    clock.now += controller.settings.confirm_s
+    asyncio.run(controller.tick())
+
+
+def test_room_answers_pressure_by_spilling_while_another_group_has_room():
+    clock, _, router, controller = room_setup()
+    record_production(router)
+    confirm_pressure(clock, controller)
+    assert controller.mode == "expanding" and not router.full_effort
+    assert router.is_cooled("G1") and not router.is_cooled("G2")
+    assert router.try_admit(128, True, best_effort=True).group.name == "G2"
+
+
+def test_room_goes_to_max_when_the_other_group_is_at_its_limits():
+    clock, groups, router, controller = room_setup(d_sequences=50)
+    record_production(router)
+    groups[2].n_await = 50  # G2's D at its limit
+    confirm_pressure(clock, controller)
+    assert controller.mode == "full_effort" and router.full_effort
+    assert all(g.tier is Tier.MAX for g in groups[1:3])
+
+
+def test_room_goes_to_max_when_requests_after_the_redirect_still_show_pressure():
+    clock, _, router, controller = room_setup()
+    record_production(router)
+    confirm_pressure(clock, controller)
+    assert controller.mode == "expanding"
+    clock.now += controller.settings.expansion_grace_s
+    record_production(router)  # now on G2: every group has shown the pressure
+    confirm_pressure(clock, controller)
+    assert router.full_effort
+
+
+def test_room_goes_to_max_once_no_group_has_had_room_for_the_trigger_window():
+    clock, _, router, controller = room_setup(d_sequences=1)
+    settings = controller.settings
+    for _ in range(2):
+        router.try_admit(128, True, best_effort=True)  # both groups at their limit
+    asyncio.run(controller.tick())
+    assert not router.full_effort
+    for _ in range(settings.d_trigger_count):
+        clock.now += 0.25
+        router.try_admit(128, True, best_effort=True)
+    asyncio.run(controller.tick())
+    assert router.full_effort and controller.mode == "full_effort"
+
+
+def test_concentrate_still_goes_to_max_with_an_idle_group():
+    clock, _, groups, _, router, controller, _ = setup(
+        table=published(), admission="slack", overload="best_effort"
+    )
+    activate(groups)
+    record_production(router)
+    confirm_pressure(clock, controller)
+    assert router.full_effort
+
+
+def _d_sample(on_decode, violated, at_p=0):
+    return ProbeSample(1245, 1230, 128, (128,) * at_p, 0, on_decode, 100.0, violated, on_decode)
+
+
+def test_d_sequence_cap_is_the_knee_of_the_violations_by_sequences():
+    samples = [_d_sample(x, False) for x in range(0, 256)]
+    samples += [_d_sample(x, True) for x in range(256, 300)]
+    cap, source, _ = d_sequence_cap(samples, theta=0.1, min_samples=20)
+    assert (cap, source) == (256, "measured")
+
+
+def test_d_sequence_cap_ignores_requests_sent_into_a_congested_p():
+    samples = [_d_sample(x, False) for x in range(0, 100)]
+    samples += [_d_sample(x, True, at_p=6) for x in range(40, 100)]
+    assert d_sequence_cap(samples, theta=0.1, p_slot=4, min_samples=20)[:2] == (None, "none")
+    assert d_sequence_cap(samples, theta=0.1, p_slot=None, min_samples=20)[0] is not None

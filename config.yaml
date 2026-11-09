@@ -14,6 +14,7 @@ slurm:
 runtime:
   python: /path/to/python
   vllm_version: "0.15.1"
+  decode_max_num_seqs: 256  # vLLM 0.15.1 A100 default; explicit engine cap and Room fallback
   offline: true
   environment:
     HF_HUB_OFFLINE: "1"
@@ -149,8 +150,14 @@ router:
   # then the Canary) with fewer requests at its P than the Canary's P slot cap, the
   # fewest at P once every P is at it; full effort then round robin (power of two
   # choices from fill_p2c_groups routable groups) without the KV in-flight gate.
+  # room: the same order and full effort, spilling once the group's P is busy over the last
+  # room_rho_window_s, or its D holds the sequences, the Canary measured it can carry at H.
   group_choice: concentrate
   fill_p2c_groups: 4
+  room_rho_window_s: 10
+  # Live requests near the SLO needed for production pressure (1, 0.0: a single one).
+  live_pressure_min_requests: 1
+  live_pressure_fraction: 0.0
   knee_update: true           # KV gate and P slot cap follow production's clean samples
   d_choice: concentrate
   p_choice: balance
@@ -178,6 +185,7 @@ telemetry:
 # Loads are equivalent prompt tokens/s = sum(prompt tokens + alpha) / window.
 controller:
   period_s: 1.0
+  min_tick_s: 0.1            # pressure wakes control early, ticks stay >= 0.1 s apart
   load_window_s: 10.0
   t_down_s: 30                # a cheaper plan must hold this long before switching down
   burst_window_s: 120         # burst factor of the offered rate over this window
@@ -228,6 +236,7 @@ canary:
   # is conservative; real (prompt, output) lengths replace these afterwards.
   max_output_tokens: 64
   default_prompts: [128, 512, 1024, 2048]
+  # default_lengths_file: lengths.json  # [[prompt, output], ...]: replaces the two above
   length_min_samples: 50
   # scheduler
   period_s: 1.0
@@ -238,6 +247,8 @@ canary:
   length_shift: 0.30          # median/p90 change that triggers a P relocation
   drift_min_samples: 200
   drain_timeout_s: 30
+  recalibrate: true           # false: no experiment after the first publish (evaluation runs
+                              # that set H themselves: POST /canatune/working, BENCH_CLOCK_GRID)
   locator:
     eps: 0.02                 # energy band: within 2 % of the minimum
     target_load_fraction: 0.8 # search at 0.8 C0 (consolidated operating point)

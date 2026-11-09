@@ -47,6 +47,10 @@ class SchedulerSettings:
     length_shift: float = 0.30
     drift_min_samples: int = 200
     drain_timeout_s: float = 30.0
+    # False: no experiment after the first publish (no recheck, drift relocation or
+    # verification). An evaluation switch: runs that vary the clocks themselves (a clock
+    # grid) must not have the Canary move the table under them.
+    recalibrate: bool = True
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "SchedulerSettings":
@@ -109,6 +113,8 @@ class CanaryScheduler:
         table = self.controller.tiers.table
         if table is None:
             return "full", "cold_start"
+        if not self.s.recalibrate:
+            return None
         if self.controller.settings.solver and self.controller.tiers.model_json() is None:
             return "full", "no_model"
         if self._reference is not None and not self.lengths.using_default:

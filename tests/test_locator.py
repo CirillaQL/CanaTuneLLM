@@ -19,6 +19,7 @@ from canatune.controller.canary import CanaryScheduler, SchedulerSettings
 from canatune.controller.locator import (
     Hardware,
     LocatorError,
+    LocatorRun,
     LocatorSettings,
     TierLocator,
     WindowResult,
@@ -28,8 +29,9 @@ from canatune.controller.locator import (
 )
 from canatune.controller.router import CanaTuneRouter, RouterSettings
 from canatune.controller.tier_controller import ControllerSettings, TierController
+from canatune.domain.admission import CostBook
 from canatune.domain.calibration import ProbeSample
-from canatune.domain.groups import ClockPoint, GroupState, Tier, TierState
+from canatune.domain.groups import ClockPoint, GroupState, Tier, TierState, TierTable
 from canatune.domain.load import LengthStats
 from canatune.domain.risk import RiskTable
 from canatune.infrastructure.clocks import GpuRef, NullClockActuator
@@ -110,7 +112,7 @@ class SurrogateBackend:
         self.limit = max_prompt
         return PROMPT
 
-    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above):
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, output_tokens=None):
         self._tick()
         f = clock.prefill_mhz
         rps = eq_tps / (PROMPT + alpha)
@@ -137,7 +139,7 @@ class SurrogateBackend:
             prefill_avg_w=j * n / seconds,
         )
 
-    async def closed_window(self, clock, concurrency, seconds, rep=0):
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all", **_):
         self._tick()
         f = clock.decode_mhz
         tpot = (55 + 1.4 * concurrency) * (1050 / f) ** 0.15
@@ -342,8 +344,9 @@ def test_decode_runs_with_p_at_the_ceiling_and_needs_25pct_for_a_step() -> None:
             self.top_wall = top_wall
             self.closed_clocks = []
 
-        async def closed_window(self, clock, concurrency, seconds, rep=0):
-            self.closed_clocks.append(clock)
+        async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all", **_):
+            if mix == "all":  # the room step runs at H, not on this search
+                self.closed_clocks.append(clock)
             w = await super().closed_window(clock, concurrency, seconds, rep)
             wall = self.top_wall if clock.decode_mhz == 1500 else 44
             if concurrency > wall:
@@ -366,7 +369,7 @@ def test_no_feasible_fill_load_publishes_nothing() -> None:
     locator = TierLocator(backend, settings())
     original = backend.open_window
 
-    async def fill_fails(clock, eq_tps, alpha, seconds, abort_above):
+    async def fill_fails(clock, eq_tps, alpha, seconds, abort_above, **kw):
         w = await original(clock, eq_tps, alpha, seconds, abort_above)
         if locator.run is not None and locator.run.phase == "fill":
             w.violations = w.requests
@@ -391,7 +394,7 @@ def test_joint_check_raises_d_when_slow_d_breaks_ttft_at_h() -> None:
     backend = SurrogateBackend(seed=13)
     original = backend.open_window
 
-    async def slow_d_delays_first_token(clock, eq_tps, alpha, seconds, abort_above):
+    async def slow_d_delays_first_token(clock, eq_tps, alpha, seconds, abort_above, **kw):
         w = await original(clock, eq_tps, alpha, seconds, abort_above)
         if clock.decode_mhz < 1000 and eq_tps > 0.6 * 4000:  # smoke r3: D 735 at 0.8 C0
             w.violations = w.requests // 4
@@ -409,7 +412,7 @@ def test_fill_bisects_capacity_between_fill_loads() -> None:
     locator = TierLocator(backend, settings())
     original = backend.open_window
 
-    async def wall_at_090(clock, eq_tps, alpha, seconds, abort_above):
+    async def wall_at_090(clock, eq_tps, alpha, seconds, abort_above, **kw):
         w = await original(clock, eq_tps, alpha, seconds, abort_above)
         c0 = (locator.run.evidence if locator.run else {}).get("capacity_c0")
         if locator.run is not None and locator.run.phase == "fill" and eq_tps > 0.9 * c0:
@@ -424,7 +427,7 @@ def test_fill_bisects_capacity_between_fill_loads() -> None:
 
 def test_d_clock_choice_uses_the_median_of_repeated_windows() -> None:
     class NoisyBackend(SurrogateBackend):
-        async def closed_window(self, clock, concurrency, seconds, rep=0):
+        async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all", **_):
             w = await super().closed_window(clock, concurrency, seconds, rep)
             if clock.decode_mhz == 300 and rep == 0 and concurrency < 44:
                 w.decode_j_per_token = 0.001  # one absurd window must not decide
@@ -589,7 +592,7 @@ class LengthBackend(SurrogateBackend):
     (long) context tokens per sequence."""
 
     KV = 33648
-    CONTEXT = {"all": 1000.0, "short": 300.0, "long": 1700.0}
+    CONTEXT = {"all": 1000.0, "short": 300.0, "long": 1700.0, "shortest": 150.0}
 
     async def kv_capacity(self):
         return self.KV
@@ -597,11 +600,14 @@ class LengthBackend(SurrogateBackend):
     def mix_context(self, mix="all"):
         return self.CONTEXT[mix]
 
+    def shortest_prompt(self):
+        return 128
+
     @staticmethod
     def tpot(f, x, k):
         return 55 * (1050 / f) ** 0.15 + 0.4 * x + 8e-4 * (1050 / f) ** 0.3 * k
 
-    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all", **_):
         w = await super().closed_window(clock, concurrency, seconds, rep)
         f, context = clock.decode_mhz, self.CONTEXT[mix]
         full = concurrency * context > 0.95 * self.KV
@@ -663,7 +669,7 @@ def test_count_model_remains_selectable() -> None:
 
 def test_length_model_without_d_telemetry_falls_back_to_the_count_model() -> None:
     class NoTelemetry(LengthBackend):
-        async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+        async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all", **_):
             w = await super().closed_window(clock, concurrency, seconds, rep, mix)
             return dataclasses.replace(w, decode_points=[])
 
@@ -677,7 +683,7 @@ class NixlLengthBackend(LengthBackend):
     """NixlConnector on vLLM 0.15: requests pulling their KV from P sit in D's waiting
     queue, so num_requests_waiting > 0 in every window; KV use shows the real queue."""
 
-    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all"):
+    async def closed_window(self, clock, concurrency, seconds, rep=0, mix="all", **_):
         w = await super().closed_window(clock, concurrency, seconds, rep, mix)
         kv = min(1.0, concurrency * self.CONTEXT[mix] / self.KV)
         waiting = w.decode_waiting_max + 2.0
@@ -722,3 +728,73 @@ def test_kv_pull_waiting_setting_follows_the_kv_connector() -> None:
         "decode_waiting_includes_kv_pull"
     ] = True
     assert LocatorSettings.from_config(config).decode_waiting_includes_kv_pull
+
+
+def test_room_limits_measure_p_and_d_each_on_its_own():
+    class RoomBackend:
+        """P stops meeting the target above 4000 eq tokens/s; D holds 160 sequences."""
+
+        def __init__(self):
+            self.opens, self.fills = [], []
+
+        def mix_context(self, mix="all"):
+            return 256.0
+
+        def shortest_prompt(self):
+            return 128
+
+        async def open_window(self, clock, load, alpha, seconds, abort, output_tokens=None):
+            self.opens.append((clock, output_tokens))
+            bad = load > 4000
+            return WindowResult(
+                clock=clock, kind="open", load=load, duration_s=seconds, requests=100,
+                violations=50 if bad else 0,
+                samples=[ProbeSample(1500, 1000, 128, (), 0, 0, 100.0, bad, 0)
+                         for _ in range(int(load / 228 * seconds))],
+            )  # fmt: skip
+
+        async def closed_window(self, clock, concurrency, seconds, **kw):
+            self.fills.append((clock, concurrency, seconds, kw))
+            return WindowResult(
+                clock=clock, kind="closed", load=concurrency, duration_s=seconds,
+                requests=concurrency,
+                samples=[ProbeSample(1, 1, 128, (), 0, 0, 100.0, x >= 160, x)
+                         for x in range(concurrency)],
+            )  # fmt: skip
+
+    backend = RoomBackend()
+    locator = TierLocator(backend, settings())
+    locator.run = LocatorRun(started_at=0.0)
+    locator.run.evidence.update(
+        prefill_ms_by_clock={"1500": {"128": 40.0, "2048": 200.0}},
+        decode={"length_model": {"1000": [10.0, 0.05, 0.0, 1.0]}},
+    )
+    h = ClockPoint(1500, 1000)
+    asyncio.run(locator.room_limits(h, 100.0, 1000.0, None))
+    room = locator.run.evidence["room"]
+    assert room["p_source"] == "measured" and room["p_rho"] > 0
+    assert 3000 <= room["p_load"] <= 4000
+    assert all(clock == h and output == 2 for clock, output in backend.opens)  # D stays idle
+    assert (room["d_sequences"], room["d_source"]) == (160, "measured")
+    clock, _, seconds, kw = backend.fills[0]
+    assert clock == h and kw["mix"] == "shortest" and kw["stagger_s"] == seconds
+    assert room["d_fill"]["rate_rps"] == pytest.approx(0.5 * room["p_rho"] / 0.04)
+    # A relocation measures P again and keeps D's result.
+    previous = TierTable(park=h, h=h, capacity_h=1.0, alpha_tokens=0.0, evidence={"room": room})
+    opens = len(backend.opens)
+    asyncio.run(locator.room_limits(h, 100.0, 1000.0, previous))
+    assert len(backend.opens) > opens or locator.run.reused  # P searched (or served from cache)
+    assert locator.run.evidence["room"]["d_sequences"] == 160 and len(backend.fills) == 1
+
+
+def test_room_p_limit_is_none_when_no_load_stops_meeting_the_target():
+    class Easy:
+        async def open_window(self, clock, load, alpha, seconds, abort, output_tokens=None):
+            return WindowResult(clock=clock, kind="open", load=load, duration_s=seconds,
+                                requests=100, violations=0)  # fmt: skip
+
+    locator = TierLocator(Easy(), settings())
+    locator.run = LocatorRun(started_at=0.0)
+    costs = CostBook({"1500": {"128": 40.0, "2048": 200.0}})
+    room = asyncio.run(locator.room_p_limit(ClockPoint(1500, 1000), 100.0, 1000.0, costs))
+    assert room["p_rho"] is None and room["p_source"] == "none"

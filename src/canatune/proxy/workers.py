@@ -549,7 +549,7 @@ def create_worker_app(
     )
     transport = control_transport or httpx.AsyncHTTPTransport(uds=control_uds)
     control = httpx.AsyncClient(transport=transport, base_url="http://decision",
-                                timeout=30.0, trust_env=False)  # fmt: skip
+                                timeout=120.0, trust_env=False)  # fmt: skip
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:

@@ -12,7 +12,7 @@ import make_job_config  # noqa: E402
 BASE = str(Path(__file__).resolve().parents[1] / "config.yaml")
 
 
-def run(tmp_path, *sets: str) -> dict:
+def run(tmp_path, *sets: str, extra: tuple[str, ...] = ()) -> dict:
     out = tmp_path / "job.yaml"
     argv = [
         "--base", BASE, "--out", str(out), "--prefill-node", "n", "--decode-node", "n",
@@ -21,6 +21,7 @@ def run(tmp_path, *sets: str) -> dict:
     ]  # fmt: skip
     for item in sets:
         argv += ["--set", item]
+    argv += list(extra)
     old = sys.argv
     sys.argv = ["make_job_config.py", *argv]
     try:
@@ -53,3 +54,9 @@ def test_an_explicit_endpoint_override_still_wins(tmp_path) -> None:
     )
     assert config["topology"]["endpoints"]["D0"]["kv_port"] == 14679
     assert config["topology"]["endpoints"]["D1"]["kv_port"] == 15000
+
+
+def test_the_baseline_can_route_over_every_pair(tmp_path) -> None:
+    config = run(tmp_path, extra=("--all-pairs-production",))
+    assert config["routing"]["production_pairs"] == [["P0", "D0"], ["P1", "D1"]]
+    assert config["routing"]["canary_pair"] == ["P0", "D0"]

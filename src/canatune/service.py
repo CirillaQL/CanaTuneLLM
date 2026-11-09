@@ -1,9 +1,11 @@
 """Assemble groups, tables, telemetry, Router, Controller and Canary from config."""
 
 import asyncio
+import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -148,11 +150,16 @@ def cold_start_lengths(config: Mapping[str, Any]) -> list[tuple[int, int]]:
     the largest max_tokens a request may ask for: a deployment policy). Probing
     with the cap is the heaviest decode load, so a cold-start H is conservative;
     real (prompt, output) lengths replace these after `length_min_samples` requests.
-    Without the cap, the legacy `canary.default_lengths` pairs are used."""
+    Without the cap, the legacy `canary.default_lengths` pairs are used.
+    `canary.default_lengths_file` (JSON list of [prompt, output]) replaces all of these:
+    an expected length distribution known before the first request, used as it is."""
     raw = config.get("canary", {})
     cap = raw.get("max_output_tokens")
     legacy = [tuple(pair) for pair in raw.get("default_lengths") or [[512, 64]]]
-    if cap is None:
+    lengths_file = raw.get("default_lengths_file")
+    if lengths_file:
+        pairs = [(int(p), int(o)) for p, o in json.loads(Path(lengths_file).read_text())]
+    elif cap is None:
         pairs = [(int(p), int(o)) for p, o in legacy]
     else:
         if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
@@ -168,6 +175,16 @@ def cold_start_lengths(config: Mapping[str, Any]) -> list[tuple[int, int]]:
 
 def _env_override(raw: Mapping[str, Any], env: str, key: str) -> Any:
     return os.environ.get(env) or raw.get(key)
+
+
+def probe_client() -> httpx.AsyncClient:
+    """The Canary's client. No connection limit: httpx's default (100) would hold probes
+    back here, and a window of more sequences would measure this client, not the GPU."""
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(120, connect=5),
+        limits=httpx.Limits(max_connections=None, max_keepalive_connections=64),
+        trust_env=False,
+    )
 
 
 def build_runtime(
@@ -273,9 +290,7 @@ def build_runtime(
             lengths,
             table,
             ProbeSettings.from_config(config),
-            client_factory=lambda: httpx.AsyncClient(
-                timeout=httpx.Timeout(120, connect=5), trust_env=False
-            ),
+            client_factory=probe_client,
             telemetry=telemetry,
             ttft_slo_ms=float(slo["ttft_ms"]),
             tpot_slo_ms=float(slo["tpot_ms"]),

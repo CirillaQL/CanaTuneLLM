@@ -44,13 +44,13 @@ The locator never touches production: the backend drives only the Canary pair.
 import math
 import statistics
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from canatune.config import NIXL_CONNECTOR, kv_connector
 from canatune.domain.admission import CostBook
-from canatune.domain.calibration import calibrate_admission, fit_plateau_slope
+from canatune.domain.calibration import calibrate_admission, d_sequence_cap, fit_plateau_slope
 from canatune.domain.groups import ClockPoint, TierTable
 from canatune.domain.models import (
     ClusterModel,
@@ -110,6 +110,13 @@ class WindowResult:
     tpot_p50_ms: float | None = None
     # (mean running sequences, mean KV tokens, TPOT ms) per request: length model
     decode_points: list = field(default_factory=list, repr=False)
+    # Completed success, failed, and right-censored requests partition requests_sent.
+    # requests counts only known SLO outcomes (including already-late censored TTFT).
+    requests_sent: int = 0
+    requests_completed: int = 0
+    requests_failed: int = 0
+    requests_censored: int = 0
+    requests_unknown: int = 0
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -130,6 +137,8 @@ class WindowResult:
             "running_max": self.decode_running_max,
             "duration_s": round(self.duration_s, 2),
             "aborted": self.aborted,
+            **{k: getattr(self, k) for k in ("requests_sent", "requests_completed",
+                "requests_failed", "requests_censored", "requests_unknown")},
         }
 
 
@@ -151,10 +160,17 @@ class ProbeBackend(Protocol):
         ...
 
     async def open_window(
-        self, clock: ClockPoint, eq_tps: float, alpha: float, seconds: float, abort_above: float
+        self,
+        clock: ClockPoint,
+        eq_tps: float,
+        alpha: float,
+        seconds: float,
+        abort_above: float,
+        output_tokens: int | None = None,
     ) -> WindowResult:
         """Poisson probes at `eq_tps` equivalent tokens/s; may stop early once the
-        observed violation rate is clearly above `abort_above`."""
+        observed violation rate is clearly above `abort_above`. `output_tokens`: every
+        request's output instead of the trace's."""
         ...
 
     async def closed_window(
@@ -208,6 +224,7 @@ class LocatorSettings:
     decode_fit_fill: float = 0.6  # length fit: highest concurrency fills this much KV
     decode_fit_max_concurrency: int = 64
     decode_fit_min_points: int = 12  # requests per clock below which the fit is refused
+    room_fill_max_s: float = 90.0  # room step: longest time to send D's sequences
     service_repeats: int = 3
     service_lengths: tuple[int, ...] = ()  # extra S(L) lengths; () = 16, 64, 256, ... up
     # to the longest probe length (the plateau and its knee need short lengths)
@@ -467,6 +484,10 @@ class TierLocator:
             ws[0],
             requests=sum(w.requests for w in ws),
             violations=sum(w.violations for w in ws),
+            aborted=any(w.aborted for w in ws),
+            **{k: sum(getattr(w, k) for w in ws) for k in (
+                "requests_sent", "requests_completed", "requests_failed",
+                "requests_censored", "requests_unknown")},
             tpot_p95_ms=max((w.tpot_p95_ms for w in ws if w.tpot_p95_ms is not None), default=None),
             decode_j_per_token=statistics.median(energies) if energies else None,
             decode_preemptions=sum(w.decode_preemptions for w in ws),
@@ -480,16 +501,17 @@ class TierLocator:
         )
 
     def feasible(self, w: WindowResult) -> bool:
-        return w.requests > 0 and wilson_ucb(w.violations, w.requests, self.s.ucb_z) <= self.s.theta
+        return (not w.aborted and w.requests > 0
+                and wilson_ucb(w.violations, w.requests, self.s.ucb_z) <= self.s.theta)
 
     def meets_target(self, w: WindowResult) -> bool:
         """Capacity uses the admission criterion itself (violation bound <= theta);
         TTFT p95 is recorded but not a separate, stricter target."""
-        return self.feasible(w) and not w.aborted
+        return self.feasible(w)
 
     def decode_clean(self, w: WindowResult) -> bool:
         return (
-            w.requests > 0
+            not w.aborted and w.requests > 0
             and w.tpot_p95_ms is not None
             and w.tpot_p95_ms <= self.s.tpot_slo_ms
             and w.decode_preemptions == 0
@@ -795,16 +817,16 @@ class TierLocator:
         self._phase("done")
         return w
 
-    async def ramp(
-        self, hw: Hardware, top: ClockPoint, alpha: float, mean_prompt: float
-    ) -> tuple[float, int]:
-        """-> (C0 in equivalent tokens/s, f_eff)."""
-        self._phase("ramp")
-        load = self.s.ramp_start_rps * (mean_prompt + alpha)
+    async def _highest_clean(
+        self, measure: Callable[[float], Awaitable[WindowResult]], start: float
+    ) -> tuple[WindowResult | None, bool]:
+        """Doubling from `start`, then two bisections -> (highest window that meets the
+        target, whether a load above it was seen not to)."""
+        load = start
         good: WindowResult | None = None
         bad: WindowResult | None = None
         for _ in range(self.s.ramp_max_steps):
-            w = await self.open(top, load, alpha)
+            w = await measure(load)
             if self.meets_target(w):
                 good, load = w, load * 2
             else:
@@ -812,16 +834,25 @@ class TierLocator:
                 if good is not None:
                     break
                 load /= 2  # even the start load is too much: go down
-        if good is None:
-            raise LocatorError("no load meets the SLO even at the highest clock")
-        if bad is not None:
+        if good is not None and bad is not None:
             lo, hi = good.load, bad.load
             for _ in range(2):
-                w = await self.open(top, (lo + hi) / 2, alpha)
+                w = await measure((lo + hi) / 2)
                 if self.meets_target(w):
                     lo, good = w.load, w
                 else:
                     hi = w.load
+        return good, bad is not None
+
+    async def ramp(
+        self, hw: Hardware, top: ClockPoint, alpha: float, mean_prompt: float
+    ) -> tuple[float, int]:
+        """-> (C0 in equivalent tokens/s, f_eff)."""
+        self._phase("ramp")
+        start = self.s.ramp_start_rps * (mean_prompt + alpha)
+        good, _ = await self._highest_clean(lambda load: self.open(top, load, alpha), start)
+        if good is None:
+            raise LocatorError("no load meets the SLO even at the highest clock")
         f_eff = top.prefill_mhz
         busy = good.prefill_mhz_median
         if busy is not None and (
@@ -1265,6 +1296,7 @@ class TierLocator:
         self._phase("model")  # after the evidence above: the model reads the D results
         self.calibrate(park=park, capacity_window=capacity_window, b_star=b_star,
                        prefill_mhz=h.prefill_mhz)
+        await self.room_limits(h, alpha, capacity, previous)
         table = TierTable(
             park=park,
             h=h,
@@ -1280,6 +1312,98 @@ class TierLocator:
         )
         self._phase("done")
         return table
+
+    async def room_p_limit(
+        self, h: ClockPoint, alpha: float, capacity: float, costs: CostBook
+    ) -> dict[str, Any]:
+        """P's own limit at H: production's prompts with two-token outputs, so D stays
+        idle and P is what stops meeting the target; the load is searched up from the
+        group's capacity and the limit is the busy share of the highest clean window.
+        None (source "none"): no load tried stopped meeting it."""
+        self._phase("room_p")
+
+        async def measure(load: float) -> WindowResult:
+            key = ("open_p", h, round(load, 1), round(alpha, 1))
+            seconds = self.open_seconds(load, alpha)
+            return await self._cached(
+                key,
+                lambda: self.backend.open_window(
+                    h, load, alpha, seconds, 2 * self.s.theta, output_tokens=2
+                ),
+            )
+
+        good, saw_limit = await self._highest_clean(measure, capacity)
+        p_rho = None if good is None or not saw_limit else self._utilization(good, costs)
+        return {
+            "p_rho": p_rho,
+            "p_source": "measured" if p_rho is not None else "none",
+            "p_load": None if good is None else good.load,
+            "p_reached": None if good is None else self._utilization(good, costs),
+        }
+
+    async def room_d_limit(self, h: ClockPoint, rho: float, costs: CostBook) -> dict[str, Any]:
+        """D's own limit at H: one window that fills D without loading P, the shortest
+        prompt at half the busy share `rho`, with outputs long enough that nothing leaves
+        before the last is sent, up to decode_max_concurrency sequences. The limit is the
+        knee of the violations by the sequences on D when each was sent."""
+        assert self.run is not None
+        ev = self.run.evidence
+        self._phase("room_d")
+        models = ev["decode"]["length_model"]
+        c = self.s.decode_max_concurrency
+        context = self.backend.mix_context("shortest")
+        prefill_ms = costs.for_clock(h.prefill_mhz)(self.backend.shortest_prompt())
+        rate = 0.5 * rho * 1000.0 / max(prefill_ms, 1e-3)
+        fill_s = min(c / rate, self.s.room_fill_max_s)
+        c = max(1, int(rate * fill_s))
+        # Outputs that outlast the fill, by the model at the clock nearest D's.
+        nearest = min(models, key=lambda f: abs(int(f) - h.decode_mhz))
+        tpot = decode_tpot(models[nearest], c / 4, c / 4 * context)
+        output = max(self.s.decode_fit_min_points, int(fill_s * 1000.0 / max(tpot, 1.0)))
+        drain_s = 2.0 * output * tpot / 1000.0
+        w = await self.backend.closed_window(
+            h, c, fill_s, mix="shortest", output_tokens=output, stagger_s=fill_s, drain_s=drain_s
+        )
+        p_slot = (ev.get("admission") or {}).get("p_slot_cap")
+        cap, source, bins = d_sequence_cap(w.samples, theta=self.s.theta, p_slot=p_slot)
+        return {
+            "d_sequences": cap,
+            "d_source": source,
+            "d_bins": bins,
+            "d_reached": max((s.on_decode for s in w.samples), default=None),
+            "d_running_max": w.decode_running_max,
+            "d_window": w.summary(),  # retain truncation/unknown counts, not just clean bins
+            "d_fill": {"rate_rps": rate, "seconds": fill_s, "output_tokens": output, "requests": c},
+        }
+
+    async def room_limits(
+        self, h: ClockPoint, alpha: float, capacity: float, previous: TierTable | None
+    ) -> None:
+        """evidence["room"]: how much a group may carry at H (group_choice room reads it).
+        P and D are each measured in a window that loads only that side, so neither takes
+        the other's bottleneck for its own. A relocation measures P again and keeps the
+        previous D result (D is not measured again there). A side not measured: None;
+        the Router uses the configured engine cap when D has no measured limit."""
+        assert self.run is not None
+        ev = self.run.evidence
+        tables = ev.get("prefill_ms_by_clock")
+        room: dict[str, Any] = {"p_rho": None, "p_source": "none", "d_sequences": None,
+                                "d_source": "none"}  # fmt: skip
+        ev["room"] = room
+        if not tables:
+            return
+        costs = CostBook(tables)
+        room.update(await self.room_p_limit(h, alpha, capacity, costs))
+        if previous is not None:
+            old = previous.evidence.get("room") or {}
+            room.update({k: old.get(k) for k in ("d_sequences", "d_source", "d_bins", "d_reached")})
+            room["reused_d"] = True
+        else:
+            rho = room["p_rho"] or room["p_reached"]
+            has_model = (ev.get("decode") or {}).get("length_model")
+            if rho and has_model and hasattr(self.backend, "mix_context"):
+                room.update(await self.room_d_limit(h, rho, costs))
+        self.log.write({"event": "locator_room", **room})
 
     async def recheck(self, table: TierTable, prompts: Sequence[int]) -> TierTable:
         """Periodic neighbour check of H at the target load: move H one step when a

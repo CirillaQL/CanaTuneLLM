@@ -184,18 +184,25 @@ def wait_publish(
     return 2, None
 
 
-def wait_h(client: httpx.Client, base: str, table: dict) -> bool:
-    """Every active group runs at the published H (the staggered move finished)."""
+def wait_h(client: httpx.Client, base: str, table: dict,
+           production_clocks: str = "canary") -> bool:
+    """Wait for the configured production clock policy, not always a literal H."""
     started = time.monotonic()
     while time.monotonic() - started < H_TIMEOUT_S:
         state = fetch(client, base, "/canatune/state") or {}
         groups = (state.get("router") or {}).get("groups") or []
         active = [g for g in groups if g.get("state") == "active"]
-        if active and all(g.get("effective") == table["h"] for g in active):
-            log(f"production at H {table['h']}: {[g['name'] for g in active]}")
+        control = state.get("controller") or {}
+        target = control.get("max_point") if production_clocks == "max" else table["h"]
+        ready = (control.get("production_clocks") == "driver"
+                 and control.get("driver_clocks_ready")) if production_clocks == "driver" else (
+            all(g.get("effective") == target for g in active)
+        )
+        if active and ready:
+            log(f"production clocks ready ({production_clocks}): {[g['name'] for g in active]}")
             return True
         time.sleep(2)
-    log("active groups did not all reach H in time; playing the profile anyway")
+    log(f"active groups did not reach clock policy {production_clocks} in time")
     return False
 
 
@@ -317,7 +324,9 @@ def main() -> int:
                     status = failed
                     return status
                 summary["published_s"] = round(time.monotonic() - started, 1)
-                summary["reached_h"] = wait_h(client, base, table)
+                summary["reached_h"] = wait_h(
+                    client, base, table, config["controller"].get("production_clocks", "canary")
+                )
                 pairs = cold_start_lengths(config)
                 meta, arrivals = loadgen.build_trace(
                     loadgen.parse_profile(os.environ.get("SMOKE_PROFILE", loadgen.DEFAULT_PROFILE)),
@@ -338,7 +347,9 @@ def main() -> int:
                     log("the stored tier table was not loaded")
                     status = failed
                     return status
-                summary["reached_h"] = wait_h(client, base, table)
+                summary["reached_h"] = wait_h(
+                    client, base, table, config["controller"].get("production_clocks", "canary")
+                )
                 meta, arrivals = loadgen.load_trace(os.environ["SMOKE_TRACE"])
             else:
                 meta, arrivals = loadgen.load_trace(os.environ["SMOKE_TRACE"])

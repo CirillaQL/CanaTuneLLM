@@ -19,8 +19,8 @@ import random
 import statistics
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
@@ -76,6 +76,7 @@ class ProbeOutcome:
     decoding_at_send: int = 0
     first_token_at: float | None = None  # monotonic, for D's state while it decoded
     last_token_at: float | None = None
+    ttft_lower_bound_ms: float | None = None  # censored before its first token, not exact TTFT
 
 
 @dataclass(frozen=True)
@@ -87,6 +88,9 @@ class ProbeSettings:
     vocab_low: int = 1000
     vocab_high: int = 31000
     seed: int = 20260925
+    # True: the load value seeds the open windows, so a small change of load gives another
+    # trace. False: one trace per seed; a window takes its first `count` requests.
+    trace_by_load: bool = True
     decode_output_tokens: int = 256  # closed (decode) windows: long outputs load D
     decode_stagger_s: float = 15.0  # closed windows: spread worker starts (steady state)
     warmup_requests: int = 3  # discarded before service times (KV-connector handshake)
@@ -142,6 +146,7 @@ class CanaryProbe:
         self._inflight_tokens = 0
         self._ids = 0
         self._kv_tokens: int | None = None  # D's KV cache size (closed windows read it)
+        self._active: dict[asyncio.Task, tuple[float, ProbeOutcome]] = {}
         self.service_source = "http"  # how service_times measured prefill ("metrics" or "http")
 
     async def quiesce(self) -> None:
@@ -264,6 +269,11 @@ class CanaryProbe:
         self._at_prefill[probe_id] = prompt_tokens
         stage = "prefill"
         sent = time.monotonic()
+        task = asyncio.current_task()
+        assert task is not None
+        progress = ProbeOutcome("pending", prompt_tokens, 0, None, None, None, n_await, d_busy,
+                                at_prefill, inflight, decoding_now)
+        self._active[task] = (sent, progress)
         prefill_ms = ttft_ms = tpot_ms = None
         timer = StreamTimer()
         status = "ok"
@@ -274,6 +284,7 @@ class CanaryProbe:
                 headers=headers,
             )
             prefill_ms = (time.monotonic() - sent) * 1000.0
+            progress.prefill_ms = prefill_ms
             self._at_prefill.pop(probe_id, None)
             self._inflight_tokens += prompt_tokens
             stage = "transfer"
@@ -290,6 +301,7 @@ class CanaryProbe:
                 async for chunk in stream.aiter_bytes():
                     if timer.feed(chunk) and ttft_ms is None:
                         ttft_ms = (timer.token_times[0] - sent) * 1000.0
+                        progress.ttft_ms = ttft_ms
                         self._n_await -= 1
                         self._inflight_tokens -= prompt_tokens
                         self._decoding += 1
@@ -300,6 +312,7 @@ class CanaryProbe:
         except Exception as error:  # a failed probe is data, never a crash (cancel passes)
             status = f"error: {error!r}"
         finally:
+            self._active.pop(task, None)
             if stage == "decode":
                 self._decoding -= 1
             else:
@@ -324,14 +337,38 @@ class CanaryProbe:
         )
         return outcome
 
+    def _violation(self, outcome: ProbeOutcome) -> bool | None:
+        if outcome.status == "censored":
+            # A late first token is already a violation. A partial stream's average
+            # TPOT, or a first token not late yet, cannot prove a final SLO outcome.
+            ttft = outcome.ttft_ms if outcome.ttft_ms is not None else outcome.ttft_lower_bound_ms
+            return True if ttft is not None and ttft >= self.ttft_slo_ms else None
+        if outcome.status != "ok":
+            return None
+        return is_violation(outcome.ttft_ms, outcome.tpot_ms,
+                            ttft_slo_ms=self.ttft_slo_ms, tpot_slo_ms=self.tpot_slo_ms)
+
+    def _censor(self, pending: Collection[asyncio.Task]) -> list[ProbeOutcome]:
+        """Freeze partial evidence and cancel before more I/O can complete it twice."""
+        now = time.monotonic()
+        outcomes = [replace(progress, status="censored", ttft_lower_bound_ms=(
+                    (now - sent) * 1000 if progress.ttft_ms is None else None))
+                for task in pending if task in self._active
+                for sent, progress in [self._active[task]]]
+        for task in pending:
+            task.cancel()
+        return outcomes
+
     def _record(self, clock: ClockPoint, outcome: ProbeOutcome) -> bool | None:
-        violated = is_violation(
-            outcome.ttft_ms,
-            outcome.tpot_ms,
-            ttft_slo_ms=self.ttft_slo_ms,
-            tpot_slo_ms=self.tpot_slo_ms,
-        )
-        if outcome.status == "ok" and violated is not None:
+        violated = self._violation(outcome)
+        if outcome.status == "censored":
+            self.log.write({"event": "probe_censored", "clock": clock.key(),
+                            "on_decode": outcome.n_await_at_send + outcome.decoding_at_send,
+                            "at_prefill": len(outcome.at_prefill),
+                            "prompt_tokens": outcome.prompt_tokens, "ttft_ms": outcome.ttft_ms,
+                            "ttft_lower_bound_ms": outcome.ttft_lower_bound_ms,
+                            "violated": violated})
+        if violated is not None:
             cell = self.table.cell(
                 clock, outcome.n_await_at_send, outcome.prompt_tokens, outcome.d_busy_at_send
             )
@@ -345,15 +382,21 @@ class CanaryProbe:
     def _mix_prompts(self, mix: str) -> list[int]:
         """Prompt lengths of a closed-window mix: "all" the current distribution,
         "short" / "long" its lower and upper half by prompt length (the length model
-        needs windows whose context per sequence differs at the same concurrency)."""
+        needs windows whose context per sequence differs at the same concurrency),
+        "shortest" its shortest prompt (loads D and leaves P free)."""
         prompts = sorted(p for p, _ in self.lengths.pairs_upto(self.prompt_limit))
         if mix == "all":
             return prompts
+        if mix == "shortest":
+            return prompts[:1]
         if mix == "short":
             return prompts[: (len(prompts) + 1) // 2]
         if mix == "long":
             return prompts[len(prompts) // 2 :]
         raise ValueError(f"unknown prompt mix {mix!r}")
+
+    def shortest_prompt(self) -> int:
+        return self._mix_prompts("shortest")[0]
 
     def mix_context(self, mix: str = "all") -> float:
         """Mean context (tokens) a closed-window sequence of this mix holds while it
@@ -417,11 +460,13 @@ class CanaryProbe:
         load: float,
         outcomes: list[ProbeOutcome],
         samples: list,
-        violations: int,
         aborted: bool,
         decode_tokens: float | None = None,
     ) -> WindowResult:
         ok = [o for o in outcomes if o.status == "ok"]
+        known = [(o, self._violation(o)) for o in outcomes]
+        known = [(o, v) for o, v in known if v is not None]
+        censored = sum(o.status == "censored" for o in outcomes)
         probe_samples = [
             ProbeSample(
                 clock.prefill_mhz,
@@ -431,11 +476,10 @@ class CanaryProbe:
                 o.inflight_tokens,
                 o.decoding_at_send,
                 o.ttft_ms,
-                is_violation(
-                    o.ttft_ms, o.tpot_ms, ttft_slo_ms=self.ttft_slo_ms, tpot_slo_ms=self.tpot_slo_ms
-                ),
+                violated,
+                o.n_await_at_send + o.decoding_at_send,
             )
-            for o in ok
+            for o, violated in known
         ]
         first, last = samples[0], samples[-1]  # explicit readings around the probes
         duration = last[0] - first[0]
@@ -463,8 +507,13 @@ class CanaryProbe:
             kind=kind,
             load=load,
             duration_s=duration,
-            requests=len(ok),
-            violations=violations,
+            requests=len(known),
+            violations=sum(bool(v) for _, v in known),
+            requests_sent=len(outcomes),
+            requests_completed=len(ok),
+            requests_failed=len(outcomes) - len(ok) - censored,
+            requests_censored=censored,
+            requests_unknown=len(outcomes) - len(known),
             ttft_p95_ms=p95([o.ttft_ms for o in ok if o.ttft_ms is not None]),
             tpot_p95_ms=p95([o.tpot_ms for o in ok if o.tpot_ms is not None]),
             prefill_j_per_request=p_j / len(ok) if ok else None,
@@ -475,7 +524,7 @@ class CanaryProbe:
             decode_waiting_max=max((s.waiting or 0.0 for s in decode_snaps), default=0.0),
             decode_kv_max=max((s.kv_usage or 0.0 for s in decode_snaps), default=None),
             decode_running_max=max((s.running or 0.0 for s in decode_snaps), default=None),
-            aborted=aborted,
+            aborted=aborted or censored > 0 or len(known) < len(outcomes),
             samples=probe_samples,
             prefill_avg_w=p_j / duration if duration > 0 else None,
             decode_avg_w=d_j / duration if duration > 0 else None,
@@ -486,19 +535,34 @@ class CanaryProbe:
         )
 
     async def open_window(
-        self, clock: ClockPoint, eq_tps: float, alpha: float, seconds: float, abort_above: float
+        self,
+        clock: ClockPoint,
+        eq_tps: float,
+        alpha: float,
+        seconds: float,
+        abort_above: float,
+        output_tokens: int | None = None,
     ) -> WindowResult:
+        """`output_tokens`: every request's output instead of the trace's."""
         await self.lock(clock)
         # Same load -> same trace: every clock replays identical arrival times and
         # lengths, so per-request energy is compared on identical work.
         # Exactly round(rate x seconds) arrivals at uniform order statistics: a Poisson
         # process conditioned on its count, so the realised load equals the nominal
         # one (an unconditioned Poisson trace can deviate from it by tens of percent).
-        trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
         rate = eq_tps / (self.lengths.mean_prompt(self.prompt_limit) + alpha)  # requests/s
         count = max(1, round(rate * seconds))
-        pairs = self.lengths.sample(trace, count, self.prompt_limit)
-        arrivals = sorted(trace.uniform(0.0, seconds) for _ in range(count))
+        if self.s.trace_by_load:
+            trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
+            pairs = self.lengths.sample(trace, count, self.prompt_limit)
+            arrivals = sorted(trace.uniform(0.0, seconds) for _ in range(count))
+        else:
+            lengths_rng = random.Random(self.s.seed * 1_000_003 + 1)
+            arrivals_rng = random.Random(self.s.seed * 1_000_003 + 2)
+            pairs = self.lengths.sample(lengths_rng, count, self.prompt_limit)
+            arrivals = sorted(arrivals_rng.random() * seconds for _ in range(count))
+        if output_tokens is not None:
+            pairs = [(prompt, output_tokens) for prompt, _ in pairs]
         outcomes: list[ProbeOutcome] = []
         tasks: set[asyncio.Task] = set()
         stop_sampling = asyncio.Event()
@@ -535,7 +599,10 @@ class CanaryProbe:
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
                 if tasks:
-                    await asyncio.wait(tasks, timeout=self.s.drain_timeout_s)
+                    _, pending = await asyncio.wait(tasks, timeout=self.s.drain_timeout_s)
+                    for outcome in self._censor(pending):
+                        outcomes.append(outcome)
+                        self._record(clock, outcome)
                 await self._append_sample(samples)
                 tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
             finally:
@@ -546,26 +613,37 @@ class CanaryProbe:
                 await asyncio.gather(*tasks, sampler, return_exceptions=True)
         generated = _diff(tokens_before, tokens_after)
         return self._result(
-            clock, "open", eq_tps, outcomes, samples, violations, aborted, generated
+            clock, "open", eq_tps, outcomes, samples, aborted, generated
         )
 
     async def closed_window(
-        self, clock: ClockPoint, concurrency: int, seconds: float, rep: int = 0, mix: str = "all"
+        self,
+        clock: ClockPoint,
+        concurrency: int,
+        seconds: float,
+        rep: int = 0,
+        mix: str = "all",
+        output_tokens: int | None = None,
+        stagger_s: float | None = None,
+        drain_s: float | None = None,
     ) -> WindowResult:
         """`concurrency` workers loop over requests until `seconds` pass. Starts are
-        spread over decode_stagger_s so D reaches a steady mix rather than one wave;
-        prompt lengths come from a trace fixed by (concurrency, rep, mix), so every
-        clock decodes the same work."""
+        spread over decode_stagger_s so D reaches a steady mix rather than one wave
+        (`stagger_s`: over that long instead); prompt lengths come from a trace fixed
+        by (concurrency, rep, mix), so every clock decodes the same work. Requests of
+        `output_tokens` tokens (default decode_output_tokens) get `drain_s` (default
+        drain_timeout_s) to finish after `seconds`."""
         await self.lock(clock)
         if self._kv_tokens is None:
             self._kv_tokens = await self.kv_capacity()
         outcomes: list[ProbeOutcome] = []
         stop_sampling = asyncio.Event()
         samples: list = []
-        violations = 0
-        salt = {"all": 0, "short": 1, "long": 2}[mix]
+        salt = {"all": 0, "short": 1, "long": 2, "shortest": 3}[mix]
         trace = random.Random(self.s.seed * 7_919 + concurrency * 101 + rep + 1_000_003 * salt)
-        stagger = min(self.s.decode_stagger_s, seconds / 3)
+        stagger = min(self.s.decode_stagger_s, seconds / 3) if stagger_s is None else stagger_s
+        output_tokens = self.s.decode_output_tokens if output_tokens is None else output_tokens
+        drain_s = self.s.drain_timeout_s if drain_s is None else drain_s
         async with self.client_factory() as client:
             tokens_before = await self._counter(client, self.decode, GENERATION_TOKENS)
             await self._append_sample(samples)
@@ -573,16 +651,13 @@ class CanaryProbe:
             deadline = time.monotonic() + seconds
 
             async def worker(index: int, prompts: list[int]) -> None:
-                nonlocal violations
                 await asyncio.sleep(stagger * index / max(concurrency, 1))
                 for prompt_tokens in prompts:
                     if time.monotonic() >= deadline:
                         break
-                    output_tokens = self.s.decode_output_tokens
                     outcome = await self.request(client, prompt_tokens, output_tokens)
                     outcomes.append(outcome)
-                    if self._record(clock, outcome):
-                        violations += 1
+                    self._record(clock, outcome)
 
             per_worker = 64  # more than a worker can finish within any window
             lengths = [
@@ -597,7 +672,10 @@ class CanaryProbe:
                 for i in range(concurrency)
             ]
             try:
-                await asyncio.wait(workers, timeout=seconds + self.s.drain_timeout_s)
+                _, pending = await asyncio.wait(workers, timeout=seconds + drain_s)
+                for outcome in self._censor(pending):
+                    outcomes.append(outcome)
+                    self._record(clock, outcome)
                 await self._append_sample(samples)
                 tokens_after = await self._counter(client, self.decode, GENERATION_TOKENS)
             finally:
@@ -608,7 +686,7 @@ class CanaryProbe:
                 await asyncio.gather(*workers, sampler, return_exceptions=True)
         generated = _diff(tokens_before, tokens_after)
         return self._result(
-            clock, "closed", concurrency, outcomes, samples, violations, False, generated
+            clock, "closed", concurrency, outcomes, samples, False, generated
         )
 
 

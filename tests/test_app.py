@@ -45,6 +45,25 @@ def test_cold_start_probes_generate_the_service_output_cap() -> None:
         cold_start_lengths(config)
 
 
+def test_cold_start_lengths_from_a_file(tmp_path) -> None:
+    import json
+
+    import pytest
+
+    from canatune.service import cold_start_lengths
+
+    config = load_config()
+    config["canary"]["max_output_tokens"] = 64
+    path = tmp_path / "lengths.json"
+    path.write_text(json.dumps([[111, 123], [2999, 700], [111, 123]]))
+    config["canary"]["default_lengths_file"] = str(path)
+    # As they are: no output cap, duplicates keep the distribution's weights.
+    assert cold_start_lengths(config) == [(111, 123), (2999, 700), (111, 123)]
+    path.write_text(json.dumps([[3000, 2000]]))  # above max_model_len 4096
+    with pytest.raises(ValueError, match="max_model_len"):
+        cold_start_lengths(config)
+
+
 def test_runtime_lengths_start_from_the_output_cap() -> None:
     import httpx
 

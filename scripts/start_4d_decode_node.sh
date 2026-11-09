@@ -31,6 +31,15 @@ fi
 side_host="${CANATUNE_DECODE_KV_HOST:-${CANATUNE_DECODE_HOST:-}}"
 [[ -n "$side_host" ]] || side_host=$(hostname -I | awk '{print $1}')
 
+# One source of truth for the engine's RUNNING cap and Room's null-limit fallback.
+# Without a job config, retain vLLM 0.15.1's A100 API-server default.
+decode_max_seqs=256
+if [[ -n "${CANATUNE_CONFIG:-}" ]]; then
+  decode_max_seqs=$(PYTHONPATH="${PROJECT_ROOT:+$PROJECT_ROOT/src:}${PYTHONPATH:-}" "$PYTHON_BIN" \
+    -c 'import sys; from canatune.config import load_config, decode_max_num_seqs; print(decode_max_num_seqs(load_config(sys.argv[1])))' \
+    "$CANATUNE_CONFIG") || { echo 'Invalid Decode max_num_seqs configuration' >&2; exit 2; }
+fi
+
 [[ -x "$PYTHON_BIN" ]] || { echo "Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 [[ -d "$MODEL_PATH" ]] || { echo "Model directory does not exist: $MODEL_PATH" >&2; exit 2; }
 command -v curl >/dev/null || { echo "curl is required" >&2; exit 2; }
@@ -126,7 +135,7 @@ for index in "${!gpu_ids[@]}"; do
       -m canatune.infrastructure.memory_plan --config "$CANATUNE_CONFIG" --total-mib "$total_mib") \
       || { echo "decode_${index}: no memory plan for GPU $gpu_id" >&2; exit 2; }
   fi
-  echo "decode_${index}: GPU $gpu_id gpu-memory-utilization $mem_util"
+  echo "decode_${index}: GPU $gpu_id gpu-memory-utilization $mem_util max_num_seqs $decode_max_seqs"
   log_file="${ROLE_WORK_DIR}/logs/decode_${index}.log"
 
   # Optional: a chat template for /v1/chat/completions (a base model has none);
@@ -138,6 +147,7 @@ for index in "${!gpu_ids[@]}"; do
     --model "$MODEL_PATH" --host 0.0.0.0 --port "$http_port" \
     --tensor-parallel-size 1 --max-model-len "${MAX_MODEL_LEN:-4096}" \
     --gpu-memory-utilization "$mem_util" \
+    --max-num-seqs "$decode_max_seqs" \
     --kv-transfer-config "$kv_config" \
     --no-enable-prefix-caching --no-enable-chunked-prefill \
     ${chat_args[@]+"${chat_args[@]}"} >"$log_file" 2>&1 &

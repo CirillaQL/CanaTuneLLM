@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import json
+import random
 import time
 
 import httpx
@@ -195,6 +196,40 @@ def test_same_load_replays_the_same_trace_at_every_clock() -> None:
     assert first and first == second  # identical arrivals and lengths
 
 
+def _window_prompts(probe, requests, eq_tps: float) -> list[int]:
+    requests.clear()
+    asyncio.run(probe.open_window(ClockPoint(2520, 1500), eq_tps, 0.0, 0.3, 1.0))
+    return [len(body["prompt"]) for port, body, _ in requests if port == 8100]
+
+
+def test_trace_by_load_false_keeps_one_trace_when_the_load_changes_slightly() -> None:
+    requests: list = []
+    probe, _ = make_probe(requests, FakeAgent())
+    by_load = [sorted(_window_prompts(probe, requests, 3000.0 + d)) for d in (0.0, 0.5, 1.0, 1.5)]
+    assert len({tuple(p) for p in by_load}) > 1  # the default draws a new trace per load
+
+    probe.s = dataclasses.replace(probe.s, trace_by_load=False)
+    fixed = [sorted(_window_prompts(probe, requests, 3000.0 + d)) for d in (0.0, 0.5, 1.0, 1.5)]
+    assert len({tuple(p) for p in fixed}) == 1
+
+
+def test_trace_by_load_false_takes_a_prefix_and_depends_on_the_seed() -> None:
+    requests: list = []
+    probe, _ = make_probe(requests, FakeAgent())
+    probe.s = dataclasses.replace(probe.s, trace_by_load=False)
+    rng_lengths = probe.lengths.sample(random.Random(probe.s.seed * 1_000_003 + 1), 40)
+    small = _window_prompts(probe, requests, 3000.0)
+    large = _window_prompts(probe, requests, 6000.0)
+    assert len(large) > len(small)
+    first = [p for p, _ in rng_lengths]
+    assert sorted(small) == sorted(first[: len(small)])
+    assert sorted(large) == sorted(first[: len(large)])
+
+    probe.s = dataclasses.replace(probe.s, seed=probe.s.seed + 1)
+    other = _window_prompts(probe, requests, 6000.0)
+    assert sorted(other) != sorted(large)
+
+
 def test_closed_windows_use_long_outputs() -> None:
     requests: list = []
     probe, _ = make_probe(requests, FakeAgent())
@@ -274,10 +309,9 @@ def test_cancelled_window_joins_all_probe_requests_and_sampler(kind):
 
 
 def test_quiesce_requires_both_vllm_nodes_idle_and_available():
-    from dataclasses import replace
 
     probe, _ = make_probe([], FakeAgent())
-    probe.s = replace(probe.s, drain_timeout_s=0.04, sample_period_s=0.001)
+    probe.s = dataclasses.replace(probe.s, drain_timeout_s=0.04, sample_period_s=0.001)
     calls = []
 
     async def metrics(client, endpoint):
@@ -324,3 +358,13 @@ def test_decode_points_average_d_state_over_each_request() -> None:
     assert decode_points([outcome], snaps, None) == []  # no KV size: no samples
     alone = dataclasses.replace(outcome, first_token_at=2.0)
     assert decode_points([alone], snaps, 1000) == []  # one snapshot is too few
+
+
+def test_probe_client_does_not_cap_the_sequences_of_a_window() -> None:
+    from canatune.service import probe_client
+
+    client = probe_client()
+    try:
+        assert client._transport._pool._max_connections > 512  # type: ignore[attr-defined]
+    finally:
+        asyncio.run(client.aclose())

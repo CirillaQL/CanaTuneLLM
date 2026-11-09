@@ -5,12 +5,19 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter
 from pydantic import BaseModel
 
+from canatune.domain.groups import ClockPoint
+
 if TYPE_CHECKING:
     from canatune.service import Runtime
 
 
 class CanaryRequest(BaseModel):
     action: str  # "full", "relocate", "recheck", "verify" or "abort"
+
+
+class WorkingRequest(BaseModel):
+    prefill_mhz: int | None = None  # both None: back to the table's H
+    decode_mhz: int | None = None
 
 
 def create_control_router(runtime: "Runtime") -> APIRouter:
@@ -52,5 +59,24 @@ def create_control_router(runtime: "Runtime") -> APIRouter:
             ok, reason = runtime.canary.request(request.action, "api")
             return {"ok": ok, "reason": reason}
         return {"ok": False, "reason": "action must be full, relocate, recheck, verify or abort"}
+
+    @router.post("/working")
+    async def working(request: WorkingRequest) -> dict[str, Any]:
+        """Lock tier H to these clocks (snapped to supported ones) on every group at H;
+        an evaluation hook for clock grids, see TierController.set_working."""
+        if (request.prefill_mhz is None) != (request.decode_mhz is None):
+            return {"ok": False, "reason": "give both clocks, or neither to clear"}
+        if runtime.tiers.table is None:
+            return {"ok": False, "reason": "no tier table yet"}
+        point = (
+            None
+            if request.prefill_mhz is None
+            else ClockPoint(int(request.prefill_mhz), int(request.decode_mhz))
+        )
+        try:
+            clock = await runtime.controller.set_working(point, "api")
+        except ValueError as error:
+            return {"ok": False, "reason": str(error)}
+        return {"ok": True, "clock": clock.key()}
 
     return router

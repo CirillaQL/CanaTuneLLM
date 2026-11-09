@@ -51,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--python", required=True, help="vLLM environment's Python")
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    ap.add_argument(
+        "--all-pairs-production", action="store_true",
+        help="production_pairs = every pair, P0/D0 included (round_robin baseline on all GPUs)",
+    )
     args = ap.parse_args(argv)
 
     n = len(args.prefill_gpus)
@@ -93,7 +97,8 @@ def main(argv: list[str] | None = None) -> int:
             }
     topology["endpoints"] = endpoints
     config["routing"]["canary_pair"] = ["P0", "D0"]
-    config["routing"]["production_pairs"] = [[f"P{i}", f"D{i}"] for i in range(1, n)]
+    first = 0 if args.all_pairs_production else 1  # P0/D0 is the Canary's otherwise
+    config["routing"]["production_pairs"] = [[f"P{i}", f"D{i}"] for i in range(first, n)]
     config["runtime"]["python"] = args.python
     config["project"]["work_dir_root"] = str(Path(args.work_dir).parent)
     for key, value in overrides:

@@ -17,6 +17,11 @@ and admits to the most loaded feasible group (concentration keeps batches large)
 (`group_choice: fill`) to the first feasible group in a fixed order (production groups,
 then the Canary) whose P holds fewer requests than the P slot cap the Canary measured,
 spreading over the feasible groups by the fewest at P once every P is at its cap.
+`group_choice: room` keeps that fixed order but spills by what a group is carrying: its
+P's busy share over the last room_rho_window_s and the sequences on its D, each against
+the limit the Canary measured on this deployment (evidence["room"]). A D queues new
+sequences long before the length model's TPOT bound reaches the SLO, so the P slot cap
+and the bound alone cannot see it.
 Under P2pNcclConnector PUT_ASYNC a send blocked by D keeps its request at P, so
 the count at P sees P queueing and P blocked by D alike; a group that drains takes
 the next request again (the order is checked from the start every time). The KV gate
@@ -53,7 +58,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from canatune.config import kv_receive_buffer_bytes
+from canatune.config import decode_max_num_seqs, kv_receive_buffer_bytes
 from canatune.domain.admission import (
     CostBook,
     PrefillCost,
@@ -118,9 +123,18 @@ class RouterSettings:
     # default), round_robin (in turn; ablation A1: clocks from the Canary, no
     # concentration) or fill (the first in a fixed order below the P slot cap, then
     # the fewest at P; full effort: round robin, power of two choices from
-    # fill_p2c_groups routable groups, without the KV in-flight gate).
+    # fill_p2c_groups routable groups, without the KV in-flight gate) or room (the same
+    # order and full effort, spilling on the Canary's evidence["room"] limits instead of the
+    # P slot cap; the least loaded relative to those limits once no group has room).
     group_choice: str = "concentrate"
     fill_p2c_groups: int = 4
+    room_rho_window_s: float = 10.0
+    decode_max_num_seqs: int = 256  # same explicit limit passed to vLLM's Decode launcher
+    # Live requests that must be near the SLO at once for production pressure: at least
+    # this many, and this share of the live requests. 1 and 0.0: a single request is
+    # enough, and a group's first near-SLO request marks it as pressured.
+    live_pressure_min_requests: int = 1
+    live_pressure_fraction: float = 0.0
     # fill: a D takes more only while its length-model TPOT bound stays below this
     # share of the TPOT SLO (controller.feedback_near_slo: from there production
     # feedback counts the latency as pressure, so a group filled to the SLO itself
@@ -185,9 +199,13 @@ class RouterSettings:
             d_choice=_choice(raw, "d_choice", ("concentrate", "balance"), "concentrate"),
             p_choice=_choice(raw, "p_choice", ("balance", "same", "concentrate"), "balance"),
             group_choice=_choice(
-                raw, "group_choice", ("concentrate", "round_robin", "fill"), "concentrate"
+                raw, "group_choice", ("concentrate", "round_robin", "fill", "room"), "concentrate"
             ),
             fill_p2c_groups=int(_positive(raw, "fill_p2c_groups", 4)),
+            room_rho_window_s=_positive(raw, "room_rho_window_s", 10.0),
+            decode_max_num_seqs=decode_max_num_seqs(config),
+            live_pressure_min_requests=int(_positive(raw, "live_pressure_min_requests", 1)),
+            live_pressure_fraction=_non_negative(raw, "live_pressure_fraction", 0.0),
             near_slo=_fraction(controller, "feedback_near_slo", 0.9),
             knee_update=bool(raw.get("knee_update", True)),
             tpot_feedback=_choice(raw, "tpot_feedback", ("window", "gap"), "window"),
@@ -377,6 +395,10 @@ class CanaTuneRouter:
         self.kv_fraction = 1.0
         # Requests at one P from which the Canary measured violations (fill); None: no cap.
         self.p_slot_cap: int | None = None
+        # group_choice room: what the Canary measured a group can carry at H (None: not
+        # measured or no limit reached; D then falls back to the engine limit).
+        self.room_p_rho: float | None = None
+        self.room_d_sequences: int | None = None
         self._kv_knee: KneeCounts | None = None  # Canary's counts + production's
         self._slot_knee: KneeCounts | None = None
         self._rng = random.Random(0)  # power of two choices (reproducible)
@@ -396,6 +418,7 @@ class CanaTuneRouter:
         self.baseline_mode = False
         self._rr = 0
         self._group_rr = 0  # group_choice round_robin: the next group index in turn
+        self._p_work: dict[str, deque[tuple[float, float]]] = {}  # P: (admitted, prefill ms)
         self.d_exhausted: deque[float] = deque()  # marks: no D safe for one more request
         self.pressure_event = asyncio.Event()
         self.risk_signals = 0
@@ -450,6 +473,21 @@ class CanaTuneRouter:
         self._idle_ttft = {
             int(k): float(v) for k, v in ((evidence or {}).get("idle_ttft_ms") or {}).items()
         }
+        room = (evidence or {}).get("room") or {}
+        self.room_p_rho = room.get("p_rho")
+        measured_d = room.get("d_sequences")
+        self.room_d_sequences = min(
+            self.settings.decode_max_num_seqs,
+            measured_d if measured_d is not None else self.settings.decode_max_num_seqs,
+        )
+        d_source = ("engine_fallback" if measured_d is None else
+                    "engine_cap" if measured_d > self.settings.decode_max_num_seqs else "measured")
+        if self.settings.group_choice == "room":
+            self.log.write({"event": "room_limits", "published_at": key,
+                            "p_rho": self.room_p_rho, "d_sequences": self.room_d_sequences,
+                            "d_measured_sequences": measured_d,
+                            "d_source": d_source,
+                            "d_engine_limit": self.settings.decode_max_num_seqs})
         admission = (evidence or {}).get("admission")
         if admission:
             self.predictor.set_prior(admission["predictor_coef"])
@@ -696,7 +734,8 @@ class CanaTuneRouter:
 
     def _note_d_exhausted(self) -> None:
         """No D could take one more request within the length model and the KV wall
-        (counting growth): one mark per 0.2 s, the Controller's D capacity trigger."""
+        (counting growth), or (group_choice room) no group has room: one mark per 0.2 s,
+        the Controller's D capacity trigger."""
         now = self._clock()
         if self.d_exhausted and now - self.d_exhausted[-1] < 0.2:
             return
@@ -730,6 +769,17 @@ class CanaTuneRouter:
                 return min(order, key=lambda item: (
                     item[0].p.n_at_p, self._tpot_by_group.get(item[0].d.name, 0.0),
                     item[0].p.pending_ms))  # fmt: skip
+            if self.settings.group_choice == "room":
+                # Fixed order, production before Canary: the first group carrying less
+                # than its limits; once none has room, the least loaded against them.
+                order = sorted(feasible, key=lambda item: (item[0].p.canary, index(item[0].p)))
+                near = self.settings.near_slo * self.settings.tpot_slo_ms
+                for item in order:
+                    tpot = self._tpot_by_group.get(item[0].d.name)
+                    if self.has_room(item[0].p, item[0].d) and (tpot is None or tpot <= near):
+                        return item
+                self._note_d_exhausted()  # no group has room: the Controller's capacity trigger
+                return min(order, key=lambda item: self._room_used(item[0].p, item[0].d))
             if self.settings.group_choice == "round_robin":
                 # In turn: the first feasible group at or after the cursor.
                 n = len(self.groups)
@@ -830,11 +880,11 @@ class CanaTuneRouter:
         """Baseline mode (high load): what the default system does, round robin over
         the fixed pairs, keeping only the hard limits (fresh D telemetry, D KV wall,
         KV in flight). No risk, length model or concentration decides here. With
-        `group_choice: fill` the KV in-flight gate does not apply (at full effort it
+        `group_choice: fill` or `room` the KV in-flight gate does not apply (at full effort it
         held back hardly any request), and from fill_p2c_groups usable groups the
         less loaded P of two drawn at random takes it (power of two choices)."""
         n = len(self.groups)
-        fill = self.settings.group_choice == "fill"
+        fill = self.settings.group_choice in ("fill", "room")
         usable: list[tuple[Group, bool]] = []
         for k in range(n):
             group = self.groups[(self._rr + k) % n]
@@ -938,6 +988,8 @@ class CanaTuneRouter:
         if dg is not group:
             dg.n_inflight += 1
         group.record_admission(now, tokens, self.settings.load_window_s)
+        if self.settings.group_choice == "room":
+            self._p_work.setdefault(group.name, deque()).append((now, s_own))
         self.admitted += 1
         if self.settings.overload == "best_effort":
             self._live[ticket.id] = ticket
@@ -1145,6 +1197,32 @@ class CanaTuneRouter:
     def is_cooled(self, group: str, now: float | None = None) -> bool:
         return self.cooled.get(group, float("-inf")) > (self._clock() if now is None else now)
 
+    def p_rho(self, group: Group, now: float | None = None) -> float:
+        """Share of the last room_rho_window_s that `group`'s P needs for the prefill work
+        admitted to it (group_choice room), by the Canary's S(L) at the admission clock."""
+        now = self._clock() if now is None else now
+        window_s = self.settings.room_rho_window_s
+        work = self._p_work.get(group.name)
+        if not work:
+            return 0.0
+        while work and work[0][0] <= now - window_s:
+            work.popleft()
+        return sum(ms for _, ms in work) / (window_s * 1000.0)
+
+    def _room_used(self, group: Group, decode: Group | None = None) -> float:
+        """How full the fuller side of a route is: 1 at its room limit."""
+        self._apply_table()
+        d = group if decode is None else decode
+        p = 0.0 if self.room_p_rho is None else self.p_rho(group) / self.room_p_rho
+        sequences = 0.0 if self.room_d_sequences is None else (
+            (d.n_await + d.n_decoding) / self.room_d_sequences
+        )  # fmt: skip
+        return max(p, sequences)
+
+    def has_room(self, group: Group, decode: Group | None = None) -> bool:
+        """group_choice room: not cooled and below its P and D limits."""
+        return not self.is_cooled(group.name) and self._room_used(group, decode) < 1.0
+
     def observe_latency(
         self, ticket: Ticket, ttft_ms: float | None, tpot_ms: float | None,
     ) -> None:
@@ -1255,6 +1333,8 @@ class CanaTuneRouter:
         window = self.settings.tpot_feedback == "window"
         live_ratio = stall_ratio = 0.0
         live_by: dict[str, float] = {}
+        live_near: dict[str, int] = {}  # per group: live requests at `near` or above
+        live_severe = live_total = gap_near = 0
         for ticket in self._live.values():
             if ticket.admitted_at < admitted_since:
                 continue
@@ -1265,12 +1345,19 @@ class CanaTuneRouter:
                 ratio = self._ttft_ratio(ticket, age)
                 live_ratio = max(live_ratio, ratio)
                 live_by[ticket.group.name] = max(live_by.get(ticket.group.name, 0.0), ratio)
+                live_total += 1
+                if ratio >= near:
+                    live_near[ticket.group.name] = live_near.get(ticket.group.name, 0) + 1
+                live_severe += ratio >= 2
             elif ticket.last_token_at is not None:
                 gap = (now - ticket.last_token_at) * 1000 / self.settings.tpot_slo_ms
                 if window:  # a stall counts as pressure, never as severe
                     stall_ratio = max(stall_ratio, gap)
                 else:
                     live_ratio = max(live_ratio, gap)
+                    live_total += 1
+                    gap_near += gap >= near
+                    live_severe += gap >= 2
         wait_ratio = max(
             ((now - t) * 1000 / self.settings.ttft_slo_ms
              for t in self._waiting_since.values()), default=0.0,
@@ -1278,6 +1365,9 @@ class CanaTuneRouter:
         fraction = sum(r >= near for r in ratios) / len(ratios) if ratios else 0.0
         tpot_q, tpot_group = self.tpot_window() if window else (0.0, None)
         stalled = stall_ratio >= self.settings.tpot_stall_factor
+        live_min = max(self.settings.live_pressure_min_requests,
+                       math.ceil(self.settings.live_pressure_fraction * live_total))  # fmt: skip
+        live_pressure = sum(live_near.values()) + gap_near >= live_min
         groups, pressured = {}, []
         for name in sorted(set(per) | set(live_by)):
             values = per.get(name, [])
@@ -1287,7 +1377,8 @@ class CanaTuneRouter:
             # Where the cluster's pressure comes from: a group with near-SLO requests of
             # its own (the cluster test above already asked for min_samples; one group
             # rarely has as many in a window, so it is not asked again here).
-            if share > 0 or live >= near:
+            near_requests = sum(r >= near for r in values) + live_near.get(name, 0)
+            if near_requests >= self.settings.live_pressure_min_requests:
                 pressured.append(name)
         if tpot_q >= 1.0 and tpot_group is not None and tpot_group not in pressured:
             pressured.append(tpot_group)
@@ -1297,8 +1388,8 @@ class CanaTuneRouter:
             "tpot_window_ratio": tpot_q, "tpot_window_group": tpot_group,
             "stall_ratio": stall_ratio,
             "pressure": (len(ratios) >= min_samples and fraction > self.settings.theta)
-            or max(live_ratio, wait_ratio) >= near or tpot_q >= 1.0 or stalled,
-            "severe": max(live_ratio, wait_ratio) >= 2,
+            or live_pressure or wait_ratio >= near or tpot_q >= 1.0 or stalled,
+            "severe": live_severe >= live_min or wait_ratio >= 2,
             "groups": groups, "pressured_groups": pressured,
         }
 

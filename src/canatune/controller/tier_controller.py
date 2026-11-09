@@ -10,7 +10,8 @@ With a table, every tick:
   group_choice fill) confirmed pressure is first answered inside the serving groups:
   the groups whose own latency shows it are cooled (no room for a feedback window),
   new requests go to the groups with room, and only when no group has room or the
-  requests admitted after the redirect still show pressure does the cluster go to MAX.
+  requests admitted after the redirect still show pressure does the cluster go to MAX
+  (group_choice room: a group at its room limits counts as having no room).
   Recover after a quiet t_down_s using actual feedback, not a model-only feasibility
   decision.
   Legacy overload policies retain incremental wake/abort/boost behavior.
@@ -41,7 +42,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from canatune.controller.router import CanaTuneRouter
-from canatune.domain.groups import Group, GroupState, Tier, TierState, TierStore, TierTable, slower
+from canatune.domain.groups import (
+    ClockPoint,
+    Group,
+    GroupState,
+    Tier,
+    TierState,
+    TierStore,
+    TierTable,
+    slower,
+)
 from canatune.domain.models import ClusterModel, Evaluation, Solver
 from canatune.infrastructure.clocks import ClockActuator, GpuRef
 from canatune.infrastructure.records import JsonlLog
@@ -54,6 +64,10 @@ class ControllerConfigError(ValueError):
 @dataclass(frozen=True)
 class ControllerSettings:
     period_s: float = 1.0
+    # Pressure wakes control early, but ticks stay this far apart: in overload every
+    # streamed token sets the pressure event, and back-to-back ticks (each sorting the
+    # TPOT window) took the event loop from the proxy (Vera job 10643648).
+    min_tick_s: float = 0.1
     load_window_s: float = 10.0
     t_down_s: float = 30.0
     min_active_groups: int = 1
@@ -84,7 +98,7 @@ class ControllerSettings:
     full_effort_min_s: float = 30.0
     exit_rate_fraction: float = 0.8
     # Clocks of a group at tier H: canary (the Canary's published H, the default) or
-    # max (ablation A2: concentration and admission as usual, no frequency scaling).
+    # max (explicitly locked MAX) or driver (release locks; NVIDIA manages clocks).
     production_clocks: str = "canary"
     # fill: answer confirmed pressure by cooling the pressured groups and sending new
     # requests to the others first; MAX only once no group has room.
@@ -102,8 +116,10 @@ class ControllerSettings:
                 or self.d_trigger_count < 1 or not self.d_trigger_window_s > 0
                 or self.full_effort_min_s < 0 or not 0 < self.exit_rate_fraction <= 1):
             raise ControllerConfigError("invalid high-load settings")
-        if self.production_clocks not in ("canary", "max"):
-            raise ControllerConfigError("controller.production_clocks must be canary or max")
+        if self.production_clocks not in ("canary", "max", "driver"):
+            raise ControllerConfigError(
+                "controller.production_clocks must be canary, max or driver"
+            )
 
     @classmethod
     def from_config(cls, config: Mapping[str, Any]) -> "ControllerSettings":
@@ -112,6 +128,7 @@ class ControllerSettings:
             raise ControllerConfigError("controller section is required")
         return cls(
             period_s=float(raw.get("period_s", 1.0)),
+            min_tick_s=float(raw.get("min_tick_s", 0.1)),
             load_window_s=float(raw.get("load_window_s", 10.0)),
             t_down_s=float(raw.get("t_down_s", 30.0)),
             min_active_groups=int(raw.get("min_active_groups", 1)),
@@ -193,6 +210,7 @@ class TierController:
         self._full_effort_since = float("-inf")
         self._full_effort_rate = 0.0
         self._redirected_at: float | None = None  # expanding by a redirect since then
+        self._driver_ready: set[str] = set()
 
     # ---- actuation ---------------------------------------------------------------
 
@@ -213,25 +231,47 @@ class TierController:
         )
         return bool(result.get("ok"))
 
+    async def _reset(self, endpoint: str) -> bool:
+        ref = self.gpu_refs.get(endpoint)
+        try:
+            if ref is None:
+                raise RuntimeError("driver mode requires a GPU agent to release clock locks")
+            result = await self.actuator.reset(ref)
+        except Exception as error:
+            self.log.write({"event": "clock_error", "endpoint": endpoint,
+                            "operation": "reset", "error": str(error)})
+            return False
+        self.log.write({"event": "clock_reset", "endpoint": endpoint, **result})
+        return bool(result.get("ok"))
+
     async def set_tier(self, group: Group, tier: Tier, reason: str) -> None:
-        """Lock P and D to `tier`; the Router sees the conservative point meanwhile."""
+        """Apply the tier policy; driver mode releases locks instead of setting MHz.
+
+        MAX is only the Router's reference point in driver mode, not a measured or
+        locked clock. The locator uses the actuator directly for its own probes.
+        """
         old = group.effective
         target = self.tiers.clocks(tier)
-        if tier is Tier.H and self.settings.production_clocks == "max":
+        driver = self.settings.production_clocks == "driver"
+        if driver:
+            target = self.tiers.clocks(Tier.MAX)
+            self._driver_ready.discard(group.name)
+        elif tier is Tier.H and self.settings.production_clocks == "max":
             target = self.tiers.clocks(Tier.MAX)  # ablation A2: H in name, MAX clocks
         group.tier = tier
         epochs = self.router.clock_epochs
         epochs[group.name] = epochs.get(group.name, 0) + 1
         group.effective = None if tier is Tier.PARK or old is None else slower(old, target)
-        ok = all(
-            await asyncio.gather(
-                self._lock(group.prefill, target.prefill_mhz),
-                self._lock(group.decode, target.decode_mhz),
-            )
+        actions = (self._reset(group.prefill), self._reset(group.decode)) if driver else (
+            self._lock(group.prefill, target.prefill_mhz),
+            self._lock(group.decode, target.decode_mhz),
         )
+        ok = all(await asyncio.gather(*actions))
         if group.tier is tier:
             if ok:
                 self._retry.pop(group.name, None)
+                if driver:
+                    self._driver_ready.add(group.name)
             else:
                 # Retry from tick(), backing off from period_s up to t_down_s.
                 _, delay = self._retry.get(group.name, (0.0, self.settings.period_s / 2))
@@ -250,6 +290,8 @@ class TierController:
                 "group": group.name,
                 "tier": tier.value,
                 "clock": target.key(),
+                "clock_policy": self.settings.production_clocks,
+                "clock_is_reference": driver,
                 "ok": ok,
                 "reason": reason,
             }
@@ -267,6 +309,37 @@ class TierController:
                 continue
             group.state = GroupState.ACTIVE
             await self.set_tier(group, Tier.MAX if cold else Tier.H, "start")
+
+    async def snap(self, point: ClockPoint) -> ClockPoint:
+        """The supported clocks nearest to `point` (those of the Canary pair's GPUs;
+        unchanged without clock control)."""
+        refs = self.gpu_refs
+        canary = next((g for g in self.groups if g.canary), self.groups[0])
+        out = []
+        wanted = ((canary.prefill, point.prefill_mhz), (canary.decode, point.decode_mhz))
+        for endpoint, mhz in wanted:
+            ref = refs.get(endpoint)
+            clocks = await self.actuator.supported_clocks(ref) if ref is not None else []
+            out.append(min(clocks, key=lambda f: (abs(f - mhz), -f)) if clocks else mhz)
+        return ClockPoint(*out)
+
+    async def set_working(self, point: ClockPoint | None, reason: str = "api") -> ClockPoint:
+        """Override the working clocks of tier H (None: the table's H again) and move
+        every active group at H there now. An evaluation hook (a clock grid against
+        the Canary's choice): the solver, when on, chooses the working point itself."""
+        if self.settings.solver:
+            raise ControllerConfigError("the working point is the solver's while it is on")
+        async with self._control_lock:
+            self.tiers.working = None if point is None else await self.snap(point)
+            target = self.tiers.clocks(Tier.H)
+            for group in self.groups:
+                if group.state is GroupState.ACTIVE and group.tier is Tier.H:
+                    await self.set_tier(group, Tier.H, reason)
+            self.log.write(
+                {"event": "working_override", "requested": None if point is None else point.key(),
+                 "clock": target.key(), "reason": reason}
+            )  # fmt: skip
+            return target
 
     async def publish(self, table: TierTable, reason: str) -> None:
         """Adopt a new tier table; active groups move to it one at a time so that
@@ -510,13 +583,14 @@ class TierController:
             self._mode("energy", "production_recovered")
 
     def _redirect(self, now: float, f: Mapping[str, Any]) -> bool:
-        """fill: cool the groups whose own production latency shows the pressure (no
+        """fill, room: cool the groups whose own production latency shows the pressure (no
         room for a feedback window) and keep serving at the working clocks while some
         routable group has room -> whether the pressure was answered this way. Pressure
         in every group leaves no room, and pressure no group shows (the proxy's own
         wait) is no hot spot: False, MAX."""
         s = self.settings
-        if not s.redirect or self.router.settings.group_choice != "fill":
+        choice = self.router.settings.group_choice
+        if not s.redirect or choice not in ("fill", "room"):
             return False
         pressured = [g for g in self.groups if g.name in (f.get("pressured_groups") or ())]
         if not pressured:
@@ -525,7 +599,8 @@ class TierController:
         for group in pressured:
             self.router.cool(group.name, until)
         room = [g.name for g in self.groups
-                if g.routable and not self.router.is_cooled(g.name, now)]
+                if g.routable and not self.router.is_cooled(g.name, now)
+                and (choice != "room" or self.router.has_room(g))]
         self.log.write({"event": "redirect", "cooled": [g.name for g in pressured],
                         "until_s": s.feedback_window_s, "room": room,
                         "groups": f.get("groups")})
@@ -751,12 +826,22 @@ class TierController:
 
     async def run(self, stop: asyncio.Event) -> None:
         """Control loop; `start()` must have run (the Runtime does it)."""
+        loop = asyncio.get_running_loop()
         while not stop.is_set():
             self.router.pressure_event.clear()
+            started = loop.time()
             try:
                 await self.tick()
             except Exception as error:  # a bad tick must not stop control
                 self.log.write({"event": "controller_error", "error": repr(error)})
+            spacing = self.settings.min_tick_s - (loop.time() - started)
+            if spacing > 0:  # pressure set meanwhile stays set: the next wait returns at once
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=spacing)
+                except asyncio.TimeoutError:
+                    pass
+                if stop.is_set():
+                    break
             try:
                 stopping = asyncio.create_task(stop.wait())
                 pressure = asyncio.create_task(self.router.pressure_event.wait())
@@ -776,6 +861,9 @@ class TierController:
         table = self.tiers.table
         return {
             "mode": self.mode,
+            "production_clocks": self.settings.production_clocks,
+            "driver_clocks_ready": all(g.name in self._driver_ready for g in self.groups
+                                       if g.state is GroupState.ACTIVE),
             "production_feedback": dict(self.feedback),
             "tiers": None if table is None else table.to_json(),
             "max_point": self.tiers.max_point.key(),

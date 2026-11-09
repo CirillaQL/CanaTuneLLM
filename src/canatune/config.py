@@ -11,6 +11,18 @@ class ConfigError(ValueError):
     """Raised when a configuration file cannot be loaded."""
 
 
+def decode_max_num_seqs(config: Mapping[str, Any]) -> int:
+    """Decode engine RUNNING limit, shared by its launcher and Room's fallback.
+
+    256 matches vLLM 0.15.1's A100 API-server default. The launcher passes it
+    explicitly so an engine-default change cannot silently disagree with routing.
+    """
+    value = config.get("runtime", {}).get("decode_max_num_seqs", 256)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ConfigError("runtime.decode_max_num_seqs must be a positive integer")
+    return value
+
+
 def load_config(path: str | Path = "config.yaml") -> dict[str, Any]:
     """Load a YAML configuration file as a mapping.
 
