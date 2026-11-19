@@ -78,7 +78,18 @@ class GpuBackend:
             "power_w": self.nv.nvmlDeviceGetPowerUsage(handle) / 1000.0,
             "energy_mj": float(self.nv.nvmlDeviceGetTotalEnergyConsumption(handle)),
             "throttle_reasons": None if reasons is None else int(reasons(handle)),
+            "util_pct": self._optional(lambda: self.nv.nvmlDeviceGetUtilizationRates(handle).gpu),
+            "power_limit_w": self._optional(
+                lambda: self.nv.nvmlDeviceGetEnforcedPowerLimit(handle) / 1000.0),
         }
+
+    @staticmethod
+    def _optional(read: Any) -> float | None:
+        """A reading only the HALO comparison uses: None where NVML lacks it."""
+        try:
+            return float(read())
+        except Exception:
+            return None
 
     @staticmethod
     def _smi(index: int, *args: str) -> None:
@@ -126,6 +137,8 @@ class DryRunBackend:
             "power_w": 50.0,
             "energy_mj": (time.monotonic() - self._t0) * 50_000.0,
             "throttle_reasons": 0,
+            "util_pct": 50.0,
+            "power_limit_w": 100.0,
         }
 
     def lock(self, index: int, mhz: int) -> None:

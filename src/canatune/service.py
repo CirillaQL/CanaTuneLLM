@@ -15,6 +15,7 @@ from canatune.controller.feedback import (
     FeedbackRouter,
     FeedbackSettings,
 )
+from canatune.controller.halo import HaloController, HaloSettings
 from canatune.controller.locator import (
     AdmissionInputs,
     LocatorSettings,
@@ -60,7 +61,9 @@ class Runtime:
     events: JsonlLog
     tiers: TierState
     lengths: LengthStats
-    feedback: FeedbackClockController | None = None  # the feedback heuristic, no Canary
+    # A comparison system that owns the clocks instead of the Canary: the feedback
+    # heuristic or the HALO bandit.
+    feedback: FeedbackClockController | HaloController | None = None
     tasks: list[asyncio.Task] = field(default_factory=list)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -227,8 +230,12 @@ def build_runtime(
     groups = build_groups(config)
     router_settings = RouterSettings.from_config(config)
     feedback_settings = FeedbackSettings.from_config(config)
-    if feedback_settings.enabled:
-        tiers.table = None  # the heuristic never uses a tier table
+    halo_settings = HaloSettings.from_config(config)
+    if feedback_settings.enabled and halo_settings.enabled:
+        raise ValueError("feedback.enabled and halo.enabled exclude each other")
+    comparison = feedback_settings.enabled or halo_settings.enabled
+    if comparison:
+        tiers.table = None  # the comparison systems never use a tier table
     slack = SlackRisk(
         slack_edges(router_settings.ttft_slo_ms),
         min_samples=int(risk_raw.get("min_samples", 20)),
@@ -238,9 +245,11 @@ def build_runtime(
     router_kwargs: dict[str, Any] = dict(
         lengths=lengths, telemetry=telemetry, log=requests_log, slack=slack
     )
-    if feedback_settings.enabled:
+    if comparison:
+        routing = halo_settings.routing if halo_settings.enabled else "watermark"
         router: CanaTuneRouter = FeedbackRouter(
-            groups, table, router_settings, tiers, feedback=feedback_settings, **router_kwargs
+            groups, table, router_settings, tiers, feedback=feedback_settings,
+            routing=routing, **router_kwargs
         )
     else:
         router = CanaTuneRouter(groups, table, router_settings, tiers, **router_kwargs)
@@ -276,11 +285,15 @@ def build_runtime(
 
     locator = None
     canary_group = groups[0]
-    if feedback_settings.enabled:
+    if comparison:
         assert isinstance(router, FeedbackRouter)
-        feedback = FeedbackClockController(
-            groups, router, controller, feedback_settings, log=events
-        )
+        feedback: FeedbackClockController | HaloController
+        if halo_settings.enabled:
+            feedback = HaloController(groups, router, controller, halo_settings, log=events)
+        else:
+            feedback = FeedbackClockController(
+                groups, router, controller, feedback_settings, log=events
+            )
         canary = CanaryScheduler(
             controller, None, lengths, SchedulerSettings.from_config(config),
             theta=router_settings.theta,

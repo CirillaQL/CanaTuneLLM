@@ -8,7 +8,8 @@ The service starts as in smoke_production.py (BENCH_MODE):
             no calibration
   baseline  the `round_robin` policy, clocks left to the driver
   feedback  the `cantune` policy with feedback.enabled (the feedback heuristic: no
-            Canary, watermark routing and SLO-feedback clocks): no publish to wait for
+            Canary, watermark routing and SLO-feedback clocks) or halo.enabled (the
+            HALO-style bandit, round robin): no publish to wait for
 Then `vllm bench serve` runs once per request rate (BENCH_RATES) against the proxy,
 with the same dataset sample (fixed seed) in every mode (BENCH_WORKLOADS: several
 datasets in turn, each with its own rates, in one service lifetime), while the node agents'
@@ -625,8 +626,9 @@ def main() -> int:
     policy = config["routing"]["policy"]
     if (mode != "baseline") != (policy == "cantune"):
         raise SystemExit(f"BENCH_MODE={mode} does not match routing.policy={policy}")
-    if (mode == "feedback") != bool((config.get("feedback") or {}).get("enabled")):
-        raise SystemExit(f"BENCH_MODE={mode} does not match feedback.enabled")
+    comparison = any((config.get(k) or {}).get("enabled") for k in ("feedback", "halo"))
+    if (mode == "feedback") != comparison:
+        raise SystemExit(f"BENCH_MODE={mode} does not match feedback.enabled / halo.enabled")
     for workload in settings.workloads or (settings,):
         if not Path(workload.dataset).is_file():
             raise SystemExit(f"dataset {workload.dataset} is not a file")

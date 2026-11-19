@@ -82,14 +82,21 @@ class FeedbackSettings:
 
 
 class FeedbackRouter(CanaTuneRouter):
-    """CanaTune's Router in open admission with watermark routing; it also keeps the
-    SLO outcome of every finished request for the clock controller."""
+    """CanaTune's Router in open admission with watermark routing (or round robin, the
+    HALO comparison); it also keeps the latency and SLO outcome of every finished
+    request for the clock controller."""
 
-    def __init__(self, *args: Any, feedback: FeedbackSettings, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, feedback: FeedbackSettings, routing: str = "watermark",
+                 **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if routing not in ("watermark", "round_robin"):
+            raise FeedbackConfigError("routing must be watermark or round_robin")
         self.feedback = feedback
-        # (finish time, TTFT violated, TPOT violated) of finished requests
-        self.finished_outcomes: deque[tuple[float, bool, bool]] = deque()
+        self.routing = routing
+        self._next = 0  # round robin: the next group index in turn
+        # (finish time, TTFT violated, TPOT violated, TTFT ms, TPOT ms) of finished requests
+        self.finished_outcomes: deque[tuple[float, bool, bool, float | None, float | None]] = (
+            deque())
 
     def kv_usage(self, group: Group) -> float | None:
         if self.telemetry is None:
@@ -106,6 +113,11 @@ class FeedbackRouter(CanaTuneRouter):
 
     def _choose(self, feasible):  # type: ignore[no-untyped-def]
         index = self.groups.index
+        if self.routing == "round_robin":  # the pairs in turn, as the baseline routes
+            n = len(self.groups)
+            item = min(feasible, key=lambda item: (index(item[0].p) - self._next) % n)
+            self._next = (index(item[0].p) + 1) % n
+            return item
         order = sorted(feasible, key=lambda item: (item[0].p.canary, index(item[0].p)))
         for item in order:
             if self.below_watermarks(item[0]):
@@ -124,7 +136,9 @@ class FeedbackRouter(CanaTuneRouter):
             else:
                 outcome = (ttft_ms is None or ttft_ms > s.ttft_slo_ms,
                            tpot_ms is not None and tpot_ms > s.tpot_slo_ms)
-            self.finished_outcomes.append((self._clock(), *outcome))
+            ok = status == "ok"
+            self.finished_outcomes.append((self._clock(), *outcome,
+                                           ttft_ms if ok else None, tpot_ms if ok else None))
         super().finish(ticket, status=status, ttft_ms=ttft_ms, tpot_ms=tpot_ms,
                        output_tokens=output_tokens, timing=timing)
 
@@ -142,6 +156,27 @@ def ladder(supported: Sequence[int], floor: int, top: int, steps: int) -> list[i
         if pick not in out:
             out.append(pick)
     return out
+
+
+async def lock_all(groups: Sequence[Group], router: CanaTuneRouter, controller: TierController,
+                   target: ClockPoint) -> bool:
+    """Lock every active group's P and D to `target`; the Router assumes the slower of the
+    old and new point meanwhile, and the clock epochs keep in-flight samples apart."""
+    epochs = router.clock_epochs
+    active = [g for g in groups if g.state is GroupState.ACTIVE]
+    for group in active:
+        epochs[group.name] = epochs.get(group.name, 0) + 1
+        if group.effective is not None:
+            group.effective = ClockPoint(min(group.effective.prefill_mhz, target.prefill_mhz),
+                                         min(group.effective.decode_mhz, target.decode_mhz))
+    results = await asyncio.gather(*(
+        controller._lock(endpoint, mhz) for group in active
+        for endpoint, mhz in ((group.prefill, target.prefill_mhz),
+                              (group.decode, target.decode_mhz))))
+    for group in active:
+        group.effective = target
+        epochs[group.name] += 1
+    return all(results)
 
 
 class FeedbackClockController:
@@ -195,23 +230,10 @@ class FeedbackClockController:
         target = self.point()
         if target == self._applied:
             return
-        epochs = self.router.clock_epochs
-        groups = [g for g in self.groups if g.state is GroupState.ACTIVE]
-        for group in groups:
-            epochs[group.name] = epochs.get(group.name, 0) + 1
-            if group.effective is not None:  # the slower point while the change is in flight
-                group.effective = ClockPoint(min(group.effective.prefill_mhz, target.prefill_mhz),
-                                             min(group.effective.decode_mhz, target.decode_mhz))
-        results = await asyncio.gather(*(
-            self.controller._lock(endpoint, mhz) for group in groups
-            for endpoint, mhz in ((group.prefill, target.prefill_mhz),
-                                  (group.decode, target.decode_mhz))))
-        for group in groups:
-            group.effective = target
-            epochs[group.name] += 1
+        ok = await lock_all(self.groups, self.router, self.controller, target)
         self._applied = target
         self.log.write({"event": "feedback_clock", "clock": target.key(), "reason": reason,
-                        "ok": all(results)})
+                        "ok": ok})
 
     def window(self, now: float) -> tuple[int, int, int]:
         """-> (requests, TTFT violations, TPOT violations) finished in the last window."""
