@@ -10,6 +10,11 @@ import httpx
 
 from canatune.config import P2P_NCCL_CONNECTOR, kv_connector
 from canatune.controller.canary import CanaryScheduler, SchedulerSettings
+from canatune.controller.feedback import (
+    FeedbackClockController,
+    FeedbackRouter,
+    FeedbackSettings,
+)
 from canatune.controller.locator import (
     AdmissionInputs,
     LocatorSettings,
@@ -55,6 +60,7 @@ class Runtime:
     events: JsonlLog
     tiers: TierState
     lengths: LengthStats
+    feedback: FeedbackClockController | None = None  # the feedback heuristic, no Canary
     tasks: list[asyncio.Task] = field(default_factory=list)
     stop: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -86,6 +92,11 @@ class Runtime:
                 await self.controller.set_tier(canary, Tier.MAX, "no_locator")
         if self.telemetry is not None:
             self.tasks.append(asyncio.create_task(self.telemetry.run(self.stop)))
+        if self.feedback is not None:
+            # The heuristic owns the clocks: neither the tier Controller's loop nor the
+            # Canary scheduler runs.
+            self.tasks.append(asyncio.create_task(self.feedback.run(self.stop)))
+            return
         self.tasks.append(asyncio.create_task(self.controller.run(self.stop)))
         self.tasks.append(asyncio.create_task(self.canary.run(self.stop)))
 
@@ -215,22 +226,24 @@ def build_runtime(
 
     groups = build_groups(config)
     router_settings = RouterSettings.from_config(config)
+    feedback_settings = FeedbackSettings.from_config(config)
+    if feedback_settings.enabled:
+        tiers.table = None  # the heuristic never uses a tier table
     slack = SlackRisk(
         slack_edges(router_settings.ttft_slo_ms),
         min_samples=int(risk_raw.get("min_samples", 20)),
         path=None if not risk_raw.get("path") else f"{risk_raw['path']}.slack.json",
     )
     slack.load()
-    router = CanaTuneRouter(
-        groups,
-        table,
-        router_settings,
-        tiers,
-        lengths=lengths,
-        telemetry=telemetry,
-        log=requests_log,
-        slack=slack,
+    router_kwargs: dict[str, Any] = dict(
+        lengths=lengths, telemetry=telemetry, log=requests_log, slack=slack
     )
+    if feedback_settings.enabled:
+        router: CanaTuneRouter = FeedbackRouter(
+            groups, table, router_settings, tiers, feedback=feedback_settings, **router_kwargs
+        )
+    else:
+        router = CanaTuneRouter(groups, table, router_settings, tiers, **router_kwargs)
 
     clock_control = dict(config.get("clock_control", {}))
     agents = dict(clock_control.get("agents") or {})
@@ -263,6 +276,18 @@ def build_runtime(
 
     locator = None
     canary_group = groups[0]
+    if feedback_settings.enabled:
+        assert isinstance(router, FeedbackRouter)
+        feedback = FeedbackClockController(
+            groups, router, controller, feedback_settings, log=events
+        )
+        canary = CanaryScheduler(
+            controller, None, lengths, SchedulerSettings.from_config(config),
+            theta=router_settings.theta,
+        )
+        runtime = Runtime(groups, router, controller, canary, telemetry, events, tiers, lengths)
+        runtime.feedback = feedback
+        return runtime
     if probe_backend is None and canary_group.prefill in refs and canary_group.decode in refs:
         slo = config["experiment"]["slo"]
         probe_backend = CanaryProbe(

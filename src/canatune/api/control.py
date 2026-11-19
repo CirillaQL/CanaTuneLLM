@@ -23,6 +23,7 @@ def create_control_router(runtime: "Runtime") -> APIRouter:
             "controller": runtime.controller.state(),
             "canary": runtime.canary.state(),
             "lengths": runtime.lengths.summary().__dict__,
+            "feedback": None if runtime.feedback is None else runtime.feedback.state(),
         }
 
     @router.get("/tiers")

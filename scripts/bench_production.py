@@ -7,6 +7,8 @@ The service starts as in smoke_production.py (BENCH_MODE):
   static    the `cantune` policy from a stored tier table (CANATUNE_TIER_TABLE):
             no calibration
   baseline  the `round_robin` policy, clocks left to the driver
+  feedback  the `cantune` policy with feedback.enabled (the feedback heuristic: no
+            Canary, watermark routing and SLO-feedback clocks): no publish to wait for
 Then `vllm bench serve` runs once per request rate (BENCH_RATES) against the proxy,
 with the same dataset sample (fixed seed) in every mode (BENCH_WORKLOADS: several
 datasets in turn, each with its own rates, in one service lifetime), while the node agents'
@@ -16,7 +18,7 @@ request to its end (vllm's `duration`), not the dataset loading before it.
 
 Environment: everything `canatune.controller.process_controller` needs, plus
   BENCH_OUT          directory for the results (required)
-  BENCH_MODE         cantune | static | baseline
+  BENCH_MODE         cantune | static | baseline | feedback
   BENCH_DATASET      the dataset file (required unless BENCH_WORKLOADS)
   BENCH_DATASET_NAME sharegpt (default) or custom (jsonl of prompt + output_tokens, as
                      make_burstgpt_dataset.py writes: output lengths from the file, no
@@ -616,13 +618,15 @@ def main() -> int:
     out = Path(os.environ["BENCH_OUT"])
     out.mkdir(parents=True, exist_ok=True)
     mode = os.environ.get("BENCH_MODE", "cantune")
-    if mode not in ("cantune", "static", "baseline"):
-        raise SystemExit("BENCH_MODE must be cantune, static or baseline")
+    if mode not in ("cantune", "static", "baseline", "feedback"):
+        raise SystemExit("BENCH_MODE must be cantune, static, baseline or feedback")
     settings = BenchSettings.from_env(os.environ)
     config = load_config(os.environ["CANATUNE_CONFIG"])
     policy = config["routing"]["policy"]
     if (mode != "baseline") != (policy == "cantune"):
         raise SystemExit(f"BENCH_MODE={mode} does not match routing.policy={policy}")
+    if (mode == "feedback") != bool((config.get("feedback") or {}).get("enabled")):
+        raise SystemExit(f"BENCH_MODE={mode} does not match feedback.enabled")
     for workload in settings.workloads or (settings,):
         if not Path(workload.dataset).is_file():
             raise SystemExit(f"dataset {workload.dataset} is not a file")
@@ -676,7 +680,7 @@ def main() -> int:
                     status = failed
                     return status
                 summary["reached_h"] = smoke.wait_h(client, base, table)
-            else:
+            elif mode == "baseline":
                 summary["clocks_at_start"] = smoke.reset_clocks(client, agents)
             endpoints = parse_endpoints(config)
             model = smoke.model_name(client, endpoints)
