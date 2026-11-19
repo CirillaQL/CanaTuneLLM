@@ -127,10 +127,11 @@ class RouterSettings:
     near_slo: float = 0.9
     # The KV gate and the P slot cap follow production's clean samples (energy mode).
     knee_update: bool = True
-    # False (ablation: estimates + pressure only): the Router ignores the occupancy
-    # limits the Canary measured (P slot cap, KV in-flight gate) and never learns them
-    # online; the latency estimates, the configured KV wall and the Pressure
-    # Controller stay. The Canary still calibrates (same clocks and estimates).
+    # False (ablation: no occupancy check after the latency estimates): fill ignores the
+    # concurrency limits the Canary measured, the P slot cap and D's B* (best effort with
+    # a length model never uses B* anyway), and never learns the cap online. Receiving
+    # checks (fresh telemetry, the KV in-flight gate, the KV wall), the TTFT/TPOT
+    # estimates and the Pressure Controller stay; the Canary still calibrates.
     capacity_limits: bool = True
     # Production TPOT feedback. window: per D, the quantile of the token gaps of the last
     # tpot_window_s against the TPOT SLO (pressure at or above it); a single live gap
@@ -438,11 +439,10 @@ class CanaTuneRouter:
             self._slot_knee = KneeCounts(bins) if bins else None
             self.log.write({"event": "admission_calibration", "published_at": key, **admission})
             if not self.settings.capacity_limits:
-                self.kv_fraction, self.p_slot_cap = 1.0, None
-                self._kv_knee = self._slot_knee = None
+                self.p_slot_cap, self._slot_knee = None, None
                 self.log.write({"event": "capacity_limits_ignored", "published_at": key,
-                                "kv_gate_fraction": admission.get("kv_gate_fraction"),
-                                "p_slot_cap": cap})
+                                "p_slot_cap": cap,
+                                "decode_max_running": table.decode_max_running})
 
     def prefill_cost(self, mhz: int | None = None) -> PrefillCost:
         """S(L) at P clock `mhz` (None: the highest measured)."""
