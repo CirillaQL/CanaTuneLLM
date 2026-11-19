@@ -127,6 +127,11 @@ class RouterSettings:
     near_slo: float = 0.9
     # The KV gate and the P slot cap follow production's clean samples (energy mode).
     knee_update: bool = True
+    # False (ablation: estimates + pressure only): the Router ignores the occupancy
+    # limits the Canary measured (P slot cap, KV in-flight gate) and never learns them
+    # online; the latency estimates, the configured KV wall and the Pressure
+    # Controller stay. The Canary still calibrates (same clocks and estimates).
+    capacity_limits: bool = True
     # Production TPOT feedback. window: per D, the quantile of the token gaps of the last
     # tpot_window_s against the TPOT SLO (pressure at or above it); a single live gap
     # counts only from tpot_stall_factor x the SLO (a hung stream), never as severe.
@@ -179,6 +184,7 @@ class RouterSettings:
             fill_p2c_groups=int(_positive(raw, "fill_p2c_groups", 4)),
             near_slo=_fraction(controller, "feedback_near_slo", 0.9),
             knee_update=bool(raw.get("knee_update", True)),
+            capacity_limits=bool(raw.get("capacity_limits", True)),
             tpot_feedback=_choice(raw, "tpot_feedback", ("window", "gap"), "window"),
             tpot_window_s=_positive(raw, "tpot_window_s", 5.0),
             tpot_window_quantile=_fraction(raw, "tpot_window_quantile", 0.95),
@@ -431,6 +437,12 @@ class CanaTuneRouter:
             bins = admission.get("p_slot_bins")
             self._slot_knee = KneeCounts(bins) if bins else None
             self.log.write({"event": "admission_calibration", "published_at": key, **admission})
+            if not self.settings.capacity_limits:
+                self.kv_fraction, self.p_slot_cap = 1.0, None
+                self._kv_knee = self._slot_knee = None
+                self.log.write({"event": "capacity_limits_ignored", "published_at": key,
+                                "kv_gate_fraction": admission.get("kv_gate_fraction"),
+                                "p_slot_cap": cap})
 
     def prefill_cost(self, mhz: int | None = None) -> PrefillCost:
         """S(L) at P clock `mhz` (None: the highest measured)."""
@@ -629,7 +641,8 @@ class CanaTuneRouter:
                     self._slack_by_group[key] = (x, predicted, None)
                     continue  # warn, but remains eligible for best-effort dispatch
             elif (self.settings.overload == "best_effort" and tier_table is not None
-                    and tier_table.decode_max_running is not None):
+                    and tier_table.decode_max_running is not None
+                    and self.settings.capacity_limits):
                 # P requests are not running D sequences. Telemetry covers D's
                 # own queue; stage reservations cover unobserved running work.
                 snapshot = (self.telemetry.fresh(dg.decode, self.settings.snapshot_max_age_s)
@@ -1371,6 +1384,7 @@ class CanaTuneRouter:
             "queued": len(self._queue),
             "kv_gate_fraction": self.kv_fraction,
             "p_slot_cap": self.p_slot_cap,
+            "capacity_limits": self.settings.capacity_limits,
             "backfill_slack_ms": self.backfill_slack_ms(),
             "overflows": dict(self.overflows),
             "holding": len(self._holding),

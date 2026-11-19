@@ -177,3 +177,18 @@ def test_fill_is_a_valid_group_choice() -> None:
     config["router"]["fill_p2c_groups"] = 0
     with pytest.raises(ValueError):
         RouterSettings.from_config(config)
+
+
+def test_without_capacity_limits_the_measured_cap_and_gate_are_ignored() -> None:
+    # Ablation: estimates + pressure only; the Canary's cap and KV gate never apply.
+    groups, router = fill_router(cap=2, capacity_limits=False)
+    router.tiers.table.evidence["admission"]["kv_gate_fraction"] = 0.3
+    router.tiers.table.evidence["admission"]["p_slot_bins"] = {"0": [200, 4]}
+    names = [router.try_admit(128, True).group.name for _ in range(4)]
+    assert names == ["G1"] * 4  # no cap: G1 until an estimate or pressure says no
+    assert router.p_slot_cap is None and router.kv_fraction == 1.0
+    assert router._slot_knee is None and router._kv_knee is None
+    t = router.try_admit(128, True)
+    router.first_token(t)
+    router.finish(t, status="ok", ttft_ms=5000, tpot_ms=50, output_tokens=8)
+    assert router.p_slot_cap is None  # nor learned online
