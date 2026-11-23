@@ -230,6 +230,27 @@ def test_trace_by_load_false_takes_a_prefix_and_depends_on_the_seed() -> None:
     assert sorted(other) != sorted(large)
 
 
+def test_profile_window_uses_its_own_mean_and_preserves_production_lengths() -> None:
+    from unittest.mock import AsyncMock
+
+    requests = []
+    probe, _ = make_probe(requests, FakeAgent())
+    original = probe.lengths
+    original_pairs = original.pairs()
+    probe.quiesce = AsyncMock()
+    result = asyncio.run(probe.open_window(
+        ClockPoint(2520, 1500), 2280, 100, .3, 1,
+        output_tokens=2, prompt_lengths=(128,),
+    ))
+    prompts = [body for port, body, _ in requests if port == 8100]
+    # 2280/(128+100) requests/s for .3 seconds: exactly three, not the old mean's rate.
+    assert result.requests_sent == len(prompts) == 3
+    assert all(len(body["prompt"]) == 128 for body in prompts)
+    assert all(body["max_tokens"] == 2 for port, body, _ in requests if port == 8200)
+    assert probe.lengths is original and original.pairs() == original_pairs
+    probe.quiesce.assert_awaited_once()
+
+
 def test_closed_windows_use_long_outputs() -> None:
     requests: list = []
     probe, _ = make_probe(requests, FakeAgent())

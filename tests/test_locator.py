@@ -112,7 +112,8 @@ class SurrogateBackend:
         self.limit = max_prompt
         return PROMPT
 
-    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, output_tokens=None):
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, output_tokens=None,
+                          prompt_lengths=None):
         self._tick()
         f = clock.prefill_mhz
         rps = eq_tps / (PROMPT + alpha)
@@ -194,8 +195,9 @@ def test_locate_on_surrogate_matches_manual_experiments() -> None:
     # park: lowest idle power -> lowest clocks
     assert table.park == ClockPoint(600, 300)
     assert table.capacity_h > 0.5 * ev["capacity_c0"]
-    # D clock choice: each clock twice plus a half-load window (D iteration model)
-    assert locator.run.windows <= 60
+    # Original calibration plus independent searches of the five P distributions.
+    assert len(ev["room"]["p_profiles"]) == 5
+    assert locator.run.windows <= 90
 
 
 def test_aborted_run_resumes_from_cached_windows() -> None:
@@ -743,7 +745,8 @@ def test_room_limits_measure_p_and_d_each_on_its_own():
         def shortest_prompt(self):
             return 128
 
-        async def open_window(self, clock, load, alpha, seconds, abort, output_tokens=None):
+        async def open_window(self, clock, load, alpha, seconds, abort, output_tokens=None,
+                              prompt_lengths=None):
             self.opens.append((clock, output_tokens))
             bad = load > 4000
             return WindowResult(
@@ -785,6 +788,76 @@ def test_room_limits_measure_p_and_d_each_on_its_own():
     asyncio.run(locator.room_limits(h, 100.0, 1000.0, previous))
     assert len(backend.opens) > opens or locator.run.reused  # P searched (or served from cache)
     assert locator.run.evidence["room"]["d_sequences"] == 160 and len(backend.fills) == 1
+
+
+def test_profile_calibration_searches_independent_limits_and_isolates_cached_windows():
+    from canatune.domain.p_capacity import p_profiles
+
+    profiles = p_profiles()
+    caps = dict(zip(profiles, (1.5, .9, .85, .7, .65)))
+    lut = {128: 20., 512: 40., 1024: 80., 2048: 160.}
+
+    class Backend:
+        def __init__(self):
+            self.calls = []
+
+        async def open_window(self, clock, load, alpha, seconds, abort, output_tokens=None,
+                              prompt_lengths=None):
+            self.calls.append((clock, output_tokens, tuple(prompt_lengths)))
+            name = next(n for n, ls in profiles.items() if ls == tuple(prompt_lengths))
+            rate = load / (sum(prompt_lengths) / len(prompt_lengths) + alpha)
+            count = max(100, round(rate * seconds))
+            lengths = [prompt_lengths[i % len(prompt_lengths)] for i in range(count)]
+            rho = sum(lut[n] for n in lengths) / (1000 * seconds)
+            bad = rho > caps[name]
+            return WindowResult(
+                clock, "open", load, seconds, requests=count,
+                violations=count if bad else 0,
+                samples=[ProbeSample(clock.prefill_mhz, clock.decode_mhz, n, (), 0, 0,
+                                     2000 if bad else 100, bad) for n in lengths],
+            )
+
+    backend = Backend()
+    locator = TierLocator(backend, settings())
+    locator.run = LocatorRun(started_at=0, evidence={"prefill_ms_by_clock": {1500: lut}})
+    costs = CostBook({1500: lut})
+    h = ClockPoint(1500, 1000)
+    result = asyncio.run(locator.room_p_profiles(h, 100, 5000, costs))
+    assert set(result) == set(profiles)
+    for name, row in result.items():
+        assert row["p_source"] == "measured"
+        assert row["prompt_lengths"] == list(profiles[name])
+        assert .75 * caps[name] <= row["p_rho"] <= caps[name]
+    assert all(clock == h and output == 2 for clock, output, _ in backend.calls)
+    assert {ls for _, _, ls in backend.calls} == set(profiles.values())
+    before = len(backend.calls)
+    assert asyncio.run(locator.room_p_profiles(h, 100, 5000, costs)) == result
+    assert len(backend.calls) == before  # own profile cache; never another distribution's window
+
+
+def test_recheck_rebuilds_the_profile_bank_at_the_new_working_clock(monkeypatch):
+    backend = SurrogateBackend(noise=0)
+    monkeypatch.setattr(backend, "model", lambda f, r: (100, 0, 1 if f < 2040 else 10))
+    locator = TierLocator(backend, settings())
+    old_bank = {"short": {"prompt_lengths": [128], "p_rho": .8}}
+    h = ClockPoint(2040, 1000)
+    table = TierTable(h, h, 5000, 100, evidence={
+        "prefill_ms_by_clock": {2040: {128: 20., 2048: 160.}},
+        "room": {"p_profiles": old_bank, "d_sequences": 123},
+    })
+    calls = []
+
+    async def rebuild(clock, alpha, capacity, costs):
+        calls.append(clock)
+        assert clock.prefill_mhz in locator.run.evidence["prefill_ms_by_clock"]
+        return {"new": {"prompt_lengths": [128], "p_rho": .7}}
+
+    monkeypatch.setattr(locator, "room_p_profiles", rebuild)
+    moved = asyncio.run(locator.recheck(table, [128, 512, 1024, 2048]))
+    assert moved.h.prefill_mhz < h.prefill_mhz and calls == [moved.h]
+    assert moved.evidence["room"]["p_profiles"]["new"]["p_rho"] == .7
+    assert moved.evidence["room"]["d_sequences"] == 123
+    assert table.evidence["room"]["p_profiles"] == old_bank  # published old state is immutable
 
 
 def test_room_p_limit_is_none_when_no_load_stops_meeting_the_target():

@@ -1594,6 +1594,38 @@ def room_setup(d_sequences=None, p_rho=None, **router):
     return clock, groups, r, controller
 
 
+def test_room_uses_each_groups_current_distribution_and_expires_old_lengths():
+    from canatune.domain.p_capacity import p_profiles
+
+    clock, groups, router, _ = room_setup(p_rho=.001, room_rho_window_s=10)
+    profiles = {name: {"prompt_lengths": list(lengths), "p_rho": .01}
+                for name, lengths in p_profiles().items()}
+    router.tiers.table.evidence["room"]["p_profiles"] = profiles
+    # First apply sees the newly attached bank.
+    ticket = router.try_admit(128, True, 0.0)
+    assert ticket.group.name == "G1"
+    assert router.p_room_limit(groups[1]) == ("short", .01)
+    assert router.has_room(groups[1])  # workload .004; old scalar .001 would spill
+    # D's cap remains independent of the selected P profile.
+    groups[1].n_decoding = router.room_d_sequences
+    assert not router.has_room(groups[1])
+    groups[1].n_decoding = 0
+    router.finish(ticket, status="ok", ttft_ms=100, tpot_ms=10, output_tokens=2)
+
+    clock.now += 10.1
+    ticket = router.try_admit(2048, True, 0.0)
+    assert ticket.group.name == "G1"
+    assert router.p_room_limit(groups[1]) == ("long", .01)
+    assert not router.has_room(groups[1])  # workload .02 at the long-profile capacity
+    assert router.p_room_limit(groups[2]) == (None, .001)  # another group has no samples
+    second = router.try_admit(128, True, 0.0)
+    assert second.group.name == "G2"
+    assert second.snapshot["room_p_rho"] == .001
+    clock.now += 10
+    assert router.p_rho(groups[1]) == 0
+    assert router.has_room(groups[1])
+
+
 def test_room_keeps_concentrating_below_its_limits():
     _, _, router, _ = room_setup(d_sequences=100)
     names = {router.try_admit(128, True, best_effort=True).group.name for _ in range(8)}

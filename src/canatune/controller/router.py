@@ -71,6 +71,7 @@ from canatune.domain.calibration import KneeCounts, gate_of_bin, kv_gate_bin, p_
 from canatune.domain.groups import ClockPoint, Group, TierState
 from canatune.domain.load import LengthStats
 from canatune.domain.models import decode_coef, decode_tpot, interpolate
+from canatune.domain.p_capacity import nearest_p_rho
 from canatune.domain.risk import Cell, RiskEstimate, RiskTable, is_violation
 from canatune.infrastructure.records import JsonlLog
 from canatune.infrastructure.telemetry import Telemetry
@@ -398,6 +399,7 @@ class CanaTuneRouter:
         # group_choice room: what the Canary measured a group can carry at H (None: not
         # measured or no limit reached; D then falls back to the engine limit).
         self.room_p_rho: float | None = None
+        self.room_p_profiles: dict[str, Any] = {}
         self.room_d_sequences: int | None = None
         self._kv_knee: KneeCounts | None = None  # Canary's counts + production's
         self._slot_knee: KneeCounts | None = None
@@ -418,7 +420,7 @@ class CanaTuneRouter:
         self.baseline_mode = False
         self._rr = 0
         self._group_rr = 0  # group_choice round_robin: the next group index in turn
-        self._p_work: dict[str, deque[tuple[float, float]]] = {}  # P: (admitted, prefill ms)
+        self._p_work: dict[str, deque[tuple[float, float, int]]] = {}
         self.d_exhausted: deque[float] = deque()  # marks: no D safe for one more request
         self.pressure_event = asyncio.Event()
         self.risk_signals = 0
@@ -475,6 +477,7 @@ class CanaTuneRouter:
         }
         room = (evidence or {}).get("room") or {}
         self.room_p_rho = room.get("p_rho")
+        self.room_p_profiles = room.get("p_profiles") or {}
         measured_d = room.get("d_sequences")
         self.room_d_sequences = min(
             self.settings.decode_max_num_seqs,
@@ -485,6 +488,7 @@ class CanaTuneRouter:
         if self.settings.group_choice == "room":
             self.log.write({"event": "room_limits", "published_at": key,
                             "p_rho": self.room_p_rho, "d_sequences": self.room_d_sequences,
+                            "p_profiles": self.room_p_profiles,
                             "d_measured_sequences": measured_d,
                             "d_source": d_source,
                             "d_engine_limit": self.settings.decode_max_num_seqs})
@@ -989,7 +993,9 @@ class CanaTuneRouter:
             dg.n_inflight += 1
         group.record_admission(now, tokens, self.settings.load_window_s)
         if self.settings.group_choice == "room":
-            self._p_work.setdefault(group.name, deque()).append((now, s_own))
+            name, limit = self.p_room_limit(group, now)
+            ticket.snapshot.update(room_p_profile=name, room_p_rho=limit)
+            self._p_work.setdefault(group.name, deque()).append((now, s_own, tokens))
         self.admitted += 1
         if self.settings.overload == "best_effort":
             self._live[ticket.id] = ticket
@@ -1207,13 +1213,24 @@ class CanaTuneRouter:
             return 0.0
         while work and work[0][0] <= now - window_s:
             work.popleft()
-        return sum(ms for _, ms in work) / (window_s * 1000.0)
+        return sum(ms for _, ms, _ in work) / (window_s * 1000.0)
+
+    def p_room_limit(
+        self, group: Group, now: float | None = None,
+    ) -> tuple[str | None, float | None]:
+        """Match this P's admitted prompt distribution in the same window as p_rho."""
+        self._apply_table()
+        self.p_rho(group, now)  # expire work before selecting a distribution
+        lengths = [n for _, _, n in self._p_work.get(group.name, ())]
+        selected = nearest_p_rho(lengths, self.room_p_profiles)
+        return selected if selected is not None else (None, self.room_p_rho)
 
     def _room_used(self, group: Group, decode: Group | None = None) -> float:
         """How full the fuller side of a route is: 1 at its room limit."""
         self._apply_table()
         d = group if decode is None else decode
-        p = 0.0 if self.room_p_rho is None else self.p_rho(group) / self.room_p_rho
+        _, limit = self.p_room_limit(group)
+        p = 0.0 if limit is None else self.p_rho(group) / limit
         sequences = 0.0 if self.room_d_sequences is None else (
             (d.n_await + d.n_decoding) / self.room_d_sequences
         )  # fmt: skip

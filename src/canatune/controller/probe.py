@@ -542,24 +542,29 @@ class CanaryProbe:
         seconds: float,
         abort_above: float,
         output_tokens: int | None = None,
+        prompt_lengths: Sequence[int] | None = None,
     ) -> WindowResult:
-        """`output_tokens`: every request's output instead of the trace's."""
+        """Overrides apply only to this window; shared production length stats stay intact."""
+        if prompt_lengths is not None:
+            await self.quiesce()  # independent profile probes must not inherit an old queue
         await self.lock(clock)
         # Same load -> same trace: every clock replays identical arrival times and
         # lengths, so per-request energy is compared on identical work.
         # Exactly round(rate x seconds) arrivals at uniform order statistics: a Poisson
         # process conditioned on its count, so the realised load equals the nominal
         # one (an unconditioned Poisson trace can deviate from it by tens of percent).
-        rate = eq_tps / (self.lengths.mean_prompt(self.prompt_limit) + alpha)  # requests/s
+        distribution = (self.lengths if prompt_lengths is None else
+                        LengthStats([(n, output_tokens or 2) for n in prompt_lengths]))
+        rate = eq_tps / (distribution.mean_prompt(self.prompt_limit) + alpha)  # requests/s
         count = max(1, round(rate * seconds))
         if self.s.trace_by_load:
             trace = random.Random(self.s.seed * 1_000_003 + int(round(eq_tps * 10)))
-            pairs = self.lengths.sample(trace, count, self.prompt_limit)
+            pairs = distribution.sample(trace, count, self.prompt_limit)
             arrivals = sorted(trace.uniform(0.0, seconds) for _ in range(count))
         else:
             lengths_rng = random.Random(self.s.seed * 1_000_003 + 1)
             arrivals_rng = random.Random(self.s.seed * 1_000_003 + 2)
-            pairs = self.lengths.sample(lengths_rng, count, self.prompt_limit)
+            pairs = distribution.sample(lengths_rng, count, self.prompt_limit)
             arrivals = sorted(arrivals_rng.random() * seconds for _ in range(count))
         if output_tokens is not None:
             pairs = [(prompt, output_tokens) for prompt, _ in pairs]

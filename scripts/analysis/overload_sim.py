@@ -896,9 +896,12 @@ class SimBackend:
         return Sim(1, "baseline", clock, phys=self.phys, overhead_ms=self.phys.probe_overhead_ms,
                    seed=self.rng.randrange(10**9))  # fmt: skip
 
-    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, output_tokens=None):
+    async def open_window(self, clock, eq_tps, alpha, seconds, abort_above, output_tokens=None,
+                          prompt_lengths=None):
         trace = random.Random(int(eq_tps * 10) + 17 + 1_000_003 * self.salt)
         pairs = self._pairs()
+        if prompt_lengths is not None:
+            pairs = [(p, output_tokens or self.decode_output_tokens) for p in prompt_lengths]
         if output_tokens is not None:
             pairs = [(p, output_tokens) for p, _ in pairs]
         mean = sum(p for p, _ in pairs) / len(pairs)

@@ -61,6 +61,7 @@ from canatune.domain.models import (
     fit_power,
     interpolate,
 )
+from canatune.domain.p_capacity import p_profiles
 from canatune.infrastructure.records import JsonlLog
 
 
@@ -167,6 +168,7 @@ class ProbeBackend(Protocol):
         seconds: float,
         abort_above: float,
         output_tokens: int | None = None,
+        prompt_lengths: Sequence[int] | None = None,
     ) -> WindowResult:
         """Poisson probes at `eq_tps` equivalent tokens/s; may stop early once the
         observed violation rate is clearly above `abort_above`. `output_tokens`: every
@@ -445,9 +447,12 @@ class TierLocator:
             self.log.write({"event": "locator_window", **result.summary()})
         return result
 
-    def open_seconds(self, eq_tps: float, alpha: float) -> float:
+    def open_seconds(
+        self, eq_tps: float, alpha: float, mean_prompt: float | None = None,
+    ) -> float:
         """Long enough for `min_window_requests` at this load, within max_window_s."""
-        rps = eq_tps / max(self.mean_prompt + alpha, 1.0)
+        mean = self.mean_prompt if mean_prompt is None else mean_prompt
+        rps = eq_tps / max(mean + alpha, 1.0)
         needed = self.s.min_window_requests / rps if rps > 0 else self.s.max_window_s
         return min(self.s.max_window_s, max(self.s.window_s, needed))
 
@@ -1314,7 +1319,8 @@ class TierLocator:
         return table
 
     async def room_p_limit(
-        self, h: ClockPoint, alpha: float, capacity: float, costs: CostBook
+        self, h: ClockPoint, alpha: float, capacity: float, costs: CostBook,
+        prompt_lengths: Sequence[int] | None = None,
     ) -> dict[str, Any]:
         """P's own limit at H: production's prompts with two-token outputs, so D stays
         idle and P is what stops meeting the target; the load is searched up from the
@@ -1323,12 +1329,15 @@ class TierLocator:
         self._phase("room_p")
 
         async def measure(load: float) -> WindowResult:
-            key = ("open_p", h, round(load, 1), round(alpha, 1))
-            seconds = self.open_seconds(load, alpha)
+            profile = None if prompt_lengths is None else tuple(prompt_lengths)
+            key = ("open_p", h, round(load, 1), round(alpha, 1), profile)
+            mean = None if profile is None else sum(profile) / len(profile)
+            seconds = self.open_seconds(load, alpha, mean)
+            kwargs = {} if profile is None else {"prompt_lengths": profile}
             return await self._cached(
                 key,
                 lambda: self.backend.open_window(
-                    h, load, alpha, seconds, 2 * self.s.theta, output_tokens=2
+                    h, load, alpha, seconds, 2 * self.s.theta, output_tokens=2, **kwargs
                 ),
             )
 
@@ -1340,6 +1349,31 @@ class TierLocator:
             "p_load": None if good is None else good.load,
             "p_reached": None if good is None else self._utilization(good, costs),
         }
+
+    async def room_p_profiles(
+        self, h: ClockPoint, alpha: float, capacity: float, costs: CostBook,
+    ) -> dict[str, Any]:
+        """Search P's capacity independently for all five prompt distributions at H."""
+        assert self.run is not None
+        ev = self.run.evidence
+        table = costs.for_clock(h.prefill_mhz)
+        measured_lengths = ev["prefill_ms_by_clock"]
+        lut = measured_lengths.get(h.prefill_mhz, measured_lengths.get(str(h.prefill_mhz)))
+        max_prompt = min(max(map(int, lut)), ev.get("prompt_limit") or 2048)
+        profiles = {}
+        # The old mixed-workload capacity is only a search starting point, not a cap.
+        rho_start = capacity * table(round(self.mean_prompt)) / (
+            1000.0 * max(self.mean_prompt + alpha, 1.0)
+        )
+        for name, lengths in p_profiles(max_prompt).items():
+            mean = sum(lengths) / len(lengths)
+            mean_ms = sum(table(n) for n in lengths) / len(lengths)
+            start = rho_start * 1000.0 / max(mean_ms, 1e-6) * (mean + alpha)
+            result = await self.room_p_limit(h, alpha, start, costs, prompt_lengths=lengths)
+            profiles[name] = {"prompt_lengths": list(lengths), **result}
+            self.log.write({"event": "locator_room_p_profile", "profile": name,
+                            "clock": h.key(), **profiles[name]})
+        return profiles
 
     async def room_d_limit(self, h: ClockPoint, rho: float, costs: CostBook) -> dict[str, Any]:
         """D's own limit at H: one window that fills D without loading P, the shortest
@@ -1403,6 +1437,7 @@ class TierLocator:
             has_model = (ev.get("decode") or {}).get("length_model")
             if rho and has_model and hasattr(self.backend, "mix_context"):
                 room.update(await self.room_d_limit(h, rho, costs))
+        room["p_profiles"] = await self.room_p_profiles(h, alpha, capacity, costs)
         self.log.write({"event": "locator_room", **room})
 
     async def recheck(self, table: TierTable, prompts: Sequence[int]) -> TierTable:
@@ -1430,8 +1465,8 @@ class TierLocator:
             for f, w in meas.items()
             if self.feasible(w) and w.prefill_j_per_request is not None
         }
-        self._phase("done")
         if table.h.prefill_mhz not in energies:
+            self._phase("done")
             return table
         best = min(energies, key=energies.get)
         if best != table.h.prefill_mhz and energies[best] < energies[table.h.prefill_mhz] * (
@@ -1440,6 +1475,17 @@ class TierLocator:
             moved = TierTable.from_json(table.to_json())
             moved.h = ClockPoint(best, table.h.decode_mhz)
             moved.published_at = time.time()
-            moved.evidence = {**table.evidence, "recheck": {str(f): e for f, e in energies.items()}}
+            moved.evidence["recheck"] = {str(f): e for f, e in energies.items()}
+            if (moved.evidence.get("room") or {}).get("p_profiles"):
+                # A bank measured at the previous H must not follow a clock change.
+                self.run.evidence = moved.evidence
+                self.mean_prompt = self.backend.set_prompt_limit(moved.evidence.get("prompt_limit"))
+                await self.prefill_table(moved.h, prompts)
+                costs = CostBook(moved.evidence["prefill_ms_by_clock"])
+                moved.evidence["room"]["p_profiles"] = await self.room_p_profiles(
+                    moved.h, moved.alpha_tokens, moved.capacity_h, costs,
+                )
+            self._phase("done")
             return moved
+        self._phase("done")
         return table
