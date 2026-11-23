@@ -1,0 +1,314 @@
+# CanaTune room experiment on A100 (Vera), 4 P + 4 D, NixlConnector.
+# Experiment parameters are those of the A100 replay headline run (Slurm 10677503, multi).
+# Site-specific values are placeholders: paths, node names; gpu_uuids were dropped
+# (filled in per job at run time). Replace them before running.
+project:
+  name: canatune-exp
+  mode: disaggregated_inference
+  work_dir_root: /path/to/vllm_job_work
+  broker_root: /path/to/job_broker
+slurm:
+  partition: vera
+  time_limit: '16:00:00'
+  nodes: 2
+  cpus_per_gpu: 16
+  exclusive: true
+runtime:
+  python: /path/to/python
+  vllm_version: 0.15.1
+  decode_max_num_seqs: 256
+  offline: true
+  environment:
+    HF_HUB_OFFLINE: '1'
+    TRANSFORMERS_OFFLINE: '1'
+    NCCL_IB_DISABLE: '1'
+    NCCL_SOCKET_IFNAME: ^lo
+    NCCL_DEBUG: INFO
+model:
+  name: mistralai/Mistral-7B-v0.1
+  snapshot_root: /path/to/model/snapshots
+  path_override_env: MODEL_OVERRIDE
+  max_model_len: 4096
+topology:
+  ip_resolution:
+    method: slurm_hostname_I_first_address
+    hardcode_ip: false
+  prefill_nodegroup:
+    node: prefill-node
+    gpu_type: NVIDIA A100-SXM4-40GB
+    endpoint_prefix: P
+    gpu_ids:
+    - 0
+    - 1
+    - 2
+    - 3
+    http_port_base: 22310
+    kv_port_base: 22330
+    high_frequency_mhz: 1410
+    memory_frequency_mhz: null
+  decode_nodegroup:
+    node: decode-node
+    gpu_type: NVIDIA A100-SXM4-40GB
+    endpoint_prefix: D
+    gpu_ids:
+    - 0
+    - 1
+    - 2
+    - 3
+    http_port_base: 22320
+    kv_port_base: 22330
+    high_frequency_mhz: 1410
+    memory_frequency_mhz: null
+    gpu_memory_utilization: auto
+    memory_reserve:
+      overflow_bytes: 3.0e9
+      per_peer_bytes: 0.25e9
+      safety_bytes: 1.0e9
+  endpoints:
+    P0:
+      role: prefill
+      gpu_id: 0
+      http_port: 22310
+      kv_port: 22330
+    P1:
+      role: prefill
+      gpu_id: 1
+      http_port: 22311
+      kv_port: 22331
+    P2:
+      role: prefill
+      gpu_id: 2
+      http_port: 22312
+      kv_port: 22332
+    P3:
+      role: prefill
+      gpu_id: 3
+      http_port: 22313
+      kv_port: 22333
+    D0:
+      role: decode
+      gpu_id: 0
+      http_port: 22320
+      kv_port: 22330
+    D1:
+      role: decode
+      gpu_id: 1
+      http_port: 22321
+      kv_port: 22331
+    D2:
+      role: decode
+      gpu_id: 2
+      http_port: 22322
+      kv_port: 22332
+    D3:
+      role: decode
+      gpu_id: 3
+      http_port: 22323
+      kv_port: 22333
+kv_transfer:
+  connector: NixlConnector
+  load_failure_policy: fail
+  kv_buffer_device: cuda
+  prefill_send_type: PUT_ASYNC
+  disable_prefix_cache: true
+  disable_chunked_prefill: true
+  kv_buffer_bytes: 1.0e9
+  kv_bytes_per_token: null
+proxy:
+  enabled: true
+  host: 127.0.0.1
+  port: 22300
+  endpoint: /v1/completions
+  chat_endpoint: /v1/chat/completions
+  models_endpoint: /v1/models
+  diagnostics_log: ${raw_root}/launcher/proxy_diagnostics.jsonl
+  workers: 0
+routing:
+  policy: cantune
+  canary_pair:
+  - P0
+  - D0
+  production_pairs:
+  - - P1
+    - D1
+  - - P2
+    - D2
+  - - P3
+    - D3
+  allow_production_cross_pairs: false
+router:
+  theta: 0.1
+  max_wait_ms: 300
+  retry_period_ms: 20
+  snapshot_max_age_s: 1.0
+  d_busy_min_running: 1
+  chars_per_token: 4
+  tokenizer: null
+  chat_template: null
+  admission: slack
+  overload: best_effort
+  doomed: backfill
+  backfill_slack_ms: auto
+  hold_max_ms: 30000
+  pairing: fixed
+  group_choice: room
+  fill_p2c_groups: 4
+  room_rho_window_s: 10
+  live_pressure_min_requests: 1
+  live_pressure_fraction: 0.0
+  knee_update: true
+  d_choice: concentrate
+  p_choice: balance
+  d_balance_modes:
+  - confirming
+  - expanding
+  - full_effort
+  kv_projection_hard: false
+  tpot_feedback: window
+  tpot_window_s: 5
+  tpot_window_quantile: 0.95
+  tpot_window_min_gaps: 50
+  tpot_stall_factor: 5
+  stream_report_s: 0.1
+  tpot_window_period_s: 0.25
+telemetry:
+  enabled: true
+  period_s: 0.25
+controller:
+  period_s: 1.0
+  min_tick_s: 0.1
+  load_window_s: 10.0
+  t_down_s: 30
+  burst_window_s: 120
+  burst_bucket_s: 10
+  min_active_groups: 1
+  stagger_s: 2.0
+  energy_log_period_s: 5
+  solver: false
+  feedback_window_s: 10
+  feedback_min_samples: 5
+  feedback_near_slo: 0.9
+  confirm_s: 2
+  expansion_grace_s: 3
+  full_effort_routing: baseline
+  confirm_window_s: 10
+  confirm_fraction: 0.6
+  d_trigger_count: 5
+  d_trigger_window_s: 3
+  full_effort_min_s: 30
+  exit_rate_fraction: 0.8
+  redirect: true
+  production_clocks: canary
+risk:
+  n_await_edges:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 5
+  prompt_token_edges:
+  - 128
+  - 512
+  - 1024
+  - 2048
+  min_samples: 20
+  path: null
+clock_control:
+  enabled: true
+  agent_port: 22340
+  agents:
+    prefill: null
+    decode: null
+  min_mhz:
+    prefill: 600
+    decode: 300
+canary:
+  tier_table_path: null
+  max_output_tokens: 256
+  default_prompts:
+  - 128
+  - 512
+  - 1024
+  - 2048
+  length_min_samples: 50
+  period_s: 1.0
+  quiet_s: 60
+  min_interval_s: 600
+  max_duty: 0.1
+  periodic_s: 1800
+  length_shift: 0.3
+  drift_min_samples: 200
+  drain_timeout_s: 30
+  recalibrate: false
+  locator:
+    eps: 0.02
+    target_load_fraction: 0.8
+    fill_load_fractions:
+    - 0.3
+    - 0.5
+    - 0.8
+    - 1.0
+    fill_bisect_steps: 2
+    window_s: 20
+    min_window_requests: 60
+    max_window_s: 120
+    idle_window_s: 5
+    coarse_points: 5
+    refine_steps: 3
+    limited_fraction_max: 0.3
+    decode_probe_concurrency: 16
+    decode_start_concurrency: 8
+    decode_load_fraction: 0.7
+    decode_model: length
+    decode_fit_fill: 0.6
+    decode_fit_max_concurrency: 64
+    decode_wall_tolerance: 0.25
+    decode_kv_limit: 0.9
+    decode_window_s: 60
+    decode_clock_repeats: 2
+  probe:
+    settle_s: 2.0
+    sample_period_s: 0.25
+    decode_stagger_s: 15
+    prefill_min_mhz: 600
+    decode_min_mhz: 300
+cache:
+  root: ${work_dir}
+  hf_home: ${work_dir}/huggingface
+  hf_hub_cache: ${work_dir}/huggingface/hub
+  torch_home: ${work_dir}/torch-cache
+  triton_cache: ${work_dir}/triton-cache
+  cuda_cache: ${work_dir}/cuda-cache
+  vllm_cache: ${work_dir}/vllm-cache
+  flashinfer_workspace: ${work_dir}/flashinfer
+  tmp_dir: ${work_dir}/tmp
+artifacts:
+  raw_root: ${work_dir}/raw
+  result_root: ${broker_job_dir}/results/${slurm_job_id}
+  server_logs: ${raw_root}/launcher
+  frequency_table: ${raw_root}/frequency_table.json
+  route_control: ${raw_root}/production_route_control.json
+experiment:
+  smoke_gate:
+    enabled: true
+    endpoint_pair:
+    - P0
+    - D0
+    required_before_formal_measurement: true
+  slo:
+    ttft_ms: 1000
+    tpot_ms: 100
+  workload:
+    request_timeout_s: 900
+    max_concurrency: 1
+    request_interval_s: 5
+container:
+  enabled: false
+  runtime: apptainer
+  image: /path/to/vllm.sif
+  use_nvidia_runtime: true
+  host_network: true
+  mounts:
+  - ${work_dir}:${work_dir}
+  - ${model_path}:${model_path}:ro
+  - ${source_root}:/workspace
