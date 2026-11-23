@@ -92,7 +92,10 @@ class RouterSettings:
     d_busy_min_running: int
     load_window_s: float
     chars_per_token: float
-    admission: str = "slack"  # slack (state-based) or cells (v1 risk table)
+    # slack (state-based), cells (v1 risk table) or predict (ablation: admit while the wait
+    # plus the predicted TTFT stays within the SLO; no slack risk, KV gate, D length model
+    # or measured occupancy limits)
+    admission: str = "slack"
     kv_bytes_per_token: float = 131072.0
     kv_buffer_bytes: float | None = 1e9  # D's KV receive buffer; None: none (NIXL)
     overload: str = "best_effort"  # risk triggers resources; queue only at hard limits
@@ -202,7 +205,7 @@ def _fraction(raw: Mapping[str, Any], key: str, default: float) -> float:
 
 
 def _admission(raw: Mapping[str, Any]) -> str:
-    return _choice(raw, "admission", ("slack", "cells"), "slack")
+    return _choice(raw, "admission", ("slack", "cells", "predict"), "slack")
 
 
 def _modes(raw: Mapping[str, Any]) -> tuple[str, ...]:
@@ -438,7 +441,7 @@ class CanaTuneRouter:
             bins = admission.get("p_slot_bins")
             self._slot_knee = KneeCounts(bins) if bins else None
             self.log.write({"event": "admission_calibration", "published_at": key, **admission})
-            if not self.settings.capacity_limits:
+            if not self.settings.capacity_limits or self.settings.admission == "predict":
                 self.p_slot_cap, self._slot_knee = None, None
                 self.log.write({"event": "capacity_limits_ignored", "published_at": key,
                                 "p_slot_cap": cap,
@@ -618,7 +621,8 @@ class CanaTuneRouter:
                 tier_table = self.tiers.table
                 risk = None
                 if (self.settings.overload == "best_effort" and tier_table is not None
-                        and tier_table.decode_length and blocked is None):
+                        and tier_table.decode_length and blocked is None
+                        and self.settings.admission != "predict"):
                     risk = self._decode_risk(dg, tokens, tier_table)
                 decode_checked[dg.name] = (d_busy, blocked, kv, risk)
             d_busy, blocked, kv_blocked, decode_risk = decode_checked[dg.name]
@@ -634,6 +638,15 @@ class CanaTuneRouter:
             self._within_limits.append((route, cell, d_busy))
             if decode_risk is not None:
                 self._d_unsafe.add(key)
+            if self.settings.admission == "predict":
+                # Point TTFT prediction only (ablation): the group takes the request while
+                # the wait so far plus its predicted TTFT stays within the TTFT SLO. No
+                # slack risk, KV in-flight gate, D length model or measured limits; the
+                # hard checks above (fresh D telemetry, D KV wall) still apply.
+                self._slack_by_group[key] = (x, predicted, None)
+                if waited_ms + predicted <= self.settings.ttft_slo_ms:
+                    out.append((route, cell, RiskEstimate(0.0, "predict", 0), d_busy))
+                continue
             tier_table = self.tiers.table
             length_model = tier_table is not None and bool(tier_table.decode_length)
             if self.settings.overload == "best_effort" and length_model:

@@ -125,7 +125,9 @@ router:
   chat_template: null
   # slack: predict TTFT from the group's state (own prefill cost, pending P work, KV
   # in flight, requests decoding) and admit when the predicted-slack bucket's risk
-  # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy).
+  # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy);
+  # predict (ablation): admit while wait + predicted TTFT <= the TTFT SLO, with no slack
+  # risk, KV in-flight gate, D length model or measured occupancy limits.
   admission: slack
   # Prediction warns; actual production latency confirms pressure. Expand using
   # measured capacity, then reclaim Canary/lock MAX only if pressure persists.
