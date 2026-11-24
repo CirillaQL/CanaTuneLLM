@@ -127,7 +127,9 @@ router:
   # in flight, requests decoding) and admit when the predicted-slack bucket's risk
   # <= theta; cells: the v1 risk table (clock, queue, prompt bucket, D busy);
   # predict (ablation): admit while wait + predicted TTFT <= the TTFT SLO, with no slack
-  # risk, KV in-flight gate, D length model or measured occupancy limits.
+  # risk, KV in-flight gate, D length model or measured occupancy limits;
+  # capacity (ablation): admit while P holds fewer requests than the Canary's P slot cap,
+  # with slack's D-side checks but no TTFT prediction or slack risk.
   admission: slack
   # Prediction warns; actual production latency confirms pressure. Expand using
   # measured capacity, then reclaim Canary/lock MAX only if pressure persists.

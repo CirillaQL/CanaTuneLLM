@@ -94,7 +94,8 @@ class RouterSettings:
     chars_per_token: float
     # slack (state-based), cells (v1 risk table) or predict (ablation: admit while the wait
     # plus the predicted TTFT stays within the SLO; no slack risk, KV gate, D length model
-    # or measured occupancy limits)
+    # or measured occupancy limits) or capacity (ablation: admit while the group is below
+    # the Canary's measured occupancy limits; no TTFT prediction or slack risk)
     admission: str = "slack"
     kv_bytes_per_token: float = 131072.0
     kv_buffer_bytes: float | None = 1e9  # D's KV receive buffer; None: none (NIXL)
@@ -205,7 +206,7 @@ def _fraction(raw: Mapping[str, Any], key: str, default: float) -> float:
 
 
 def _admission(raw: Mapping[str, Any]) -> str:
-    return _choice(raw, "admission", ("slack", "cells", "predict"), "slack")
+    return _choice(raw, "admission", ("slack", "cells", "predict", "capacity"), "slack")
 
 
 def _modes(raw: Mapping[str, Any]) -> tuple[str, ...]:
@@ -446,6 +447,9 @@ class CanaTuneRouter:
                 self.log.write({"event": "capacity_limits_ignored", "published_at": key,
                                 "p_slot_cap": cap,
                                 "decode_max_running": table.decode_max_running})
+            elif self.settings.admission == "capacity" and self.p_slot_cap is None:
+                # capacity admission without a measured P slot cap has no P-side limit
+                self.log.write({"event": "capacity_admission_no_slot_cap", "published_at": key})
 
     def prefill_cost(self, mhz: int | None = None) -> PrefillCost:
         """S(L) at P clock `mhz` (None: the highest measured)."""
@@ -617,7 +621,8 @@ class CanaTuneRouter:
                 continue
             if dg.name not in decode_checked:  # D-side checks once per D
                 d_busy, blocked = self._decode_state(dg)
-                kv = self._kv_blocked(dg, tokens) and self.settings.admission == "slack"
+                kv = (self._kv_blocked(dg, tokens)
+                      and self.settings.admission in ("slack", "capacity"))
                 tier_table = self.tiers.table
                 risk = None
                 if (self.settings.overload == "best_effort" and tier_table is not None
@@ -674,6 +679,17 @@ class CanaTuneRouter:
                 if alpha + delta * (dg.n_await + dg.n_decoding + 1) > self.settings.tpot_slo_ms:
                     self._slack_by_group[key] = (x, predicted, None)
                     continue  # TPOT risk requests resources, not a hard rejection
+            if self.settings.admission == "capacity":
+                # Measured capacity only (ablation): the group takes the request while its P
+                # holds fewer requests than the Canary's P slot cap. No TTFT prediction or
+                # slack risk; the D-side checks above (fresh telemetry, KV wall, KV in-flight
+                # gate, D length model) are those of slack admission. The prediction is kept
+                # for the logs only.
+                self._slack_by_group[key] = (x, predicted, None)
+                cap = self.p_slot_cap
+                if cap is None or group.n_at_p < cap:
+                    out.append((route, cell, RiskEstimate(0.0, "capacity", 0), d_busy))
+                continue
             if self.settings.admission == "slack":
                 slack = self.slack.estimate(self.settings.ttft_slo_ms - waited_ms - predicted)
                 self._slack_by_group[key] = (x, predicted, slack)
@@ -789,13 +805,16 @@ class CanaTuneRouter:
             ranked = []
             for route, cell, d_busy in self._within_limits:
                 predicted = self._slack_by_group[route.key][1]
+                # Capacity admission ranks by the requests at P, not by a TTFT prediction.
+                load = (route.p.n_at_p if self.settings.admission == "capacity"
+                        else predicted)
                 # A D the length model still allows first (the lowest predicted TTFT
                 # alone sent requests into a D whose KV was already full: job J).
-                order = (route.key in self._d_unsafe, predicted, route.canary,
+                order = (route.key in self._d_unsafe, load, route.canary,
                          self.groups.index(route.p), self.groups.index(route.d))  # fmt: skip
                 ranked.append((*order, route, cell, d_busy))
-            _, predicted, _, _, _, route, cell, d_busy = min(ranked, key=lambda r: r[:5])
-            slack = self._slack_by_group[route.key][2]
+            route, cell, d_busy = min(ranked, key=lambda r: r[:5])[5:]
+            _, predicted, slack = self._slack_by_group[route.key]
             if best_effort:
                 kind = "best_effort"
             elif waited_ms + predicted <= self.settings.ttft_slo_ms:
